@@ -1,0 +1,10 @@
+numpy
+opencv-python
+rasterio
+scipy
+scikit-image
+Pillow
+torch
+torchvision
+lightglue
+kornia

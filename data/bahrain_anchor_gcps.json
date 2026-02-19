@@ -1,0 +1,367 @@
+{
+  "description": "Stable anchor GCPs for Bahrain imagery (20th century) - manually refined coordinates",
+  "reference": "Features that existed throughout 1960-2000 period, coordinates verified against modern satellite imagery",
+  "gcps": [
+    {
+      "name": "Bahrain Fort - NW Corner",
+      "lon": 50.5194329834434,
+      "lat": 26.233866426408664,
+      "description": "Northwest corner of Bahrain Fort (Qal'at al-Bahrain), UNESCO World Heritage Site. Ancient fort with clear walls and corners visible in satellite imagery.",
+      "feature_type": "corner",
+      "confidence": "high",
+      "notes": "Fort dates to 2300 BC, corner position stable",
+      "era": "Ancient (2300 BC - present)",
+      "patch_size_m": 400
+    },
+    {
+      "name": "Adhari Pool",
+      "lon": 50.54388101694405,
+      "lat": 26.199487070219035,
+      "description": "Adhari spring pool, natural feature with distinctive circular shape surrounded by vegetation",
+      "feature_type": "water_feature",
+      "confidence": "high",
+      "notes": "Natural spring, existed for millennia",
+      "era": "Ancient (pre-history - present)"
+    },
+    {
+      "name": "Ayn Al Hakim",
+      "lon": 50.56930345116297,
+      "lat": 26.175948529531897,
+      "description": "Historic spring and water feature in central Bahrain, distinctive as oasis in desert.",
+      "feature_type": "water_feature",
+      "confidence": "high",
+      "notes": "Spring may have varying visibility depending on season/water level",
+      "era": "Ancient (pre-history - present)"
+    },
+    {
+      "name": "Manama Cemetery",
+      "lon": 50.579389109957546,
+      "lat": 26.2228181075249,
+      "description": "Historic cemetery wall boundary in Hoora, Manama. Large rectangular walled area visible from satellite. Corner in south west of the graveyard",
+      "feature_type": "boundary",
+      "confidence": "high",
+      "notes": "Cemetery established pre-1900",
+      "era": "Historic (pre-1900 - present)"
+    },
+    {
+      "name": "Arad Fort - NW Corner",
+      "lon": 50.62699785927708,
+      "lat": 26.252572552662482,
+      "description": "Northwest corner of Arad Fort, 15th century coastal fort in Muharraq. Distinctive square fort with clear corners.",
+      "feature_type": "corner",
+      "confidence": "high",
+      "notes": "Fort structure stable since construction",
+      "era": "Historic (15th century - present)"
+    },
+    {
+      "name": "Casino Fountain - Muharraq",
+      "lon": 50.61500237846778,
+      "lat": 26.260405471913234,
+      "description": "Historic fountain/water feature in Muharraq, distinctive circular feature in urban area.",
+      "feature_type": "water_feature",
+      "confidence": "high",
+      "notes": "May not be visible in all historical imagery, urban development nearby",
+      "era": "Historic (unknown - present)"
+    },
+    {
+      "name": "Jazirat Ash Shaykh",
+      "lon": 50.63212244958079,
+      "lat": 26.05101577805928,
+      "description": "Small island south of main Bahrain island. Use mosque north on the island as reference",
+      "feature_type": "island_center",
+      "confidence": "high",
+      "notes": "Island shape stable, use centroid or distinctive cape",
+      "era": "Natural (permanent)"
+    },
+    {
+      "name": "Ya'sub Island",
+      "lon": 50.44541241681017,
+      "lat": 26.10661664993742,
+      "description": "Distinctive isolated island. West of Bahrain",
+      "feature_type": "island_center",
+      "confidence": "high",
+      "notes": "Natural island, shape stable",
+      "era": "Natural (permanent)"
+    },
+    {
+      "name": "Muhammediyya Island",
+      "lon": 50.43623722944332,
+      "lat": 26.20028397880676,
+      "description": "Island north west of bahrain",
+      "feature_type": "island_center",
+      "confidence": "high",
+      "notes": "",
+      "era": "Natural (permanent, possibly modified)"
+    },
+    {
+      "name": "Al Sayah Island",
+      "lon": 50.59141834670467,
+      "lat": 26.27121888204319,
+      "description": "Island north of main Bahrain island, west of Muharraq. distinctive shape. Point on spring at center.",
+      "feature_type": "island_center",
+      "confidence": "high",
+      "notes": "Natural island",
+      "era": "Natural (permanent)"
+    },
+    {
+      "name": "Um Al Na'san Farm - Path Intersection",
+      "lon": 50.413728629264476,
+      "lat": 26.126886370436257,
+      "description": "Farm in the south of Um Al Na'san island, at the intersection of 2 dirt paths in the middle of the farm.",
+      "feature_type": "intersection",
+      "confidence": "high",
+      "notes": "Original coords EPSG:3857: 5612030.60, 3014804.87",
+      "era": "Historic"
+    },
+    {
+      "name": "Riffa, second roundabout",
+      "lon": 50.535367052423936,
+      "lat": 26.124264637397182,
+      "description": "Second roundabout in Riffa, central Bahrain. Distinctive road junction visible in satellite imagery.",
+      "feature_type": "intersection",
+      "confidence": "high",
+      "notes": "Road infrastructure stable since construction",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Awali roundabout",
+      "lon": 50.54929227183449,
+      "lat": 26.087159169802742,
+      "description": "Roundabout in Awali, the oil company town in central Bahrain. Distinctive circular road junction.",
+      "feature_type": "intersection",
+      "confidence": "high",
+      "notes": "Awali built in 1930s-40s for BAPCO oil workers",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Sitra road bend",
+      "lon": 50.61560532953291,
+      "lat": 26.161764395314815,
+      "description": "Distinctive bend in the road on Sitra island, east of main Bahrain island.",
+      "feature_type": "road",
+      "confidence": "high",
+      "notes": "",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Fork in the road",
+      "lon": 50.457817608080184,
+      "lat": 26.176406839740185,
+      "description": "Distinctive fork in the road in western Bahrain.",
+      "feature_type": "road",
+      "confidence": "high",
+      "notes": "",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Underwater island in Fasht Al Adham",
+      "lon": 50.68497495784785,
+      "lat": 26.105449895868862,
+      "description": "Submerged island feature within the Fasht Al Adham reef complex east of Bahrain. Distinctive shallow area visible in satellite imagery.",
+      "feature_type": "reef_feature",
+      "confidence": "high",
+      "notes": "Visibility depends on tide and image quality",
+      "era": "Natural (permanent)"
+    },
+    {
+      "name": "Bend in the road in Hidd",
+      "lon": 50.65342412732195,
+      "lat": 26.242195393955935,
+      "description": "Distinctive road bend in Hidd, eastern Muharraq. Visible road feature in satellite imagery.",
+      "feature_type": "road",
+      "confidence": "high",
+      "notes": "",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Fork in the road, central",
+      "lon": 50.536409270100364,
+      "lat": 26.15725483305064,
+      "description": "Fork in the road in central Bahrain, between Riffa and Sitra.",
+      "feature_type": "road",
+      "confidence": "high",
+      "notes": "",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Fork in the road, west",
+      "lon": 50.49309108906408,
+      "lat": 26.144364257811777,
+      "description": "Fork in the road in west-central Bahrain.",
+      "feature_type": "road",
+      "confidence": "high",
+      "notes": "",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Oil tanks",
+      "lon": 50.602106104223445,
+      "lat": 26.110227401526856,
+      "description": "Oil storage tanks near Sitra, distinctive circular tank farm visible in satellite imagery.",
+      "feature_type": "industrial",
+      "confidence": "high",
+      "notes": "BAPCO oil infrastructure, built mid-20th century",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Dredge in reef",
+      "lon": 50.813487369593034,
+      "lat": 26.075032905531145,
+      "description": "Dredged channel or feature in the reef far east of Bahrain. Distinctive man-made cut visible in satellite imagery.",
+      "feature_type": "reef_feature",
+      "confidence": "high",
+      "notes": "Man-made feature in natural reef, should be stable once created",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Fork in road, oil wells north",
+      "lon": 50.552874174565176,
+      "lat": 26.02637748487846,
+      "description": "Fork in the road near oil wells in southern Bahrain.",
+      "feature_type": "road",
+      "confidence": "high",
+      "notes": "Oil field road infrastructure",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Fork in road, oil wells south",
+      "lon": 50.54159146111221,
+      "lat": 25.968748844499306,
+      "description": "Fork in the road near oil wells in far southern Bahrain.",
+      "feature_type": "road",
+      "confidence": "high",
+      "notes": "Oil field road infrastructure",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Island off fasht",
+      "lon": 50.72184840394824,
+      "lat": 26.025805307414856,
+      "description": "Small island off the eastern fasht reef complex, southeast of Bahrain.",
+      "feature_type": "island_center",
+      "confidence": "high",
+      "notes": "Natural island feature",
+      "era": "Natural (permanent)"
+    },
+    {
+      "name": "Khusaida island",
+      "lon": 50.6223184794251,
+      "lat": 26.292245017597207,
+      "feature_type": "island_center",
+      "confidence": "high"
+    },
+    {
+      "name": "Random water spring",
+      "lon": 50.64141760371105,
+      "lat": 26.27380145254727,
+      "feature_type": "water_feature",
+      "confidence": "high"
+    },
+    {
+      "name": "Fork in the Road -Hidd top",
+      "lon": 50.65422621875876,
+      "lat": 26.249950251979957,
+      "feature_type": "road",
+      "confidence": "high",
+      "era": "1968-"
+    },
+    {
+      "name": "Hillat Sulaita",
+      "lon": 50.63874311268818,
+      "lat": 26.24345195577746,
+      "feature_type": "island_center",
+      "confidence": "high"
+    },
+    {
+      "name": "Hillat Naim",
+      "lon": 50.63536873610349,
+      "lat": 26.238986715894082,
+      "feature_type": "island_center",
+      "confidence": "high"
+    },
+    {
+      "name": "um al shajar",
+      "lon": 50.65601137340843,
+      "lat": 26.22873343269163,
+      "feature_type": "island_center",
+      "confidence": "high"
+    },
+    {
+      "name": "El Azil",
+      "lon": 50.65679996699618,
+      "lat": 26.218507873837456,
+      "feature_type": "island_center",
+      "confidence": "high"
+    },
+    {
+      "name": "Qaser Abu Shahin",
+      "lon": 50.6683995947877,
+      "lat": 26.235221470331552,
+      "feature_type": "island_center",
+      "confidence": "high"
+    },
+    {
+      "name": "Bab al Bahrain",
+      "lon": 50.57563167996558,
+      "lat": 26.234009604397762,
+      "feature_type": "corner",
+      "confidence": "high"
+    },
+    {
+      "name": "Hoora Cemetery",
+      "lon": 50.58548743284543,
+      "lat": 26.23133909898657,
+      "feature_type": "boundary",
+      "confidence": "high"
+    },
+    {
+      "name": "Port authority",
+      "lon": 50.603919964263696,
+      "lat": 26.20481293092791,
+      "feature_type": "corner",
+      "confidence": "high"
+    },
+    {
+      "name": "Ain As'Safahiyya",
+      "lon": 50.58687189852502,
+      "lat": 26.183305066439736,
+      "feature_type": "water_feature",
+      "confidence": "high"
+    },
+    {
+      "name": "Ain al Khadra",
+      "lon": 50.51057193488802,
+      "lat": 26.177917269456337,
+      "feature_type": "water_feature",
+      "confidence": "high"
+    },
+    {
+      "name": "Fork in Budaiya Road",
+      "lon": 50.48672683453512,
+      "lat": 26.2182800691342,
+      "feature_type": "intersection",
+      "confidence": "high"
+    },
+    {
+      "name": "Farm corner",
+      "lon": 50.47310415609972,
+      "lat": 26.197647020271866,
+      "feature_type": "corner",
+      "confidence": "high"
+    },
+    {
+      "name": "Jidda",
+      "lon": 50.405249130912814,
+      "lat": 26.19392723861405,
+      "feature_type": "island_center",
+      "confidence": "high"
+    },
+    {
+      "name": "Fork in the road - center west",
+      "lon": 50.486580487349414,
+      "lat": 26.05408333429288,
+      "feature_type": "intersection",
+      "confidence": "high"
+    }
+  ]
+}
