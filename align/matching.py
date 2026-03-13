@@ -1,4 +1,4 @@
-"""Dense feature matching: LightGlue (SuperPoint) and LoFTR tiled."""
+"""Dense feature matching: LoFTR, ELoFTR, and RoMa tiled."""
 
 import numpy as np
 import cv2
@@ -7,140 +7,16 @@ import rasterio.transform
 
 import torch
 import torch.nn.functional as F
-from lightglue import LightGlue, SuperPoint
-from lightglue.utils import rbd
 import kornia.feature as KF
 
 from .geo import get_torch_device
 from .image import clahe_normalize, class_weight_map, make_land_mask, stable_feature_mask, to_u8
 
 
-def match_with_lightglue(arr_ref, arr_off_shifted, ref_transform,
-                         off_transform, shift_px_x, shift_py_y, device=None,
-                         max_keypoints=4096, model_cache=None, mask_mode="coastal_obia"):
-    """Match features using SuperPoint + LightGlue neural matcher.
-
-    Returns list of (ref_gx, ref_gy, off_gx, off_gy, confidence, name) tuples.
-    """
-    if device is None:
-        device = get_torch_device()
-
-    h, w = arr_ref.shape
-    scale_factor = 1.0
-    ref_resized = clahe_normalize(arr_ref)
-    off_resized = clahe_normalize(arr_off_shifted)
-
-    def _build_tensors(ref_img, off_img, sf):
-        if sf < 1.0:
-            rh, rw = int(h * sf), int(w * sf)
-            ri = cv2.resize(ref_img, (rw, rh), interpolation=cv2.INTER_AREA)
-            oi = cv2.resize(off_img, (rw, rh), interpolation=cv2.INTER_AREA)
-        else:
-            ri, oi = ref_img, off_img
-            
-        ri = np.ascontiguousarray(ri, dtype=np.float32)
-        oi = np.ascontiguousarray(oi, dtype=np.float32)
-        
-        rt = torch.from_numpy(ri)[None, None] / 255.0
-        ot = torch.from_numpy(oi)[None, None] / 255.0
-        return rt.to(device, non_blocking=True), ot.to(device, non_blocking=True)
-
-    ref_tensor, off_tensor = _build_tensors(ref_resized, off_resized, scale_factor)
-
-    if model_cache is not None:
-        extractor = model_cache.superpoint
-        matcher = model_cache.lightglue
-    else:
-        extractor = SuperPoint(max_num_keypoints=max_keypoints).eval().to(device)
-        matcher = LightGlue(features='superpoint', depth_confidence=-1,
-                            width_confidence=-1).eval().to(device)
-
-    try:
-        with torch.no_grad():
-            feats0 = extractor.extract(ref_tensor)
-            feats1 = extractor.extract(off_tensor)
-            matches01 = matcher({'image0': feats0, 'image1': feats1})
-    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-        if "out of memory" in str(e).lower() or "MPS" in str(e):
-            max_dim_fallback = 4096
-            scale_factor = min(max_dim_fallback / max(h, w), 1.0)
-            print(f"    OOM at full resolution, retrying at {max_dim_fallback}px "
-                  f"(scale={scale_factor:.3f})")
-            del ref_tensor, off_tensor
-            if hasattr(torch, 'mps') and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-            elif torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            ref_tensor, off_tensor = _build_tensors(ref_resized, off_resized, scale_factor)
-            with torch.no_grad():
-                feats0 = extractor.extract(ref_tensor)
-                feats1 = extractor.extract(off_tensor)
-                matches01 = matcher({'image0': feats0, 'image1': feats1})
-        else:
-            raise
-
-    feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]
-
-    kpts0 = feats0['keypoints'].cpu().numpy()
-    kpts1 = feats1['keypoints'].cpu().numpy()
-    matches = matches01['matches'].cpu().numpy()
-    mscores = (matches01['scores'].cpu().numpy()
-               if 'scores' in matches01 else np.ones(len(matches)))
-
-    if len(matches) == 0:
-        return []
-
-    mkpts0 = kpts0[matches[:, 0]]
-    mkpts1 = kpts1[matches[:, 1]]
-
-    conf_mask = mscores > 0.5
-    mkpts0 = mkpts0[conf_mask]
-    mkpts1 = mkpts1[conf_mask]
-    mscores = mscores[conf_mask]
-
-    if len(mkpts0) < 4:
-        return []
-
-    # RANSAC
-    src_pts = mkpts0.astype(np.float32).reshape(-1, 1, 2)
-    dst_pts = mkpts1.astype(np.float32).reshape(-1, 1, 2)
-    M_ransac, inliers = cv2.estimateAffine2D(
-        src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0)
-
-    if M_ransac is None or inliers is None:
-        return []
-
-    inlier_mask = inliers.ravel().astype(bool)
-    mkpts0 = mkpts0[inlier_mask]
-    mkpts1 = mkpts1[inlier_mask]
-    mscores = mscores[inlier_mask]
-
-    if len(mkpts0) == 0:
-        return []
-
-    mkpts0 = mkpts0 / scale_factor
-    mkpts1 = mkpts1 / scale_factor
-
-    results = []
-    for i in range(len(mkpts0)):
-        ref_col, ref_row = mkpts0[i]
-        off_col, off_row = mkpts1[i]
-
-        ref_gx, ref_gy = rasterio.transform.xy(
-            ref_transform, float(ref_row), float(ref_col))
-        off_gx, off_gy = rasterio.transform.xy(
-            off_transform, float(off_row) + shift_py_y,
-            float(off_col) + shift_px_x)
-
-        results.append((ref_gx, ref_gy, off_gx, off_gy, float(mscores[i]), f"lg_{i}"))
-
-    return results
-
-
 def match_with_eloftr(arr_ref, arr_off_shifted, ref_transform, off_transform,
                       shift_px_x, shift_py_y, neural_res=4.0,
                       min_valid_frac=0.30, skip_ransac=False, model_cache=None,
-                      batch_size=4, max_matches=5000, max_tiles=300,
+                      batch_size=8, max_matches=5000, max_tiles=300,
                       existing_anchors=None,
                       src_offset=None, work_crs=None, mask_mode="coastal_obia"):
     """Match features using EfficientLoFTR tiled."""
@@ -167,7 +43,7 @@ def match_with_eloftr(arr_ref, arr_off_shifted, ref_transform, off_transform,
 def match_with_roma(arr_ref, arr_off_shifted, ref_transform, off_transform,
                     shift_px_x, shift_py_y, neural_res=4.0,
                     min_valid_frac=0.30, skip_ransac=False, model_cache=None,
-                    batch_size=4, max_matches=5000, max_tiles=300,
+                    batch_size=8, max_matches=5000, max_tiles=300,
                     existing_anchors=None,
                     src_offset=None, work_crs=None, mask_mode="coastal_obia"):
     """Match features using RoMa tiled."""
@@ -187,7 +63,7 @@ def match_with_roma(arr_ref, arr_off_shifted, ref_transform, off_transform,
 def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transform, off_transform,
                         shift_px_x, shift_py_y, neural_res=4.0,
                         min_valid_frac=0.30, skip_ransac=False,
-                        batch_size=4, max_matches=5000, max_tiles=300,
+                        batch_size=8, max_matches=5000, max_tiles=300,
                         existing_anchors=None,
                         src_offset=None, work_crs=None, mask_mode="coastal_obia"):
     """Generic tiled matching orchestrator for LoFTR, ELoFTR, and RoMa."""
@@ -221,22 +97,23 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
 
     def _collect_matches(correspondences, items):
         if model_type == "roma":
-            # correspondences is (warp, certainty) from model.match
-            warp, certainty = correspondences
-            
+            # correspondences is a dict from v2's match()
+            preds = correspondences
+
             for i in range(len(items)):
                 it = items[i]
                 try:
-                    # model.sample expects matches=[H, W, 4] and certainty=[H, W]
-                    # Since match() was batched, we slice it
-                    m, c = model.sample(warp[i], certainty[i], num=400)
+                    # Build per-element preds dict for v2's sample()
+                    preds_i = {k: v[i:i+1] if v is not None else None for k, v in preds.items()}
+                    m, c, _, _ = model.sample(preds_i, num_corresp=600)
                     m = m.cpu().numpy()
                     c = c.cpu().numpy()
                 except Exception as e:
                     print(f"    RoMa sample error: {e}")
                     continue
 
-                mask = c > 0.2
+                # c is post-sigmoid overlap; satast clamps >0.05 to 1.0
+                mask = c > 0.55
                 m = m[mask]
                 c = c[mask]
                 
@@ -337,7 +214,9 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
         try:
             with torch.no_grad():
                 if model_type == "roma":
-                    correspondences = model.match(b_ref, b_off, batched=True)
+                    B = b_ref.shape[0]
+                    model.apply_setting("satast")  # high quality for tiled matching
+                    correspondences = model.match(b_ref, b_off)
                 else:
                     correspondences = model({"image0": b_ref, "image1": b_off})
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:

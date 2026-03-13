@@ -52,36 +52,6 @@ def clahe_normalize(img, clip_limit=3.0, grid=(8, 8)):
     return clahe.apply(img)
 
 
-def prepare_match_pair(ref, off, clip_limit=3.0, grid=(8, 8)):
-    """Normalise both images to CLAHE-enhanced uint8.
-
-    Convenience wrapper used by scale detection and NCC matching.
-    Returns (ref_u8, off_u8).
-    """
-    return clahe_normalize(ref, clip_limit, grid), clahe_normalize(off, clip_limit, grid)
-
-
-def build_preprocessed_stack(arr):
-    """Build a small multi-channel preprocessing stack for QA and masking."""
-
-    u8 = to_u8(arr)
-    clahe = clahe_normalize(u8)
-    grad = sobel_gradient(clahe)
-    lap = cv2.Laplacian(clahe.astype(np.float32), cv2.CV_32F, ksize=3)
-    texture = cv2.GaussianBlur(np.abs(lap), (7, 7), 0)
-
-    if np.any(u8 > 0):
-        grad = grad / max(float(np.max(grad)), 1.0)
-        texture = texture / max(float(np.max(texture)), 1.0)
-
-    return {
-        "raw": u8,
-        "clahe": clahe,
-        "gradient": grad.astype(np.float32),
-        "texture": texture.astype(np.float32),
-    }
-
-
 def is_cloudy_patch(arr, threshold_bright=0.85, threshold_low_texture=0.15):
     """Detect if a patch is likely cloudy or featureless.
 

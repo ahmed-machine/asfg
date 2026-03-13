@@ -8,7 +8,7 @@ import rasterio.transform
 from osgeo import gdal
 from rasterio.warp import reproject, Resampling
 
-from .grid_optim import optimize_grid, optimize_grid_hierarchical
+from .grid_optim import optimize_grid_hierarchical
 from .flow_refine import dense_flow_refinement
 from .image import make_land_mask, to_u8
 
@@ -130,25 +130,20 @@ def _icp_coastline_refine(write_path, reference_path, out_transform,
     ref_land = (make_land_mask(ref_small) > 0).astype(np.uint8)
     out_land = (make_land_mask(out_small) > 0).astype(np.uint8)
 
-    # Morphological stability filter: keep coastline points that persist
-    # under ±1px erosion/dilation (filters out tidal flats)
-    ref_eroded = cv2.erode(ref_land, k, iterations=1)
-    ref_dilated = cv2.dilate(ref_land, k, iterations=1)
-    ref_stable = (ref_eroded == ref_dilated)
-
-    out_eroded = cv2.erode(out_land, k, iterations=1)
-    out_dilated = cv2.dilate(out_land, k, iterations=1)
-    out_stable = (out_eroded == out_dilated)
-
     ref_coast = cv2.morphologyEx(ref_land, cv2.MORPH_GRADIENT, k) > 0
     out_coast = cv2.morphologyEx(out_land, cv2.MORPH_GRADIENT, k) > 0
 
-    # Filter to stable coastline segments only
-    ref_coast = ref_coast & ref_stable
-    out_coast = out_coast & out_stable
+    # Mutual agreement filter: keep coastline points where both images
+    # agree on nearby land (filters noise without the old erode==dilate bug)
+    ref_land_d = cv2.dilate(ref_land, k, iterations=2)
+    out_land_d = cv2.dilate(out_land, k, iterations=2)
+    ref_coast = ref_coast & (out_land_d > 0)
+    out_coast = out_coast & (ref_land_d > 0)
 
     ref_pts = np.column_stack(np.where(ref_coast)).astype(np.float32)  # (N, 2) as (row, col)
     out_pts = np.column_stack(np.where(out_coast)).astype(np.float32)
+
+    print(f"  [ICP] Coast points: ref={len(ref_pts)}, out={len(out_pts)}", flush=True)
 
     if len(ref_pts) < 50 or len(out_pts) < 50:
         print("  [ICP] Too few stable coastline points, skipping", flush=True)
@@ -228,60 +223,74 @@ def _icp_coastline_refine(write_path, reference_path, out_transform,
     # Create a distance-from-coast weight map: corrections fade to zero inland
     # Use the reference coastline mask for distance computation
     coast_dist = cv2.distanceTransform((~ref_coast).astype(np.uint8), cv2.DIST_L2, 3)
-    fade_dist_px = 2000.0 / icp_res  # fade over 2km
+    fade_dist_px = 500.0 / icp_res  # fade over 500m (coastline-local only)
     coast_weight = np.clip(1.0 - coast_dist / fade_dist_px, 0.0, 1.0).astype(np.float32)
 
-    # Apply weighted shift strip by strip to avoid OOM
+    # Apply weighted shift tile by tile to avoid OOM and cv2.remap SHRT_MAX limit
     shift_x_px = tx_m / output_res
     shift_y_px = ty_m / output_res
+    pad = int(max(abs(shift_x_px), abs(shift_y_px))) + 2  # margin for remap
 
-    icp_strip_h = min(2048, out_h)
-    icp_n_strips = (out_h + icp_strip_h - 1) // icp_strip_h
+    MAX_TILE = 16384  # well under SHRT_MAX (32767)
+    tile_h = min(MAX_TILE, out_h)
+    tile_w = min(MAX_TILE, out_w)
+    n_strips_y = (out_h + tile_h - 1) // tile_h
+    n_strips_x = (out_w + tile_w - 1) // tile_w
 
     with rasterio.open(write_path, 'r+') as ds:
-        for si in range(icp_n_strips):
-            rs = si * icp_strip_h
-            re = min(rs + icp_strip_h, out_h)
+        for si in range(n_strips_y):
+            rs = si * tile_h
+            re = min(rs + tile_h, out_h)
             sh = re - rs
+            for sj in range(n_strips_x):
+                cs = sj * tile_w
+                ce = min(cs + tile_w, out_w)
+                sw = ce - cs
 
-            strip_data = ds.read(1, window=((rs, re), (0, out_w))).astype(np.float32)
+                # Read with padding for remap boundary pixels
+                rs_p = max(0, rs - pad)
+                re_p = min(out_h, re + pad)
+                cs_p = max(0, cs - pad)
+                ce_p = min(out_w, ce + pad)
+                tile_data = ds.read(1, window=((rs_p, re_p), (cs_p, ce_p))).astype(np.float32)
 
-            # Compute coast weight for this strip (from ICP-res coast_weight)
-            strip_cw = cv2.resize(
-                coast_weight,
-                (out_w, sh),
-                interpolation=cv2.INTER_LINEAR,
-            )
-            # Actually we need the correct rows from coast_weight. Let's interpolate properly.
-            # Map strip rows to icp_h rows
-            strip_y_frac_start = rs / max(1, out_h - 1)
-            strip_y_frac_end = (re - 1) / max(1, out_h - 1)
-            cw_r0 = int(strip_y_frac_start * (icp_h - 1))
-            cw_r1 = min(icp_h, int(strip_y_frac_end * (icp_h - 1)) + 2)
-            cw_slice = coast_weight[cw_r0:cw_r1]
-            strip_cw = cv2.resize(cw_slice, (out_w, sh), interpolation=cv2.INTER_LINEAR)
+                # Offsets of the actual tile within the padded read
+                oy = rs - rs_p
+                ox = cs - cs_p
 
-            y_coords = np.arange(rs, re, dtype=np.float32).reshape(-1, 1)
-            y_coords = np.broadcast_to(y_coords, (sh, out_w)).copy()
-            x_coords = np.arange(0, out_w, dtype=np.float32).reshape(1, -1)
-            x_coords = np.broadcast_to(x_coords, (sh, out_w)).copy()
+                # Interpolate coast weight for this tile
+                y_frac_s = rs / max(1, out_h - 1)
+                y_frac_e = (re - 1) / max(1, out_h - 1)
+                x_frac_s = cs / max(1, out_w - 1)
+                x_frac_e = (ce - 1) / max(1, out_w - 1)
+                cw_r0 = int(y_frac_s * (icp_h - 1))
+                cw_r1 = min(icp_h, int(y_frac_e * (icp_h - 1)) + 2)
+                cw_c0 = int(x_frac_s * (icp_w - 1))
+                cw_c1 = min(icp_w, int(x_frac_e * (icp_w - 1)) + 2)
+                cw_slice = coast_weight[cw_r0:cw_r1, cw_c0:cw_c1]
+                tile_cw = cv2.resize(cw_slice, (sw, sh), interpolation=cv2.INTER_LINEAR)
 
-            corr_mx = (x_coords - shift_x_px * strip_cw).astype(np.float32)
-            corr_my = (y_coords - shift_y_px * strip_cw).astype(np.float32)
-            # Adjust to strip-local coordinates for remap
-            corr_my -= rs
+                # Build remap coords in padded-tile space
+                y_coords = np.arange(sh, dtype=np.float32).reshape(-1, 1) + oy
+                y_coords = np.broadcast_to(y_coords, (sh, sw)).copy()
+                x_coords = np.arange(sw, dtype=np.float32).reshape(1, -1) + ox
+                x_coords = np.broadcast_to(x_coords, (sh, sw)).copy()
 
-            corrected = cv2.remap(strip_data, corr_mx, corr_my,
-                                  interpolation=cv2.INTER_LINEAR,
-                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            ds.write(corrected, indexes=1, window=((rs, re), (0, out_w)))
+                corr_mx = (x_coords - shift_x_px * tile_cw).astype(np.float32)
+                corr_my = (y_coords - shift_y_px * tile_cw).astype(np.float32)
+
+                corrected = cv2.remap(tile_data, corr_mx, corr_my,
+                                      interpolation=cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                ds.write(corrected, indexes=1, window=((rs, re), (cs, ce)))
 
     print(f"  [ICP] Coastline refinement applied", flush=True)
 
 
 def apply_warp(input_path, output_path, reference_path, gcps, work_crs,
                output_bounds, output_res, output_crs=None,
-               grid_size=20, grid_iters=300, arap_weight=1.0):
+               grid_size=20, grid_iters=300, arap_weight=1.0,
+               n_real_gcps_in=None):
     """Run DINOv2 grid optimization and warp.
 
     output_bounds: (left, bottom, right, top) in work_crs to constrain extent.
@@ -377,19 +386,67 @@ def apply_warp(input_path, output_path, reference_path, gcps, work_crs,
     del src_u8
     gc.collect()
 
-    # 4. Process GCPs
+    # 4. Process GCPs — track which are real vs pipeline-boundary
     target_pts = []
     source_pts = []
+    is_real = []
     inv_out_transform = ~out_transform  # type: ignore
-    for px, py, gx, gy in gcps:
+    n_input_real = n_real_gcps_in if n_real_gcps_in is not None else len(gcps)
+    for idx, (px, py, gx, gy) in enumerate(gcps):
         t_col, t_row = inv_out_transform * (gx, gy)
         # Only keep points strictly within the target grid
         if 0 <= t_col < out_w and 0 <= t_row < out_h:
             source_pts.append([px, py])
             target_pts.append([t_col, t_row])
+            is_real.append(idx < n_input_real)
 
     source_pts = np.array(source_pts, dtype=np.float32)
     target_pts = np.array(target_pts, dtype=np.float32)
+    n_real_gcps = sum(is_real)
+
+    # 4a. Add virtual boundary GCPs along target grid edges where real GCPs
+    # are sparse.  These anchor extrapolation to the affine baseline, preventing
+    # wild divergence in data-sparse regions (e.g., east edge).
+    if n_real_gcps >= 3:
+        n = n_real_gcps
+        A_aff = np.zeros((2 * n, 6), dtype=np.float32)
+        b_aff = np.zeros(2 * n, dtype=np.float32)
+        for i in range(n):
+            tx, ty = target_pts[i]
+            A_aff[2*i]   = [tx, ty, 1, 0, 0, 0]
+            A_aff[2*i+1] = [0, 0, 0, tx, ty, 1]
+            b_aff[2*i]   = source_pts[i, 0]
+            b_aff[2*i+1] = source_pts[i, 1]
+        aff_params, _, _, _ = np.linalg.lstsq(A_aff, b_aff, rcond=None)
+
+        spacing_px = max(100, min(out_w, out_h) // 15)
+        min_dist_px = spacing_px * 2.0  # only add where truly no GCP coverage
+        edge_pts = []
+        for x in np.arange(0, out_w, spacing_px):
+            edge_pts.append((float(x), 0.0))
+            edge_pts.append((float(x), float(out_h - 1)))
+        for y in np.arange(spacing_px, out_h - spacing_px, spacing_px):
+            edge_pts.append((0.0, float(y)))
+            edge_pts.append((float(out_w - 1), float(y)))
+        for c in [(0, 0), (out_w-1, 0), (0, out_h-1), (out_w-1, out_h-1)]:
+            edge_pts.append((float(c[0]), float(c[1])))
+
+        virtual_target = []
+        virtual_source = []
+        for tx, ty in edge_pts:
+            dists = np.sqrt((target_pts[:, 0] - tx)**2 + (target_pts[:, 1] - ty)**2)
+            if np.min(dists) > min_dist_px:
+                sx = aff_params[0]*tx + aff_params[1]*ty + aff_params[2]
+                sy = aff_params[3]*tx + aff_params[4]*ty + aff_params[5]
+                if -src_w*0.1 < sx < src_w*1.1 and -src_h*0.1 < sy < src_h*1.1:
+                    virtual_target.append([tx, ty])
+                    virtual_source.append([sx, sy])
+
+        if virtual_target:
+            n_virtual = len(virtual_target)
+            target_pts = np.vstack([target_pts, np.array(virtual_target, dtype=np.float32)])
+            source_pts = np.vstack([source_pts, np.array(virtual_source, dtype=np.float32)])
+            print(f"  Virtual boundary GCPs: {n_virtual} added (0.15x weight)", flush=True)
 
     # 4b. Compute reclamation mask (XOR of land masks, dilated)
     # Only large coherent XOR blobs are real reclamation; scattered small
@@ -412,7 +469,7 @@ def apply_warp(input_path, output_path, reference_path, gcps, work_crs,
         xor_cleaned = cv2.morphologyEx(xor_raw, cv2.MORPH_OPEN, k_open)
 
         # Keep only large connected components (> min_area_px²)
-        min_area_m2 = 500 * 500  # 500m × 500m minimum reclamation area
+        min_area_m2 = 300 * 300  # 300m × 300m minimum reclamation area
         px_per_m = coast_scale_t / output_res
         min_area_px = max(50, int(min_area_m2 * px_per_m * px_per_m))
         n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(xor_cleaned, connectivity=8)
@@ -421,9 +478,9 @@ def apply_warp(input_path, output_path, reference_path, gcps, work_crs,
             if stats[lbl, cv2.CC_STAT_AREA] >= min_area_px:
                 xor_mask[labels == lbl] = 1
 
-        # Dilate by ~100m at coastline resolution (reduced from 200m to
-        # preserve more coast points; the soft-clamp chamfer handles the rest)
-        dilate_px = max(1, int(100.0 / (output_res / coast_scale_t)))
+        # Dilate by ~50m at coastline resolution (reduced from 100m to
+        # preserve more coast points for chamfer alignment)
+        dilate_px = max(1, int(50.0 / (output_res / coast_scale_t)))
         k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
         reclamation_mask = cv2.dilate(xor_mask, k_dilate, iterations=1).astype(bool)
         n_changed = int(reclamation_mask.sum())
@@ -440,7 +497,8 @@ def apply_warp(input_path, output_path, reference_path, gcps, work_crs,
     # 5. Run hierarchical grid optimizer (coarse-to-fine pyramid)
     # levels: (grid_size, iters) — coarse captures global warp,
     # fine captures local distortion (~250m node spacing at 64×64)
-    pyramid_levels = [(8, 200), (24, 200), (64, 200)]
+    # Note: 4th level at 96×96 caused flow refinement write failures (v21)
+    pyramid_levels = [(8, 300), (24, 300), (64, 500)]
     warper = optimize_grid_hierarchical(
         source_img=src_img_rgb,
         target_img=target_img_rgb,
@@ -454,103 +512,75 @@ def apply_warp(input_path, output_path, reference_path, gcps, work_crs,
         levels=pyramid_levels,
         w_arap=arap_weight,
         reclamation_mask_tgt=reclamation_mask,
+        n_real_gcps=n_real_gcps,
     )
-
-    print("  Applying chunked remap...", flush=True)
-    
-    # 6. Apply remap and write to output
-    estimated_size = out_w * out_h * 4
-    bigtiff = 'YES' if estimated_size > 3_000_000_000 else 'NO'
 
     import torch
     import torch.nn.functional as F
 
-    with rasterio.open(write_path, 'w', driver='GTiff',
-                       width=out_w, height=out_h, count=1,
-                       dtype='float32', crs=work_crs,
-                       transform=out_transform,
-                       compress='lzw', predictor=2, tiled=True,
-                       nodata=0, BIGTIFF=bigtiff) as dst:
-        
-        strip_height = min(2048, out_h)
-        n_strips = (out_h + strip_height - 1) // strip_height
-        
-        # Displacements are on target domain [-1, 1]
-        with torch.no_grad():
-            displacements = warper.displacements.detach() # (1, 2, grid_h, grid_w)
-
-        for strip_idx in range(n_strips):
-            row_start = strip_idx * strip_height
-            row_end = min(row_start + strip_height, out_h)
-            strip_h = row_end - row_start
-            
-            # Create target pixel coordinates for the strip
-            y_coords = np.linspace(row_start, row_end - 1, strip_h)
-            x_coords = np.linspace(0, out_w - 1, out_w)
-            
-            # Normalize to [-1, 1]
-            y_norm = (y_coords / (out_h - 1)) * 2.0 - 1.0
-            x_norm = (x_coords / (out_w - 1)) * 2.0 - 1.0
-            
-            y_grid, x_grid = np.meshgrid(y_norm, x_norm, indexing='ij')
-            
-            grid_tensor = torch.from_numpy(np.stack([x_grid, y_grid], axis=-1)).float().unsqueeze(0).to(warper.displacements.device)
-            grid_tensor = grid_tensor.clamp(-1.0, 1.0)
-
-            with torch.no_grad():
-                strip_disp = F.grid_sample(displacements, grid_tensor, mode='bilinear', padding_mode='zeros', align_corners=True)
-                strip_disp = strip_disp.squeeze(0).cpu().numpy() # (2, strip_h, out_w)
-            
-            src_x_norm = x_grid + strip_disp[0]
-            src_y_norm = y_grid + strip_disp[1]
-            
-            strip_map_x = ((src_x_norm + 1.0) / 2.0) * (src_w - 1)
-            strip_map_y = ((src_y_norm + 1.0) / 2.0) * (src_h - 1)
-            
-            strip_map_x = strip_map_x.astype(np.float32)
-            strip_map_y = strip_map_y.astype(np.float32)
-            
-            strip_data = _chunked_remap(src_data, strip_map_x, strip_map_y)
-            
-            nodata_mask = ((strip_map_x < 0) | (strip_map_x >= src_w - 1) |
-                           (strip_map_y < 0) | (strip_map_y >= src_h - 1))
-            strip_data[nodata_mask] = 0
-            
-            dst.write(strip_data, indexes=1, window=((row_start, row_end), (0, out_w)))
-            
-            if (strip_idx + 1) % 5 == 0 or strip_idx == n_strips - 1:
-                print(f"    Warp strip {strip_idx + 1}/{n_strips} complete", flush=True)
-
-    src_ds.close()
-    print("  Grid deformation warp complete", flush=True)
-
-    # 6b. Dense optical flow post-refinement (Improvement 2)
-    # Work at a reduced resolution (~4m/px) to keep memory reasonable,
-    # then upsample the flow correction to full res for strip-based re-remap.
+    # ------------------------------------------------------------------
+    # 6b. Dense optical flow post-refinement (single-pass optimisation)
+    #
+    # Instead of writing grid-only remap to disk, reading it back for
+    # flow estimation, and re-remapping, we:
+    #   1. Generate a small warped preview in-memory via the grid
+    #      displacement (no disk I/O).
+    #   2. Compute optical flow at reduced resolution (~16 m/px).
+    #   3. Upsample flow and combine with grid displacement in a
+    #      single remap pass that writes the final output.
+    # This eliminates the first full-res remap + disk write, halving
+    # the I/O and saving several minutes on large images.
+    # ------------------------------------------------------------------
+    flow_x_full = None
+    flow_y_full = None
     try:
-        print("  [FlowRefine] Starting dense optical flow post-refinement...", flush=True)
-        # Work resolution: ~4m/px (or output_res if coarser)
+        print("  [FlowRefine] Starting dense optical flow post-refinement (coarse-to-fine)...", flush=True)
+        # Fine resolution: ~4m/px (preserves sub-pixel corrections)
         fr_work_res = max(4.0, output_res)
         fr_scale = output_res / fr_work_res
         fr_w = max(64, int(out_w * fr_scale))
         fr_h = max(64, int(out_h * fr_scale))
 
+        # Coarse resolution: ~8m/px (captures large-scale corrections robustly)
+        coarse_res = max(8.0, output_res)
+        do_two_pass = coarse_res > fr_work_res * 1.3  # only if meaningfully different
+        coarse_w = max(64, int(out_w * output_res / coarse_res)) if do_two_pass else fr_w
+        coarse_h = max(64, int(out_h * output_res / coarse_res)) if do_two_pass else fr_h
+
         # Read reference at reduced resolution
-        from affine import Affine as _Affine
         fr_transform = rasterio.transform.from_bounds(
             left, bottom, right, top, fr_w, fr_h)
         src_ref_fr = rasterio.open(reference_path)
         ref_arr_fr = _reproject_to_grid(src_ref_fr, fr_transform, fr_w, fr_h, work_crs)
         src_ref_fr.close()
 
-        # Read warped output at reduced resolution
-        with rasterio.open(write_path, 'r') as warped_ds:
-            warped_full = warped_ds.read(1).astype(np.float32)
-        warped_arr_fr = cv2.resize(warped_full, (fr_w, fr_h), interpolation=cv2.INTER_AREA)
-        del warped_full
+        # Generate warped preview in-memory at flow resolution by applying
+        # the grid displacement to the source image directly (avoids a
+        # full-res remap → disk → read-back cycle).
+        print("  [FlowRefine] Generating warped preview in-memory...", flush=True)
+        with torch.no_grad():
+            _fr_disp = warper.displacements.detach()
+            # Sample displacement at flow resolution
+            _yr = np.linspace(-1.0, 1.0, fr_h)
+            _xr = np.linspace(-1.0, 1.0, fr_w)
+            _yg_fr, _xg_fr = np.meshgrid(_yr, _xr, indexing='ij')
+            _gt_fr = torch.from_numpy(
+                np.stack([_xg_fr, _yg_fr], axis=-1)
+            ).float().unsqueeze(0).clamp(-1.0, 1.0).to(_fr_disp.device)
+            _sd_fr = F.grid_sample(
+                _fr_disp, _gt_fr, mode='bicubic',
+                padding_mode='zeros', align_corners=True
+            ).squeeze(0).cpu().numpy()  # (2, fr_h, fr_w)
 
-        # Compute flow at reduced resolution
-        from .flow_refine import _estimate_flow_dis, _forward_backward_mask
+        _smx_fr = ((_xg_fr + _sd_fr[0] + 1.0) / 2.0 * (src_w - 1)).astype(np.float32)
+        _smy_fr = ((_yg_fr + _sd_fr[1] + 1.0) / 2.0 * (src_h - 1)).astype(np.float32)
+        warped_arr_fr = _chunked_remap(src_data, _smx_fr, _smy_fr)
+        del _sd_fr, _smx_fr, _smy_fr, _gt_fr, _xg_fr, _yg_fr
+
+        # Two-pass coarse-to-fine flow refinement:
+        # Pass 1 (coarse, ~8m/px): captures large-scale corrections robustly
+        # Pass 2 (fine, ~4m/px): captures sub-pixel residuals on corrected image
+        from .flow_refine import _estimate_flow, _forward_backward_mask
 
         def _to_u8(arr):
             valid = arr[arr > 0]
@@ -562,19 +592,88 @@ def apply_warp(input_path, output_path, reference_path, gcps, work_crs,
             return np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
 
         ref_u8_fr = _to_u8(ref_arr_fr)
+
+        # ---- Coarse pass at ~8m/px ----
+        flow_coarse_fine = np.zeros((fr_h, fr_w, 2), dtype=np.float32)
+        if do_two_pass:
+            print(f"  [FlowRefine] Coarse pass at {coarse_res:.0f}m/px "
+                  f"({coarse_w}x{coarse_h})...", flush=True)
+            ref_arr_c = cv2.resize(ref_arr_fr, (coarse_w, coarse_h),
+                                   interpolation=cv2.INTER_AREA)
+            warped_arr_c = cv2.resize(warped_arr_fr, (coarse_w, coarse_h),
+                                      interpolation=cv2.INTER_AREA)
+            ref_u8_c = _to_u8(ref_arr_c)
+            warped_u8_c = _to_u8(warped_arr_c)
+
+            flow_c = _estimate_flow(ref_u8_c, warped_u8_c)
+            fb_mask_c = _forward_backward_mask(ref_u8_c, warped_u8_c, flow_c, 3.0)
+
+            flow_c[:, :, 0] = cv2.medianBlur(flow_c[:, :, 0], 5)
+            flow_c[:, :, 1] = cv2.medianBlur(flow_c[:, :, 1], 5)
+            flow_c[~fb_mask_c] = 0
+            valid_mask_c = (ref_arr_c > 0) & (warped_arr_c > 0)
+            flow_c[~valid_mask_c] = 0
+
+            # Clamp coarse corrections at 75m
+            max_px_c = 75.0 / coarse_res
+            flow_mag_c = np.sqrt(flow_c[:, :, 0]**2 + flow_c[:, :, 1]**2)
+            too_large_c = flow_mag_c > max_px_c
+            if np.any(too_large_c):
+                clip_c = np.where(too_large_c, max_px_c / (flow_mag_c + 1e-8), 1.0)
+                flow_c[:, :, 0] *= clip_c
+                flow_c[:, :, 1] *= clip_c
+
+            reliable_c_pct = float(fb_mask_c.sum()) / max(1, fb_mask_c.size) * 100
+            mean_corr_c = (float(np.mean(flow_mag_c[fb_mask_c])) * coarse_res
+                           if fb_mask_c.any() else 0.0)
+            print(f"  [FlowRefine] Coarse: {reliable_c_pct:.0f}% reliable, "
+                  f"mean {mean_corr_c:.1f}m, "
+                  f"max {float(flow_mag_c.max()) * coarse_res:.1f}m", flush=True)
+
+            if reliable_c_pct < 10.0:
+                print(f"  [FlowRefine] Coarse pass only {reliable_c_pct:.0f}% reliable "
+                      f"— skipping flow entirely", flush=True)
+                del ref_arr_c, warped_arr_c, ref_u8_c, warped_u8_c
+                del flow_c, fb_mask_c, valid_mask_c
+                del ref_arr_fr, warped_arr_fr, ref_u8_fr
+                gc.collect()
+                raise RuntimeError("Insufficient reliable coarse flow pixels")
+
+            # Upsample coarse flow to fine resolution (convert pixel units)
+            px_ratio = coarse_res / fr_work_res  # e.g. 8/4 = 2.0
+            flow_coarse_fine[:, :, 0] = cv2.resize(
+                flow_c[:, :, 0], (fr_w, fr_h),
+                interpolation=cv2.INTER_LINEAR) * px_ratio
+            flow_coarse_fine[:, :, 1] = cv2.resize(
+                flow_c[:, :, 1], (fr_w, fr_h),
+                interpolation=cv2.INTER_LINEAR) * px_ratio
+
+            # Apply coarse correction to warped preview for fine pass
+            ys_grid = np.arange(fr_h, dtype=np.float32)
+            xs_grid = np.arange(fr_w, dtype=np.float32)
+            xg_remap, yg_remap = np.meshgrid(xs_grid, ys_grid)
+            map_x = (xg_remap + flow_coarse_fine[:, :, 0]).astype(np.float32)
+            map_y = (yg_remap + flow_coarse_fine[:, :, 1]).astype(np.float32)
+            warped_arr_fr = cv2.remap(warped_arr_fr, map_x, map_y,
+                                       cv2.INTER_LINEAR, borderValue=0)
+
+            del ref_arr_c, warped_arr_c, ref_u8_c, warped_u8_c
+            del flow_c, fb_mask_c, valid_mask_c
+            del map_x, map_y, xg_remap, yg_remap
+
+        # ---- Fine pass at ~4m/px ----
+        print(f"  [FlowRefine] Fine pass at {fr_work_res:.0f}m/px "
+              f"({fr_w}x{fr_h})...", flush=True)
         warped_u8_fr = _to_u8(warped_arr_fr)
 
-        flow_fwd = _estimate_flow_dis(ref_u8_fr, warped_u8_fr)
+        flow_fwd = _estimate_flow(ref_u8_fr, warped_u8_fr)
         fb_mask = _forward_backward_mask(ref_u8_fr, warped_u8_fr, flow_fwd, 3.0)
 
-        # Median filter
+        # Median filter to remove salt-and-pepper noise
         flow_fwd[:, :, 0] = cv2.medianBlur(flow_fwd[:, :, 0], 5)
         flow_fwd[:, :, 1] = cv2.medianBlur(flow_fwd[:, :, 1], 5)
 
-        # Subtract systematic flow bias before zeroing unreliable pixels.
-        # Cap at 15m/axis: larger biases are usually legitimate warp corrections,
-        # not DIS artifacts.
-        MAX_BIAS_M = 15.0
+        # Log systematic flow bias
         if fb_mask.any():
             reliable_dx = flow_fwd[fb_mask, 0]
             reliable_dy = flow_fwd[fb_mask, 1]
@@ -583,24 +682,18 @@ def apply_warp(input_path, output_path, reference_path, gcps, work_crs,
             bias_m_dx = abs(median_dx) * fr_work_res
             bias_m_dy = abs(median_dy) * fr_work_res
             if bias_m_dx > 5.0 or bias_m_dy > 5.0:
-                max_bias_px = MAX_BIAS_M / fr_work_res
-                capped_dx = float(np.clip(median_dx, -max_bias_px, max_bias_px))
-                capped_dy = float(np.clip(median_dy, -max_bias_px, max_bias_px))
-                flow_fwd[:, :, 0] -= capped_dx
-                flow_fwd[:, :, 1] -= capped_dy
-                print(f"  [FlowRefine] Subtracted median bias: "
-                      f"dx={median_dx * fr_work_res:+.1f}m, dy={median_dy * fr_work_res:+.1f}m"
-                      f" (capped to dx={capped_dx * fr_work_res:+.1f}m, dy={capped_dy * fr_work_res:+.1f}m)",
-                      flush=True)
+                print(f"  [FlowRefine] Fine bias: "
+                      f"dx={median_dx * fr_work_res:+.1f}m, "
+                      f"dy={median_dy * fr_work_res:+.1f}m"
+                      f" (NOT subtracted)", flush=True)
 
         flow_fwd[~fb_mask] = 0
-
-        # Zero where no data
         valid_mask_fr = (ref_arr_fr > 0) & (warped_arr_fr > 0)
         flow_fwd[~valid_mask_fr] = 0
 
-        # Clamp corrections
-        max_px = 50.0 / fr_work_res
+        # Clamp fine corrections (tighter cap when coarse already handled large offsets)
+        fine_clamp_m = 30.0 if do_two_pass else 75.0
+        max_px = fine_clamp_m / fr_work_res
         flow_mag = np.sqrt(flow_fwd[:, :, 0]**2 + flow_fwd[:, :, 1]**2)
         too_large = flow_mag > max_px
         if np.any(too_large):
@@ -611,94 +704,142 @@ def apply_warp(input_path, output_path, reference_path, gcps, work_crs,
 
         reliable_pct = float(fb_mask.sum()) / max(1, fb_mask.size) * 100
         mean_corr = float(np.mean(flow_mag[fb_mask])) * fr_work_res if fb_mask.any() else 0.0
-        print(f"  [FlowRefine] {reliable_pct:.0f}% reliable, "
+        print(f"  [FlowRefine] Fine: {reliable_pct:.0f}% reliable, "
               f"mean correction {mean_corr:.1f}m, "
               f"max {float(flow_mag.max()) * fr_work_res:.1f}m", flush=True)
 
-        # Skip if too few reliable pixels — flow will do more harm than good.
-        # Also skip if reliability is marginal AND mean correction is large,
-        # which indicates the flow is making big dubious corrections.
-        if reliable_pct < 10.0:
-            print(f"  [FlowRefine] Only {reliable_pct:.0f}% reliable (mean corr {mean_corr:.1f}m) — skipping "
-                  f"(threshold 10%)", flush=True)
+        # If fine pass has low reliability in single-pass mode, skip entirely.
+        # In two-pass mode, we still have the coarse flow.
+        if reliable_pct < 10.0 and not do_two_pass:
+            print(f"  [FlowRefine] Only {reliable_pct:.0f}% reliable — skipping",
+                  flush=True)
             del ref_arr_fr, warped_arr_fr, ref_u8_fr, warped_u8_fr
             del fb_mask, valid_mask_fr, flow_fwd
             gc.collect()
             raise RuntimeError("Insufficient reliable flow pixels")
 
+        if reliable_pct < 10.0 and do_two_pass:
+            print(f"  [FlowRefine] Fine pass only {reliable_pct:.0f}% reliable "
+                  f"— using coarse flow only", flush=True)
+            flow_fwd[:] = 0  # zero out unreliable fine contribution
+
         del ref_arr_fr, warped_arr_fr, ref_u8_fr, warped_u8_fr, fb_mask, valid_mask_fr
 
-        # Upsample flow to full output resolution
-        flow_x_full = cv2.resize(flow_fwd[:, :, 0], (out_w, out_h),
+        # Combine coarse + fine flow (both in fine-pixel units)
+        flow_total_x = flow_coarse_fine[:, :, 0] + flow_fwd[:, :, 0]
+        flow_total_y = flow_coarse_fine[:, :, 1] + flow_fwd[:, :, 1]
+        del flow_coarse_fine, flow_fwd
+
+        # Final clamp on combined flow — must accommodate coarse (75m) + fine (30m)
+        combined_clamp_m = 100.0 if do_two_pass else 75.0
+        max_px_total = combined_clamp_m / fr_work_res
+        flow_mag_total = np.sqrt(flow_total_x**2 + flow_total_y**2)
+        too_large_t = flow_mag_total > max_px_total
+        if np.any(too_large_t):
+            clip_t = np.where(too_large_t, max_px_total / (flow_mag_total + 1e-8), 1.0)
+            flow_total_x *= clip_t
+            flow_total_y *= clip_t
+
+        total_mean_m = (float(np.mean(flow_mag_total[flow_mag_total > 0])) * fr_work_res
+                        if np.any(flow_mag_total > 0) else 0.0)
+        if do_two_pass:
+            print(f"  [FlowRefine] Combined: mean {total_mean_m:.1f}m, "
+                  f"max {float(flow_mag_total.max()) * fr_work_res:.1f}m", flush=True)
+
+        # Upsample to full output resolution
+        flow_x_full = cv2.resize(flow_total_x, (out_w, out_h),
                                   interpolation=cv2.INTER_LINEAR) / fr_scale
-        flow_y_full = cv2.resize(flow_fwd[:, :, 1], (out_w, out_h),
+        flow_y_full = cv2.resize(flow_total_y, (out_w, out_h),
                                   interpolation=cv2.INTER_LINEAR) / fr_scale
-        del flow_fwd
+        del flow_total_x, flow_total_y
         gc.collect()
-
-        # Re-read source for re-remap
-        src_ds_fr = rasterio.open(input_path)
-        src_data_fr = src_ds_fr.read(1).astype(np.float32)
-        src_w_fr, src_h_fr = src_ds_fr.width, src_ds_fr.height
-
-        # Re-remap strip by strip: recompute grid remap + add flow correction
-        print("  [FlowRefine] Re-applying remap with flow corrections...", flush=True)
-        with torch.no_grad():
-            fr_disp = warper.displacements.detach()
-
-        with rasterio.open(write_path, 'r+') as dst_fr:
-            fr_strip_h = min(2048, out_h)
-            fr_n_strips = (out_h + fr_strip_h - 1) // fr_strip_h
-            for si in range(fr_n_strips):
-                rs = si * fr_strip_h
-                re = min(rs + fr_strip_h, out_h)
-                sh = re - rs
-
-                # Recompute grid remap for this strip
-                yc = np.linspace(rs, re - 1, sh)
-                xc = np.linspace(0, out_w - 1, out_w)
-                yn = (yc / (out_h - 1)) * 2.0 - 1.0
-                xn = (xc / (out_w - 1)) * 2.0 - 1.0
-                yg, xg = np.meshgrid(yn, xn, indexing='ij')
-                gt = torch.from_numpy(np.stack([xg, yg], axis=-1)).float().unsqueeze(0).clamp(-1.0, 1.0).to(fr_disp.device)
-                with torch.no_grad():
-                    sd = F.grid_sample(fr_disp, gt, mode='bilinear',
-                                       padding_mode='zeros', align_corners=True)
-                    sd = sd.squeeze(0).cpu().numpy()
-
-                smx = ((xg + sd[0] + 1.0) / 2.0 * (src_w_fr - 1)).astype(np.float32)
-                smy = ((yg + sd[1] + 1.0) / 2.0 * (src_h_fr - 1)).astype(np.float32)
-
-                # Add flow correction (in source pixel units)
-                smx += flow_x_full[rs:re]
-                smy += flow_y_full[rs:re]
-
-                strip_data = _chunked_remap(src_data_fr, smx, smy)
-                nodata = ((smx < 0) | (smx >= src_w_fr - 1) |
-                          (smy < 0) | (smy >= src_h_fr - 1))
-                strip_data[nodata] = 0
-                dst_fr.write(strip_data, indexes=1, window=((rs, re), (0, out_w)))
-
-                if (si + 1) % 5 == 0 or si == fr_n_strips - 1:
-                    print(f"    FlowRefine strip {si + 1}/{fr_n_strips} complete", flush=True)
-
-        src_ds_fr.close()
-        del flow_x_full, flow_y_full, src_data_fr
-        gc.collect()
+        print("  [FlowRefine] Flow computed, will merge into single remap pass", flush=True)
         print("  [FlowRefine] Post-refinement complete", flush=True)
     except Exception as e:
         import traceback
         traceback.print_exc()
         print(f"  [FlowRefine] WARNING: Flow refinement failed ({e}), "
               f"keeping grid-only result", flush=True)
+        flow_x_full = None
+        flow_y_full = None
 
-    # 6c. ICP coastline refinement (Improvement 4)
-    try:
-        print("  [ICP] Starting coastline ICP refinement...", flush=True)
-        _icp_coastline_refine(write_path, reference_path, out_transform,
-                              out_w, out_h, work_crs, output_res)
-    except Exception as e:
-        print(f"  [ICP] WARNING: Coastline ICP failed ({e}), keeping result", flush=True)
+    # ------------------------------------------------------------------
+    # 6c. Single-pass remap: grid displacement (+ flow if available)
+    # This replaces the old two-pass approach (grid-only write, then
+    # flow re-remap) with one combined write to disk.
+    # ------------------------------------------------------------------
+    has_flow = flow_x_full is not None and flow_y_full is not None
+    label = "grid+flow" if has_flow else "grid-only"
+    print(f"  Applying {label} remap...", flush=True)
+
+    estimated_size = out_w * out_h * 4
+    bigtiff = 'YES' if estimated_size > 3_000_000_000 else 'NO'
+
+    with rasterio.open(write_path, 'w', driver='GTiff',
+                       width=out_w, height=out_h, count=1,
+                       dtype='float32', crs=work_crs,
+                       transform=out_transform,
+                       compress='lzw', predictor=2, tiled=True,
+                       nodata=0, BIGTIFF=bigtiff) as dst:
+
+        strip_height = min(2048, out_h)
+        n_strips = (out_h + strip_height - 1) // strip_height
+
+        with torch.no_grad():
+            displacements = warper.displacements.detach()  # (1, 2, grid_h, grid_w)
+
+        for strip_idx in range(n_strips):
+            row_start = strip_idx * strip_height
+            row_end = min(row_start + strip_height, out_h)
+            strip_h = row_end - row_start
+
+            y_coords = np.linspace(row_start, row_end - 1, strip_h)
+            x_coords = np.linspace(0, out_w - 1, out_w)
+            y_norm = (y_coords / (out_h - 1)) * 2.0 - 1.0
+            x_norm = (x_coords / (out_w - 1)) * 2.0 - 1.0
+            y_grid, x_grid = np.meshgrid(y_norm, x_norm, indexing='ij')
+
+            grid_tensor = torch.from_numpy(
+                np.stack([x_grid, y_grid], axis=-1)
+            ).float().unsqueeze(0).to(displacements.device).clamp(-1.0, 1.0)
+
+            with torch.no_grad():
+                strip_disp = F.grid_sample(
+                    displacements, grid_tensor, mode='bicubic',
+                    padding_mode='zeros', align_corners=True
+                ).squeeze(0).cpu().numpy()  # (2, strip_h, out_w)
+
+            strip_map_x = ((x_grid + strip_disp[0] + 1.0) / 2.0 * (src_w - 1)).astype(np.float32)
+            strip_map_y = ((y_grid + strip_disp[1] + 1.0) / 2.0 * (src_h - 1)).astype(np.float32)
+
+            # Add flow correction when available (flow is in source pixel units)
+            if has_flow:
+                strip_map_x += flow_x_full[row_start:row_end]
+                strip_map_y += flow_y_full[row_start:row_end]
+
+            strip_data = _chunked_remap(src_data, strip_map_x, strip_map_y)
+
+            nodata_mask = ((strip_map_x < 0) | (strip_map_x >= src_w - 1) |
+                           (strip_map_y < 0) | (strip_map_y >= src_h - 1))
+            strip_data[nodata_mask] = 0
+
+            dst.write(strip_data, indexes=1, window=((row_start, row_end), (0, out_w)))
+
+            if (strip_idx + 1) % 5 == 0 or strip_idx == n_strips - 1:
+                print(f"    Warp strip {strip_idx + 1}/{n_strips} complete", flush=True)
+
+    src_ds.close()
+    if has_flow:
+        del flow_x_full, flow_y_full
+    gc.collect()
+    print(f"  {label.capitalize()} remap complete", flush=True)
+
+    # 6d. ICP coastline refinement (Improvement 4)
+    # ICP coastline refinement disabled — cross-temporal coastline changes
+    # (reclamation) produce spurious shifts that damage alignment (v37: -17m,
+    # v45: -27.9m).  The fixed ICP code is preserved above for future use
+    # when reclamation masking is integrated into the ICP pipeline.
+    print("  [ICP] Skipped (disabled — cross-temporal coastline changes)", flush=True)
 
     # 7. Reproject to output CRS if needed
     if needs_reproject:

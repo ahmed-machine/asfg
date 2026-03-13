@@ -32,7 +32,7 @@ from .coarse import detect_offset_at_resolution
 from .scale import (detect_scale_rotation, detect_local_scales, fit_affine_from_gcps,
                     apply_scale_rotation_precorrection, apply_local_scale_precorrection)
 from .anchors import locate_anchors
-from .matching import match_with_lightglue, match_with_loftr
+from .matching import match_with_loftr
 from .filtering import (matched_pairs_sufficient, refine_matches_phase_correlation,
                         correct_reference_offset, select_best_gcps,
                         iterative_outlier_removal,
@@ -54,14 +54,14 @@ def _make_sub_args(input_path, reference, output, match_res=5.0,
                    coarse_pass=0, best=False, anchors=None,
                    yes=True, device=None, tin_tarr_thresh=1.5,
                    skip_fpp=False, matcher_anchor="roma",
-                   matcher_dense="eloftr", grid_size=20,
+                   matcher_dense="roma", grid_size=20,
                    grid_iters=300, arap_weight=1.0,
                    mask_provider="coastal_obia", global_search=True,
                    global_search_res=40.0, global_search_top_k=3,
                    force_global=False, metadata_priors=None,
                    metadata_priors_dir=None, reference_window=None,
-                   allow_abstain=False, qa_json=None,
-                   diagnostics_dir=None):
+                   allow_abstain=False, tps_fallback=False,
+                   qa_json=None, diagnostics_dir=None):
     import argparse
     return argparse.Namespace(
         input=input_path, reference=reference, output=output,
@@ -79,6 +79,7 @@ def _make_sub_args(input_path, reference, output, match_res=5.0,
         metadata_priors_dir=metadata_priors_dir,
         reference_window=reference_window,
         allow_abstain=allow_abstain,
+        tps_fallback=tps_fallback,
         qa_json=qa_json,
         diagnostics_dir=diagnostics_dir,
     )
@@ -135,7 +136,7 @@ class AlignState:
     tin_tarr_thresh: float = 1.5
     skip_fpp: bool = False
     matcher_anchor: str = "roma"
-    matcher_dense: str = "eloftr"
+    matcher_dense: str = "roma"
     grid_size: int = 20
     grid_iters: int = 300
     arap_weight: float = 1.0
@@ -158,6 +159,7 @@ class AlignState:
     qa_json_path: Optional[str] = None
     diagnostics_dir: Optional[str] = None
     allow_abstain: bool = False
+    tps_fallback: bool = False
     abstained: bool = False
     temp_paths: List[str] = field(default_factory=list)
 
@@ -273,7 +275,7 @@ def step_setup(args) -> AlignState:
         tin_tarr_thresh=getattr(args, 'tin_tarr_thresh', 1.5),
         skip_fpp=getattr(args, 'skip_fpp', False),
         matcher_anchor=getattr(args, 'matcher_anchor', 'roma'),
-        matcher_dense=getattr(args, 'matcher_dense', 'eloftr'),
+        matcher_dense=getattr(args, 'matcher_dense', 'roma'),
         grid_size=getattr(args, 'grid_size', 20),
         grid_iters=getattr(args, 'grid_iters', 300),
         arap_weight=getattr(args, 'arap_weight', 1.0),
@@ -290,6 +292,7 @@ def step_setup(args) -> AlignState:
         qa_json_path=getattr(args, 'qa_json', None),
         diagnostics_dir=getattr(args, 'diagnostics_dir', None),
         allow_abstain=bool(getattr(args, 'allow_abstain', False)),
+        tps_fallback=bool(getattr(args, 'tps_fallback', False)),
     )
 
 
@@ -439,31 +442,49 @@ def step_coarse_offset(state: AlignState) -> AlignState:
         arr_off_xc, _ = read_overlap_region(
             src_offset, state.overlap, state.work_crs, 5.0)
 
-        ref_u8_xc = _clahe(arr_ref_xc)
-        off_u8_xc = _clahe(arr_off_xc)
-
-        # Build template from centre of valid region in reference
-        valid_ref = ref_u8_xc > 0
+        # Find valid centre on raw array (avoid CLAHE on full image)
+        valid_ref = arr_ref_xc > 0
         if np.any(valid_ref):
             rr_xc, cc_xc = np.where(valid_ref)
             rc = int(np.mean(rr_xc))
             cc_c = int(np.mean(cc_xc))
-            th = min(600, min(ref_u8_xc.shape) // 3)
-            tr0_xc = max(0, rc - th)
-            tr1_xc = min(ref_u8_xc.shape[0], rc + th)
-            tc0_xc = max(0, cc_c - th)
-            tc1_xc = min(ref_u8_xc.shape[1], cc_c + th)
-            templ_xc = ref_u8_xc[tr0_xc:tr1_xc, tc0_xc:tc1_xc]
-
-            # Search around the current best estimate ±200m
+            th = min(600, min(arr_ref_xc.shape) // 3)
             best_dx_px = int(round(state.coarse_dx / 5.0))
             best_dy_px = int(round(state.coarse_dy / 5.0))
             margin_xc = int(200 / 5.0)
+
+            # Compute crop bounds with CLAHE context padding (100 px)
+            pad = 100
+            tr0_xc = max(0, rc - th)
+            tr1_xc = min(arr_ref_xc.shape[0], rc + th)
+            tc0_xc = max(0, cc_c - th)
+            tc1_xc = min(arr_ref_xc.shape[1], cc_c + th)
+
             s_c0_xc = max(0, tc0_xc + best_dx_px - margin_xc)
-            s_c1_xc = min(off_u8_xc.shape[1], tc0_xc + templ_xc.shape[1] + best_dx_px + margin_xc)
+            s_c1_xc = min(arr_off_xc.shape[1], tc0_xc + (tr1_xc - tr0_xc) + best_dx_px + margin_xc)
             s_r0_xc = max(0, tr0_xc + best_dy_px - margin_xc)
-            s_r1_xc = min(off_u8_xc.shape[0], tr0_xc + templ_xc.shape[0] + best_dy_px + margin_xc)
-            search_xc = off_u8_xc[s_r0_xc:s_r1_xc, s_c0_xc:s_c1_xc]
+            s_r1_xc = min(arr_off_xc.shape[0], tr0_xc + (tr1_xc - tr0_xc) + best_dy_px + margin_xc)
+
+            # Crop first, then CLAHE (only on the small patches)
+            ref_crop = arr_ref_xc[max(0, tr0_xc - pad):min(arr_ref_xc.shape[0], tr1_xc + pad),
+                                  max(0, tc0_xc - pad):min(arr_ref_xc.shape[1], tc1_xc + pad)]
+            off_crop = arr_off_xc[max(0, s_r0_xc - pad):min(arr_off_xc.shape[0], s_r1_xc + pad),
+                                  max(0, s_c0_xc - pad):min(arr_off_xc.shape[1], s_c1_xc + pad)]
+
+            ref_u8_crop = _clahe(ref_crop)
+            off_u8_crop = _clahe(off_crop)
+
+            # Extract template and search from CLAHE'd crops
+            # Adjust indices for the padding offset
+            rpad_t = tr0_xc - max(0, tr0_xc - pad)
+            cpad_t = tc0_xc - max(0, tc0_xc - pad)
+            templ_xc = ref_u8_crop[rpad_t:rpad_t + (tr1_xc - tr0_xc),
+                                   cpad_t:cpad_t + (tc1_xc - tc0_xc)]
+
+            rpad_s = s_r0_xc - max(0, s_r0_xc - pad)
+            cpad_s = s_c0_xc - max(0, s_c0_xc - pad)
+            search_xc = off_u8_crop[rpad_s:rpad_s + (s_r1_xc - s_r0_xc),
+                                    cpad_s:cpad_s + (s_c1_xc - s_c0_xc)]
 
             if (templ_xc.shape[0] >= 64 and templ_xc.shape[1] >= 64 and
                     search_xc.shape[0] > templ_xc.shape[0] and
@@ -576,6 +597,7 @@ def step_handle_large_offset(state: AlignState, args) -> AlignState:
                     metadata_priors=state.metadata_prior_paths,
                     reference_window=state.reference_window,
                     allow_abstain=state.allow_abstain,
+                    tps_fallback=state.tps_fallback,
                     qa_json=state.qa_json_path,
                     diagnostics_dir=state.diagnostics_dir,
                 )
@@ -962,53 +984,19 @@ def step_feature_matching(state: AlignState, args) -> AlignState:
         except Exception as e:
             print(f"    Anchor GCP loading failed: {e}")
 
-    # 2b: LightGlue
+    # 2b: Dense matching (LoFTR, ELoFTR, or RoMa)
     target = 200 if state.best else 25
     if not matched_pairs_sufficient(state.matched_pairs, target=target):
-        print("  2b: SuperPoint + LightGlue matching...", flush=True)
+        print(f"  2b: {state.matcher_dense.upper()} tiled dense matching...", flush=True)
         try:
-            device = get_torch_device()
-            print(f"    Device: {device}")
-            lg_pairs = match_with_lightglue(
-                arr_ref_neural, arr_off_neural_shifted,
-                ref_neural_transform, off_neural_transform,
-                shift_px_x_neural, shift_py_y_neural, device=device,
-                max_keypoints=8192 if state.best else 4096,
-                model_cache=state.model_cache,
-                mask_mode=state.mask_provider)
-            state.matched_pairs.extend(lg_pairs)
-            print(f"    LightGlue: {len(lg_pairs)} matches")
-            if lg_pairs:
-                state.used_neural = True
-        except Exception as e:
-            print(f"    LightGlue failed: {e}")
-
-    # Quality gate after LightGlue
-    if not state.best:
-        lg_auto = [p for p in state.matched_pairs if not p[5].startswith("anchor:")]
-        if len(lg_auto) >= 6:
-            lg_src = np.array([(p[2], p[3]) for p in lg_auto])
-            lg_dst = np.array([(p[0], p[1]) for p in lg_auto])
-            _, lg_res = fit_affine_from_gcps(lg_src, lg_dst)
-            lg_mean_res = np.mean(lg_res)
-            if lg_mean_res > 50:
-                print(f"    LightGlue quality poor ({lg_mean_res:.0f}m residual), "
-                      f"discarding for LoFTR fallback")
-                state.matched_pairs = [p for p in state.matched_pairs
-                                       if p[5].startswith("anchor:")]
-
-    # 2c: Dense matching (LoFTR, ELoFTR, or RoMa)
-    if not matched_pairs_sufficient(state.matched_pairs, target=target):
-        print(f"  2c: {state.matcher_dense.upper()} tiled dense matching...", flush=True)
-        try:
-            from .matching import match_with_eloftr, match_with_roma
-            
             matcher_fn = match_with_loftr
             if state.matcher_dense == "eloftr":
+                from .matching import match_with_eloftr
                 matcher_fn = match_with_eloftr
             elif state.matcher_dense == "roma":
+                from .matching import match_with_roma
                 matcher_fn = match_with_roma
-                
+
             dense_pairs = matcher_fn(
                 arr_ref_neural, arr_off_neural_shifted,
                 ref_neural_transform, off_neural_transform,
@@ -1137,11 +1125,12 @@ def step_feature_matching(state: AlignState, args) -> AlignState:
             else:
                 arr_off_c_shifted = shift_array(arr_off_c, -shift_x_c, -shift_y_c)
 
-            from .matching import match_with_eloftr, match_with_roma
             matcher_fn = match_with_loftr
             if state.matcher_dense == "eloftr":
+                from .matching import match_with_eloftr
                 matcher_fn = match_with_eloftr
             elif state.matcher_dense == "roma":
+                from .matching import match_with_roma
                 matcher_fn = match_with_roma
 
             coarse_pairs = matcher_fn(
@@ -1692,31 +1681,82 @@ def step_validate_and_filter(state: AlignState) -> AlignState:
             state.gcps.append((col, row, corrected_gx, corrected_gy))
         state.mean_residual = np.sqrt(np.mean((offsets_e - med_de) ** 2 + (offsets_n - med_dn) ** 2))
     else:
-        # Cross-validation
+        # Cross-validation (5-fold for stable estimate with sparse GCPs)
         native_res = max(state.offset_res_m, state.ref_res_m)
         residual_threshold = max(native_res * 5, 10.0)
         if len(state.matched_pairs) >= 10:
-            n_cv = max(2, len(state.matched_pairs) // 5)
+            k_folds = 5
             indices = np.arange(len(state.matched_pairs))
             np.random.seed(42)
             np.random.shuffle(indices)
-            cv_idx = indices[:n_cv]
-            train_idx = indices[n_cv:]
-            train_pairs = [state.matched_pairs[i] for i in train_idx]
-            train_offset = np.array([(p[2], p[3]) for p in train_pairs])
-            train_ref = np.array([(p[0], p[1]) for p in train_pairs])
-            train_weights = np.array([p[4] for p in train_pairs])
-            M_cv, _ = fit_affine_from_gcps(train_offset, train_ref, weights=train_weights)
             cv_errors = []
-            for i in cv_idx:
-                ogx, ogy = state.matched_pairs[i][2], state.matched_pairs[i][3]
-                rgx, rgy = state.matched_pairs[i][0], state.matched_pairs[i][1]
-                pred_x = M_cv[0, 0] * ogx + M_cv[0, 1] * ogy + M_cv[0, 2]
-                pred_y = M_cv[1, 0] * ogx + M_cv[1, 1] * ogy + M_cv[1, 2]
-                cv_errors.append(np.sqrt((pred_x - rgx) ** 2 + (pred_y - rgy) ** 2))
+            fold_size = len(indices) // k_folds
+            for fold in range(k_folds):
+                start = fold * fold_size
+                end = start + fold_size if fold < k_folds - 1 else len(indices)
+                test_idx = indices[start:end]
+                train_idx = np.concatenate([indices[:start], indices[end:]])
+                train_pairs = [state.matched_pairs[i] for i in train_idx]
+                train_offset = np.array([(p[2], p[3]) for p in train_pairs])
+                train_ref = np.array([(p[0], p[1]) for p in train_pairs])
+                train_weights = np.array([p[4] for p in train_pairs])
+                M_cv, _ = fit_affine_from_gcps(train_offset, train_ref, weights=train_weights)
+                for i in test_idx:
+                    ogx, ogy = state.matched_pairs[i][2], state.matched_pairs[i][3]
+                    rgx, rgy = state.matched_pairs[i][0], state.matched_pairs[i][1]
+                    pred_x = M_cv[0, 0] * ogx + M_cv[0, 1] * ogy + M_cv[0, 2]
+                    pred_y = M_cv[1, 0] * ogx + M_cv[1, 1] * ogy + M_cv[1, 2]
+                    cv_errors.append(np.sqrt((pred_x - rgx) ** 2 + (pred_y - rgy) ** 2))
             state.cv_mean = float(np.mean(cv_errors))
-            print(f"  Cross-validation: fit={state.mean_residual:.1f}m, "
+            print(f"  Cross-validation ({k_folds}-fold, n={len(state.matched_pairs)}): "
+                  f"fit={state.mean_residual:.1f}m, "
                   f"CV={state.cv_mean:.1f}m (threshold={residual_threshold:.0f}m)")
+
+            # If cv_mean is high, the affine M_geo is polluted by outlier GCPs.
+            # Refit M_geo using RANSAC to get a robust affine for holdout validation.
+            # GCPs for the grid optimizer are NOT changed — only M_geo for QA.
+            if state.cv_mean > 40.0 and len(state.matched_pairs) >= 8:
+                all_offset = np.array([(p[2], p[3]) for p in state.matched_pairs])
+                all_ref = np.array([(p[0], p[1]) for p in state.matched_pairs])
+                best_inliers = None
+                best_M = None
+                n_pts = len(state.matched_pairs)
+                rng = np.random.RandomState(42)
+                for _ in range(200):
+                    sample = rng.choice(n_pts, 3, replace=False)
+                    M_trial, _ = fit_affine_from_gcps(
+                        all_offset[sample], all_ref[sample])
+                    pred_x = M_trial[0, 0] * all_offset[:, 0] + M_trial[0, 1] * all_offset[:, 1] + M_trial[0, 2]
+                    pred_y = M_trial[1, 0] * all_offset[:, 0] + M_trial[1, 1] * all_offset[:, 1] + M_trial[1, 2]
+                    errs = np.sqrt((pred_x - all_ref[:, 0]) ** 2 + (pred_y - all_ref[:, 1]) ** 2)
+                    inlier_mask = errs < 40.0  # 40m inlier threshold
+                    n_in = int(inlier_mask.sum())
+                    if best_inliers is None or n_in > best_inliers:
+                        best_inliers = n_in
+                        best_M = M_trial
+                        best_mask = inlier_mask
+                if best_inliers >= 6:
+                    # Refit from all inliers
+                    inlier_offset = all_offset[best_mask]
+                    inlier_ref = all_ref[best_mask]
+                    inlier_weights = np.array([
+                        state.matched_pairs[i][4] for i in range(n_pts) if best_mask[i]])
+                    M_robust, robust_res = fit_affine_from_gcps(
+                        inlier_offset, inlier_ref, weights=inlier_weights)
+                    robust_mean = float(np.mean(robust_res))
+                    if robust_mean < state.cv_mean * 0.5:
+                        state.M_geo = M_robust
+                        # Recompute cv_mean with robust M_geo
+                        cv_errors_robust = []
+                        for i in range(n_pts):
+                            ogx, ogy = state.matched_pairs[i][2], state.matched_pairs[i][3]
+                            rgx, rgy = state.matched_pairs[i][0], state.matched_pairs[i][1]
+                            pred_x = M_robust[0, 0] * ogx + M_robust[0, 1] * ogy + M_robust[0, 2]
+                            pred_y = M_robust[1, 0] * ogx + M_robust[1, 1] * ogy + M_robust[1, 2]
+                            cv_errors_robust.append(np.sqrt((pred_x - rgx) ** 2 + (pred_y - rgy) ** 2))
+                        state.cv_mean = float(np.mean(cv_errors_robust))
+                        print(f"  Robust M_geo refit: {best_inliers}/{n_pts} inliers, "
+                              f"mean residual={robust_mean:.1f}m, CV={state.cv_mean:.1f}m")
 
     state.gcp_records = gcps_from_legacy(state.gcps, source="selected_gcp")
 
@@ -1838,6 +1878,9 @@ def step_select_warp_and_apply(state: AlignState) -> AlignState:
     all_gcps = list(state.gcps) + list(state.boundary_gcps)
     print(f"Step 5: Grid Optimization Warp ({len(state.gcps)} GCPs "
           f"+ {len(state.boundary_gcps)} boundary = {len(all_gcps)} total)", flush=True)
+    # Free neural models before grid optimizer + flow refinement to reclaim GPU memory
+    if state.model_cache is not None:
+        state.model_cache.close()
     apply_warp(state.current_input, state.output_path, state.reference_path, all_gcps,
                state.work_crs,
                output_bounds=state.overlap,
@@ -1845,7 +1888,8 @@ def step_select_warp_and_apply(state: AlignState) -> AlignState:
                output_crs=output_crs,
                grid_size=state.grid_size,
                grid_iters=state.grid_iters,
-               arap_weight=state.arap_weight)
+               arap_weight=state.arap_weight,
+               n_real_gcps_in=len(state.gcps))
 
     # ------------------------------------------------------------------
     # QA + TPS fallback gate
@@ -1868,40 +1912,41 @@ def step_select_warp_and_apply(state: AlignState) -> AlignState:
     except Exception as e:
         print(f"  Grid QA failed: {e}", flush=True)
 
-    # TPS fallback — run always so we have a baseline
+    # TPS fallback — only run when --tps-fallback is set
     tps_tmp = state.output_path.replace('.tif', '_tps_fallback.tif')
     tps_ok = False
     qa_tps = None
-    try:
-        print("  Running TPS fallback warp for comparison...", flush=True)
-        tps_ok = _tps_warp_gcps(
-            state.current_input, tps_tmp,
-            all_gcps, state.work_crs, output_crs,
-            state.overlap, state.offset_res_m,
-        )
-        if tps_ok:
-            try:
-                from .flow_refine import apply_flow_refinement_to_file
-                flow_applied = apply_flow_refinement_to_file(
-                    tps_tmp, state.reference_path,
-                    state.work_crs, state.overlap,
-                    state.offset_res_m,
-                )
-                if flow_applied:
-                    print("  [FlowRefine-TPS] Applied flow refinement to TPS result", flush=True)
-            except Exception as e:
-                print(f"  [FlowRefine-TPS] Skipped ({e})", flush=True)
-            qa_tps = evaluate_alignment_quality_paths(
-                tps_tmp,
-                state.reference_path,
-                state.overlap,
-                state.work_crs,
-                eval_res=qa_eval_res,
-                mask_mode=state.mask_provider,
+    if state.tps_fallback:
+        try:
+            print("  Running TPS fallback warp for comparison...", flush=True)
+            tps_ok = _tps_warp_gcps(
+                state.current_input, tps_tmp,
+                all_gcps, state.work_crs, output_crs,
+                state.overlap, state.offset_res_m,
             )
-            print(f"  TPS fallback QA:  {_qa_label(qa_tps)}", flush=True)
-    except Exception as e:
-        print(f"  TPS fallback failed: {e}", flush=True)
+            if tps_ok:
+                try:
+                    from .flow_refine import apply_flow_refinement_to_file
+                    flow_applied = apply_flow_refinement_to_file(
+                        tps_tmp, state.reference_path,
+                        state.work_crs, state.overlap,
+                        state.offset_res_m,
+                    )
+                    if flow_applied:
+                        print("  [FlowRefine-TPS] Applied flow refinement to TPS result", flush=True)
+                except Exception as e:
+                    print(f"  [FlowRefine-TPS] Skipped ({e})", flush=True)
+                qa_tps = evaluate_alignment_quality_paths(
+                    tps_tmp,
+                    state.reference_path,
+                    state.overlap,
+                    state.work_crs,
+                    eval_res=qa_eval_res,
+                    mask_mode=state.mask_provider,
+                )
+                print(f"  TPS fallback QA:  {_qa_label(qa_tps)}", flush=True)
+        except Exception as e:
+            print(f"  TPS fallback failed: {e}", flush=True)
 
     state.qa_reports = []
     report_grid = build_candidate_report(
@@ -1924,7 +1969,7 @@ def step_select_warp_and_apply(state: AlignState) -> AlignState:
     )
 
     report_tps = None
-    if tps_ok and os.path.exists(tps_tmp):
+    if state.tps_fallback and tps_ok and os.path.exists(tps_tmp):
         report_tps = build_candidate_report(
             "tps",
             tps_tmp,
@@ -1945,21 +1990,21 @@ def step_select_warp_and_apply(state: AlignState) -> AlignState:
         )
 
     # Decide which result to keep
-    grid_score = report_grid.total_score
-    tps_score = report_tps.total_score if report_tps is not None else float('inf')
     selected_candidate = "grid"
-
-    if tps_ok and tps_score < grid_score * 0.97:
-        print(f"  TPS fallback is better (score {tps_score:.0f} vs grid {grid_score:.0f}) "
-              f"— using TPS result.", flush=True)
-        os.replace(tps_tmp, state.output_path)
-        selected_candidate = "tps"
-    else:
-        if grid_score < float('inf'):
-            print(f"  Grid optimizer wins (score {grid_score:.0f} vs TPS {tps_score:.0f}).",
-                  flush=True)
-        if tps_ok and os.path.exists(tps_tmp):
-            os.remove(tps_tmp)
+    if state.tps_fallback:
+        grid_score = report_grid.total_score
+        tps_score = report_tps.total_score if report_tps is not None else float('inf')
+        if tps_ok and tps_score < grid_score * 0.97:
+            print(f"  TPS fallback is better (score {tps_score:.0f} vs grid {grid_score:.0f}) "
+                  f"— using TPS result.", flush=True)
+            os.replace(tps_tmp, state.output_path)
+            selected_candidate = "tps"
+        else:
+            if grid_score < float('inf'):
+                print(f"  Grid optimizer wins (score {grid_score:.0f} vs TPS {tps_score:.0f}).",
+                      flush=True)
+            if tps_ok and os.path.exists(tps_tmp):
+                os.remove(tps_tmp)
 
     selected_report = report_grid if selected_candidate == "grid" else report_tps
     if selected_report is not None:

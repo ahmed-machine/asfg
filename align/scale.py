@@ -455,7 +455,7 @@ def detect_scale_rotation(src_offset, src_ref, overlap, work_crs,
 # ---------------------------------------------------------------------------
 
 def detect_local_scales(src_offset, src_ref, overlap, work_crs,
-                        coarse_dx, coarse_dy, grid_cols=4, grid_rows=3,
+                        coarse_dx, coarse_dy, grid_cols=3, grid_rows=3,
                         model_cache=None):
     """Detect scale and rotation per-patch across the overlap region using LoFTR.
 

@@ -93,9 +93,9 @@ def main():
         help="Model to use for anchor GCP matching (default: roma)"
     )
     parser.add_argument(
-        "--matcher-dense", type=str, default="eloftr",
+        "--matcher-dense", type=str, default="roma",
         choices=["eloftr", "roma", "loftr"],
-        help="Model to use for dense tiled matching (default: eloftr)"
+        help="Model to use for dense tiled matching (default: roma)"
     )
     parser.add_argument(
         "--mask-provider", type=str, default="coastal_obia",
@@ -157,6 +157,10 @@ def main():
     parser.add_argument(
         "--arap-weight", type=float, default=1.0,
         help="ARAP regularization weight (default: 1.0)"
+    )
+    parser.add_argument(
+        "--tps-fallback", action="store_true", default=False,
+        help="Run TPS fallback warp for comparison (default: off)"
     )
     args = parser.parse_args()
 

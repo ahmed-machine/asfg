@@ -25,18 +25,20 @@ class ModelCache:
     def __init__(self, device: str = "cpu"):
         self.device = device
         self._loftr = None
-        self._superpoint = None
-        self._lightglue = None
         self._roma = None
         self._eloftr = None
 
     @property
     def roma(self):
         if self._roma is None:
-            from .roma import roma_outdoor
-
-            print(f"  [ModelCache] Loading RoMa on {self.device}")
-            self._roma = roma_outdoor(device=self.device, use_custom_corr=False)
+            torch.set_float32_matmul_precision("highest")
+            from .romav2 import RoMaV2
+            from .romav2.device import set_device
+            set_device(self.device)
+            print(f"  [ModelCache] Loading RoMa v2 on {self.device}")
+            cfg = RoMaV2.Cfg(setting="fast", compile=False)
+            self._roma = RoMaV2(cfg)
+            print(f"  [ModelCache] RoMa v2 ready")
         return self._roma
 
     @property
@@ -98,46 +100,8 @@ class ModelCache:
                 self._loftr = model
         return self._loftr
 
-    @property
-    def superpoint(self):
-        if self._superpoint is None:
-            from lightglue import SuperPoint
-
-            print(f"  [ModelCache] Loading SuperPoint on {self.device}")
-            model = SuperPoint(max_num_keypoints=8192).eval().to(self.device)
-            try:
-                if hasattr(torch, "compile") and self.device == "cuda":
-                    self._superpoint = torch.compile(model)
-                else:
-                    self._superpoint = model
-            except Exception:
-                self._superpoint = model
-        return self._superpoint
-
-    @property
-    def lightglue(self):
-        if self._lightglue is None:
-            from lightglue import LightGlue
-
-            print(f"  [ModelCache] Loading LightGlue on {self.device}")
-            model = LightGlue(
-                features="superpoint",
-                depth_confidence=-1,
-                width_confidence=-1,
-            ).eval().to(self.device)
-            try:
-                if hasattr(torch, "compile") and self.device == "cuda":
-                    self._lightglue = torch.compile(model)
-                else:
-                    self._lightglue = model
-            except Exception:
-                self._lightglue = model
-        return self._lightglue
-
     def close(self) -> None:
         self._loftr = None
-        self._superpoint = None
-        self._lightglue = None
         self._roma = None
         self._eloftr = None
         if self.device != "cpu":

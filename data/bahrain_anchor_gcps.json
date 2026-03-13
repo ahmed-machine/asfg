@@ -362,6 +362,26 @@
       "lat": 26.05408333429288,
       "feature_type": "intersection",
       "confidence": "high"
+    },
+    {
+      "name": "oil tanks in low sitra",
+      "lon": 50.624882038669654,
+      "lat": 26.144989161316921,
+      "feature_type": "industrial",
+      "confidence": "high",
+      "description": "Oil storage tanks in lower Sitra, east of main Bahrain island. Distinctive circular tank farm visible in satellite imagery.",
+      "notes": "BAPCO oil infrastructure, built mid-20th century",
+      "era": "Historic (mid-20th century - present)"
+    },
+    {
+      "name": "Sanabis boys school",
+      "lon": 50.544261157387076,
+      "lat": 26.225711410539709,
+      "feature_type": "building",
+      "confidence": "high",
+      "description": "Sanabis Boys School in northern Manama. Distinctive building complex visible in satellite imagery.",
+      "notes": "School building, stable structure",
+      "era": "Historic (mid-20th century - present)"
     }
   ]
 }

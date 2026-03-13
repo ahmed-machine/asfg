@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.interpolate import RBFInterpolator
 
 # ---------------------------------------------------------------------------
 # DINOv2 model singleton
@@ -189,7 +190,7 @@ def asap_regularization(
         # Per-cell weight: reduce ARAP where GCPs are dense
         # cr1/cr2 shape is (grid_H-1, grid_W-1), crop density map to match
         dm = gcp_density_map[:grid_H - 1, :grid_W - 1].to(residual.device)
-        cell_weight = (1.0 - dm * 0.8).unsqueeze(0).unsqueeze(0)  # (1, 1, H-2, W-1)
+        cell_weight = (1.0 - dm * 0.3).unsqueeze(0).unsqueeze(0)  # (1, 1, H-2, W-1)
         arap_loss = ((cr1 + cr2) * cell_weight).mean() * scale
     else:
         arap_loss = (cr1.mean() + cr2.mean()) * scale
@@ -239,9 +240,12 @@ def memory_efficient_chamfer(
             d = (dx ** 2 + dy ** 2).sqrt()           # metres, shape (C, M)
             mins.append(d.min(dim=1).values)          # (C,)
         all_mins = torch.cat(mins)
-        # Soft clamp: beyond max_dist_m, gradient = 0.1 (not zero)
+        # Robust soft clamp (Huber-style): beyond max_dist_m, gradient = 0.1.
+        # Points with large chamfer distance are likely reclamation (real
+        # coastline change), not misalignment — capping their gradient
+        # prevents reclamation zones from distorting the overall warp.
         all_mins = torch.where(all_mins <= max_dist_m, all_mins,
-                               max_dist_m + (all_mins - max_dist_m) * 0.3)
+                               max_dist_m + (all_mins - max_dist_m) * 0.1)
         return all_mins.mean()
 
     return 0.5 * (directed(pts1, pts2) + directed(pts2, pts1))
@@ -764,20 +768,11 @@ def optimize_grid(
 # Hierarchical coarse-to-fine grid optimisation (Improvement 1 + 3 + 5)
 # ---------------------------------------------------------------------------
 
-def _compute_affine_baseline(
-    tgt_pts_n: torch.Tensor,
-    src_pts_n: torch.Tensor,
-    grid_size: Tuple[int, int],
-    device: torch.device,
-    W_t: int, H_t: int,
-    output_res_m: float,
-) -> Optional[torch.Tensor]:
-    """Fit affine from GCPs and return baseline displacement (1, 2, H, W)."""
-    if tgt_pts_n.shape[0] < 3:
-        return None
-    tgt_np = tgt_pts_n.cpu().numpy()
-    src_np = src_pts_n.cpu().numpy()
+def _fit_affine(tgt_np, src_np):
+    """Fit a 6-param affine from corresponding points. Returns params or None."""
     n = len(tgt_np)
+    if n < 3:
+        return None
     A = np.zeros((2 * n, 6), dtype=np.float32)
     b = np.zeros(2 * n, dtype=np.float32)
     for i in range(n):
@@ -785,14 +780,172 @@ def _compute_affine_baseline(
         A[2*i+1] = [0, 0, 0, tgt_np[i, 0], tgt_np[i, 1], 1]
         b[2*i]   = src_np[i, 0]
         b[2*i+1] = src_np[i, 1]
-    affine_params, _, rank, _ = np.linalg.lstsq(A, b, rcond=None)
-    print(f"  Affine init rank={rank}, params={affine_params.round(4)}", flush=True)
+    params, _, rank, _ = np.linalg.lstsq(A, b, rcond=None)
+    return params
+
+
+def _fit_rbf_residual(
+    real_tgt: np.ndarray,
+    real_src: np.ndarray,
+    affine_params: np.ndarray,
+    xx: np.ndarray,
+    yy: np.ndarray,
+    scale_m: float,
+) -> Optional[dict]:
+    """Fit RBF interpolation of affine residuals on real GCPs.
+
+    Returns dict with 'src_x', 'src_y' grids and diagnostics, or None on failure.
+    Multiquadric kernel with linear polynomial augmentation ensures smooth
+    extrapolation (decays to affine far from GCPs).
+    """
+    n = len(real_tgt)
+    if n < 6:
+        return None
+
+    # Affine predictions on real GCPs
+    aff_x, aff_y = _apply_affine(affine_params, real_tgt[:, 0], real_tgt[:, 1])
+    res_x = real_src[:, 0] - aff_x
+    res_y = real_src[:, 1] - aff_y
+
+    # Adaptive epsilon: mean nearest-neighbor distance among GCPs
+    # Broader kernels capture systematic distortion, not per-GCP noise
+    from scipy.spatial import cKDTree
+    tree = cKDTree(real_tgt)
+    nn_dists, _ = tree.query(real_tgt, k=2)
+    mean_nn_dist = float(nn_dists[:, 1].mean())
+    epsilon = mean_nn_dist * 1.0
+
+    # Smoothing: 50% of median squared residual — high because GCP residuals
+    # are dominated by match noise, not systematic camera distortion
+    med_res_sq = float(np.median(res_x**2 + res_y**2))
+    smoothing = med_res_sq * 0.5
+
+    try:
+        rbf_dx = RBFInterpolator(
+            real_tgt, res_x, kernel='multiquadric', epsilon=epsilon,
+            smoothing=smoothing, degree=1,
+        )
+        rbf_dy = RBFInterpolator(
+            real_tgt, res_y, kernel='multiquadric', epsilon=epsilon,
+            smoothing=smoothing, degree=1,
+        )
+    except Exception as e:
+        print(f"  RBF fit failed: {e}", flush=True)
+        return None
+
+    # Evaluate on grid
+    grid_pts = np.column_stack([xx.ravel(), yy.ravel()])
+    dx_grid = rbf_dx(grid_pts).reshape(xx.shape)
+    dy_grid = rbf_dy(grid_pts).reshape(yy.shape)
+
+    # Safety clamp: max 500m deviation from affine
+    max_dev_norm = 500.0 / scale_m
+    dev = np.sqrt(dx_grid**2 + dy_grid**2)
+    max_dev = float(dev.max())
+    if max_dev > max_dev_norm:
+        clamp_factor = np.minimum(1.0, max_dev_norm / np.maximum(dev, 1e-12))
+        dx_grid *= clamp_factor
+        dy_grid *= clamp_factor
+        print(f"  RBF clamped: max_dev {max_dev*scale_m:.1f}m > 500m", flush=True)
+
+    # Compose: affine + RBF residual
+    aff_x_grid, aff_y_grid = _apply_affine(affine_params, xx, yy)
+    src_x = aff_x_grid + dx_grid
+    src_y = aff_y_grid + dy_grid
+
+    # RBF RMS on real GCPs (evaluate RBF at GCP locations for diagnostics)
+    rbf_pred_x = aff_x + rbf_dx(real_tgt)
+    rbf_pred_y = aff_y + rbf_dy(real_tgt)
+    rbf_rms = float(np.sqrt(np.mean((rbf_pred_x - real_src[:, 0])**2 + (rbf_pred_y - real_src[:, 1])**2)))
+
+    return {
+        'src_x': src_x,
+        'src_y': src_y,
+        'rbf_rms': rbf_rms,
+        'max_dev_m': float(max_dev * scale_m),
+        'epsilon': epsilon,
+        'smoothing': smoothing,
+        'mean_nn_dist': mean_nn_dist,
+    }
+
+
+def _apply_affine(params, xx, yy):
+    """Apply affine params to grid, return (src_x, src_y)."""
+    src_x = params[0]*xx + params[1]*yy + params[2]
+    src_y = params[3]*xx + params[4]*yy + params[5]
+    return src_x, src_y
+
+
+def _compute_affine_baseline(
+    tgt_pts_n: torch.Tensor,
+    src_pts_n: torch.Tensor,
+    grid_size: Tuple[int, int],
+    device: torch.device,
+    W_t: int, H_t: int,
+    output_res_m: float,
+    n_real_gcps: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    """Fit affine from GCPs and return baseline displacement (1, 2, H, W).
+
+    Tries RBF interpolation of affine residuals on real GCPs to capture
+    spatially-varying camera/film distortion. Falls back to global affine
+    if RBF doesn't improve enough.
+    """
+    if tgt_pts_n.shape[0] < 3:
+        return None
+    tgt_np = tgt_pts_n.cpu().numpy()
+    src_np = src_pts_n.cpu().numpy()
 
     y_g = np.linspace(-1, 1, grid_size[0], dtype=np.float32)
     x_g = np.linspace(-1, 1, grid_size[1], dtype=np.float32)
     yy, xx = np.meshgrid(y_g, x_g, indexing='ij')
-    src_x = affine_params[0]*xx + affine_params[1]*yy + affine_params[2]
-    src_y = affine_params[3]*xx + affine_params[4]*yy + affine_params[5]
+
+    # Global affine (always computed as fallback)
+    global_params = _fit_affine(tgt_np, src_np)
+    if global_params is None:
+        return None
+    print(f"  Affine init params={global_params.round(4)}", flush=True)
+
+    scale = (W_t / 2.0) * output_res_m  # normalized → metres
+
+    # Compute global affine residual
+    aff_src_x, aff_src_y = _apply_affine(global_params, tgt_np[:, 0], tgt_np[:, 1])
+    affine_rms = np.sqrt(np.mean((aff_src_x - src_np[:, 0])**2 + (aff_src_y - src_np[:, 1])**2))
+    print(f"  Affine RMS: {affine_rms*scale:.1f}m", flush=True)
+
+    # Try RBF interpolation of affine residuals using ONLY real GCPs.
+    # Boundary GCPs are placed at affine-predicted positions (zero residual),
+    # so they carry no distortion signal. RBF naturally decays to affine
+    # far from GCPs (no extrapolation blowup like polynomials).
+    n_real = n_real_gcps if n_real_gcps is not None else len(tgt_np)
+    real_tgt = tgt_np[:n_real]
+    real_src = src_np[:n_real]
+
+    if n_real >= 6:
+        rbf_result = _fit_rbf_residual(real_tgt, real_src, global_params, xx, yy, scale)
+        if rbf_result is not None:
+            # Compare RBF vs affine RMS on real GCPs
+            aff_real_x, aff_real_y = _apply_affine(global_params, real_tgt[:, 0], real_tgt[:, 1])
+            affine_rms_real = float(np.sqrt(np.mean((aff_real_x - real_src[:, 0])**2 + (aff_real_y - real_src[:, 1])**2)))
+            rbf_rms = rbf_result['rbf_rms']
+            print(f"  RBF baseline: RMS {rbf_rms*scale:.1f}m vs affine {affine_rms_real*scale:.1f}m "
+                  f"({n_real} GCPs, eps={rbf_result['epsilon']:.4f}, smooth={rbf_result['smoothing']:.6f})", flush=True)
+            print(f"  RBF max_dev={rbf_result['max_dev_m']:.1f}m, mean_nn_dist={rbf_result['mean_nn_dist']:.4f}", flush=True)
+
+            # Accept RBF if it improves real-GCP RMS by >5%
+            if rbf_rms < affine_rms_real * 0.95:
+                improvement_m = (affine_rms_real - rbf_rms) * scale
+                print(f"  Using RBF baseline (improvement: {improvement_m:.1f}m, "
+                      f"{(1 - rbf_rms/affine_rms_real)*100:.1f}%)", flush=True)
+                baseline = torch.from_numpy(
+                    np.stack([rbf_result['src_x'] - xx, rbf_result['src_y'] - yy], axis=0)
+                ).unsqueeze(0).to(device)
+                return baseline
+            else:
+                print(f"  RBF not used: improvement {(1 - rbf_rms/affine_rms_real)*100:.1f}% < 5%", flush=True)
+
+    # Fall back to global affine
+    src_x, src_y = _apply_affine(global_params, xx, yy)
     baseline = torch.from_numpy(
         np.stack([src_x - xx, src_y - yy], axis=0)
     ).unsqueeze(0).to(device)
@@ -803,14 +956,28 @@ def _compute_gcp_weights(
     tgt_pts_n: torch.Tensor,
     source_pts: np.ndarray,
     src_shape: Tuple[int, int],
+    n_real_gcps: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute per-GCP confidence weights.
 
-    With good spatial coverage (41+ GCPs across west/east/islands/reefs),
-    uniform weighting lets the optimizer use all constraints equally.
-    Returns (N,) tensor of uniform 1.0 weights.
+    Real GCPs get weight 1.0.  Virtual boundary GCPs (indices >= n_real_gcps)
+    get distance-dependent weight: 0 near real GCPs (where they'd fight real
+    data), ramping up to 0.15 in truly data-sparse regions.
     """
-    return torch.ones(tgt_pts_n.shape[0], device=tgt_pts_n.device)
+    n_total = tgt_pts_n.shape[0]
+    weights = torch.ones(n_total, device=tgt_pts_n.device)
+    if n_real_gcps is not None and n_real_gcps < n_total:
+        real_pts = tgt_pts_n[:n_real_gcps].cpu().numpy()
+        virtual_pts = tgt_pts_n[n_real_gcps:].cpu().numpy()
+        # Distance from each virtual GCP to nearest real GCP (normalized coords)
+        from scipy.spatial import cKDTree
+        tree = cKDTree(real_pts)
+        dists, _ = tree.query(virtual_pts, k=1)
+        # Ramp: 0.05 when near real GCP (dist < 0.1), 0.15 when far (dist > 0.3)
+        # Floor at 1/3 base weight prevents north drift from unconstrained boundaries
+        ramp = np.clip((dists - 0.1) / 0.2, 0.0, 1.0).astype(np.float32)
+        weights[n_real_gcps:] = torch.from_numpy(ramp * 0.10 + 0.05).to(tgt_pts_n.device)
+    return weights
 
 
 def _run_single_level(
@@ -856,15 +1023,31 @@ def _run_single_level(
     feat_scale_m = feat_px_per_token * output_res_m
 
     optimizer = torch.optim.Adam(warper.parameters(), lr=lr)
+    # Cosine annealing with warm restarts every 100 iters to escape plateaus
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=100, T_mult=1, eta_min=lr * 0.1
+    )
     cached_feat_val = torch.tensor(0.0, device=device)
     cached_feat_mid_val = torch.tensor(0.0, device=device)
 
     WARMUP_ITERS = min(30, iters // 4)
     FEAT_CAD = 5
 
+    # Early stopping: track loss history
+    loss_history = []
+    EARLY_STOP_WINDOW = 20
+    EARLY_STOP_THRESHOLD = 0.0003  # 0.03% improvement
+    final_iter = iters
+
     for i in range(iters):
         optimizer.zero_grad()
         warmup = min(1.0, i / max(1, WARMUP_ITERS))
+
+        # Regularization decay: reduce ARAP/Laplacian by 0.5x after warmup
+        # to allow finer deformation once coarse alignment is stable
+        reg_decay = 1.0 if i < WARMUP_ITERS else 0.5
+        eff_w_arap = w_arap * reg_decay
+        eff_w_laplacian = w_laplacian * reg_decay
 
         # 1. Data loss (GCPs) with per-GCP confidence weights
         if tgt_pts_n.shape[0] > 0:
@@ -915,7 +1098,7 @@ def _run_single_level(
             feat_loss = cached_feat_val
             feat_mid_loss = cached_feat_mid_val
 
-        # 4. ARAP + Laplacian on residual
+        # 4. ARAP + Laplacian on residual (with decay)
         arap_loss, laplacian_loss = asap_regularization(
             warper.residual, grid_size=grid_size,
             target_size=(H_t, W_t), output_res_m=output_res_m,
@@ -926,19 +1109,24 @@ def _run_single_level(
         res_m = ((warper.residual[:, 0].pow(2).mean() * scale_x_m**2 +
                   warper.residual[:, 1].pow(2).mean() * scale_y_m**2 + 1e-8).sqrt())
 
-        total = (w_data      * data_loss                       +
-                 w_chamfer   * chamfer_loss     * warmup       +
-                 w_feat      * feat_loss        * warmup       +
-                 w_feat_mid  * feat_mid_loss    * warmup       +
-                 w_arap      * arap_loss                       +
-                 w_laplacian * laplacian_loss                   +
-                 w_disp      * res_m)
+        total = (w_data          * data_loss                       +
+                 w_chamfer       * chamfer_loss     * warmup       +
+                 w_feat          * feat_loss        * warmup       +
+                 w_feat_mid      * feat_mid_loss    * warmup       +
+                 eff_w_arap      * arap_loss                       +
+                 eff_w_laplacian * laplacian_loss                   +
+                 w_disp          * res_m)
 
         total.backward()
         optimizer.step()
+        scheduler.step()
 
         with torch.no_grad():
             warper.residual.clamp_(-max_residual_norm, max_residual_norm)
+
+        # Track loss for early stopping
+        loss_val = total.item()
+        loss_history.append(loss_val)
 
         if i == 0:
             res_abs_max = warper.residual.abs().max().item()
@@ -946,7 +1134,7 @@ def _run_single_level(
                 f"  [{level_name}] Iter 1: data={w_data*data_loss.item():.2f} "
                 f"cham={w_chamfer*chamfer_loss.item():.2f} "
                 f"feat={w_feat*feat_loss.item():.4f} "
-                f"arap={w_arap*arap_loss.item():.4f} "
+                f"arap={eff_w_arap*arap_loss.item():.4f} "
                 f"res|max|={res_abs_max:.6f}",
                 flush=True
             )
@@ -963,6 +1151,22 @@ def _run_single_level(
                 f"res|max|={res_abs_max:.6f} resRMS={res_rms_m:.2f}m",
                 flush=True
             )
+
+        # Early stopping: check if loss has plateaued
+        if i >= WARMUP_ITERS + EARLY_STOP_WINDOW:
+            old_loss = loss_history[-(EARLY_STOP_WINDOW + 1)]
+            improvement = (old_loss - loss_val) / (abs(old_loss) + 1e-8)
+            if improvement < EARLY_STOP_THRESHOLD:
+                final_iter = i + 1
+                print(
+                    f"  [{level_name}] Early stop at iter {final_iter}/{iters} "
+                    f"(<{EARLY_STOP_THRESHOLD*100:.1f}% improvement over {EARLY_STOP_WINDOW} iters)",
+                    flush=True
+                )
+                break
+
+    if final_iter == iters:
+        print(f"  [{level_name}] Completed all {iters} iters (no early stop)", flush=True)
 
     return warper
 
@@ -987,6 +1191,7 @@ def optimize_grid_hierarchical(
     w_laplacian: float = 0.2,
     w_disp: float = 0.05,
     max_residual_norm: float = 0.03,
+    n_real_gcps: Optional[int] = None,
 ) -> 'GridWarper':
     """Hierarchical coarse-to-fine grid optimisation.
 
@@ -997,7 +1202,7 @@ def optimize_grid_hierarchical(
     levels since smoothness is already ensured by the coarser levels.
     """
     if levels is None:
-        levels = [(8, 200), (24, 200), (64, 200)]
+        levels = [(8, 300), (24, 300), (64, 500)]
 
     # CPU is faster than MPS for tiny grid tensors and avoids compatibility issues.
     device = torch.device('cpu')
@@ -1102,7 +1307,8 @@ def optimize_grid_hierarchical(
     # -----------------------------------------------------------------------
     # GCP confidence weights (Improvement 5)
     # -----------------------------------------------------------------------
-    gcp_weights = _compute_gcp_weights(tgt_pts_n, source_pts, src_shape)
+    gcp_weights = _compute_gcp_weights(tgt_pts_n, source_pts, src_shape,
+                                       n_real_gcps=n_real_gcps)
 
     # -----------------------------------------------------------------------
     # GCP density map for adaptive ARAP (computed at finest grid)
@@ -1134,7 +1340,7 @@ def optimize_grid_hierarchical(
     first_grid_size = (levels[0][0], levels[0][0])
     affine_baseline = _compute_affine_baseline(
         tgt_pts_n, src_pts_n, first_grid_size, device,
-        W_t, H_t, output_res_m,
+        W_t, H_t, output_res_m, n_real_gcps=n_real_gcps,
     )
 
     if affine_baseline is not None:
@@ -1181,7 +1387,11 @@ def optimize_grid_hierarchical(
         reg_scale = 1.0 + 0.15 * level_idx
         level_w_arap = w_arap * reg_scale
         level_w_laplacian = w_laplacian * reg_scale
-        level_w_disp = w_disp * reg_scale
+        # Finer levels: trust GCPs more, penalise displacement less.
+        # Coarse levels establish smooth global alignment; fine levels
+        # tighten local corrections near GCPs.
+        level_w_disp = w_disp / (1.0 + 0.5 * level_idx)
+        level_w_data = w_data * (1.0 + 0.5 * level_idx)
 
         # Finer levels get tighter Huber delta (GCPs act as harder constraints)
         level_huber = max(3.0, 10.0 / (1.0 + level_idx))
@@ -1194,8 +1404,14 @@ def optimize_grid_hierarchical(
         # at fine resolution. Keep chamfer strongest at coarse (global alignment).
         level_w_chamfer = w_chamfer / (1.0 + 0.5 * level_idx)
 
-        # Compute GCP density map at this grid size for adaptive ARAP
-        level_density = _compute_gcp_density_map(tgt_pts_n, gs)
+        # Adaptive clamp: finer levels allow larger local corrections
+        level_max_residual = max_residual_norm * (1.0 + 0.5 * level_idx)
+
+        # Uniform ARAP: don't reduce regularization where GCPs are dense.
+        # Adaptive ARAP (0.3-0.8) causes grid instability and jagged features.
+        # v17 (uniform) got accepted=true with score 70.1, while v18 (0.3)
+        # produced north=-88m and regression.
+        level_density = None
 
         warper = _run_single_level(
             warper=warper,
@@ -1212,13 +1428,13 @@ def optimize_grid_hierarchical(
             output_res_m=output_res_m,
             iters=level_iters,
             lr=lr,
-            w_data=w_data,
+            w_data=level_w_data,
             w_chamfer=level_w_chamfer,
             w_feat=w_feat,
             w_arap=level_w_arap,
             w_laplacian=level_w_laplacian,
             w_disp=level_w_disp,
-            max_residual_norm=max_residual_norm,
+            max_residual_norm=level_max_residual,
             level_name=level_name,
             gcp_weights=gcp_weights,
             feat_mid=src_feat_mid_t,

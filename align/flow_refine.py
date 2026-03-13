@@ -3,10 +3,229 @@
 After grid-based warping brings images within ~50-100m, dense optical flow
 gives pixel-level displacement corrections.  Forward-backward consistency
 checks reject unreliable flow in changed areas (water, clouds, new buildings).
+
+RAFT (torchvision) is preferred over DIS for cross-temporal satellite imagery:
+- Learned features handle radiometric/semantic differences between eras
+- Better accuracy on large displacements and texture-poor regions
+- Forward-backward consistency still used for reliability masking
+- Falls back to DIS if RAFT unavailable (no GPU, import failure, etc.)
 """
 
 import cv2
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# RAFT (torchvision) — preferred flow estimator
+# ---------------------------------------------------------------------------
+_RAFT_MODEL = None
+_RAFT_DEVICE = None
+_RAFT_AVAILABLE = None  # None = not yet checked
+
+
+def _get_raft_model():
+    """Load RAFT model singleton. Returns (model, device) or (None, None).
+
+    Tries CUDA first, then MPS, skips CPU (too slow for production images).
+    On MPS, does a small forward pass to verify operator support.
+    """
+    global _RAFT_MODEL, _RAFT_DEVICE, _RAFT_AVAILABLE
+    if _RAFT_AVAILABLE is False:
+        return None, None
+    if _RAFT_MODEL is not None:
+        return _RAFT_MODEL, _RAFT_DEVICE
+    try:
+        import torch
+        from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            print("  [RAFT] Skipped (no GPU available, DIS fallback)", flush=True)
+            _RAFT_AVAILABLE = False
+            return None, None
+
+        # Force garbage collection to free GPU memory from previous models
+        import gc
+        gc.collect()
+        if device.type == 'mps':
+            torch.mps.empty_cache()
+        elif device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+        print(f"  [RAFT] Loading RAFT-Large model on {device}...", flush=True)
+        model = raft_large(weights=Raft_Large_Weights.DEFAULT).to(device)
+        model.eval()
+
+        # Smoke test on MPS — some ops may not be supported
+        if device.type == 'mps':
+            try:
+                dummy = torch.randn(1, 3, 128, 128, device=device)
+                with torch.no_grad():
+                    model(dummy, dummy)
+                print(f"  [RAFT] MPS smoke test passed", flush=True)
+            except Exception as e:
+                print(f"  [RAFT] MPS not supported ({e}), falling back to DIS", flush=True)
+                del model
+                _RAFT_AVAILABLE = False
+                return None, None
+
+        _RAFT_MODEL = model
+        _RAFT_DEVICE = device
+        _RAFT_AVAILABLE = True
+        print(f"  [RAFT] Model ready on {device}", flush=True)
+        return model, device
+    except Exception as e:
+        print(f"  [RAFT] Not available ({e}), falling back to DIS", flush=True)
+        _RAFT_AVAILABLE = False
+        return None, None
+
+
+def _raft_forward_single(model, device, ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray:
+    """Run RAFT on a single (small enough) image pair. Returns flow (H, W, 2)."""
+    import torch
+
+    h, w = ref_gray.shape[:2]
+
+    def _prepare(gray):
+        rgb = np.stack([gray, gray, gray], axis=0).astype(np.float32) / 255.0
+        return torch.from_numpy(rgb).unsqueeze(0).to(device)
+
+    # Pad to multiple of 8
+    pad_h = (8 - h % 8) % 8
+    pad_w = (8 - w % 8) % 8
+    if pad_h > 0 or pad_w > 0:
+        ref_padded = np.pad(ref_gray, ((0, pad_h), (0, pad_w)), mode='reflect')
+        warped_padded = np.pad(warped_gray, ((0, pad_h), (0, pad_w)), mode='reflect')
+    else:
+        ref_padded = ref_gray
+        warped_padded = warped_gray
+
+    ref_t = _prepare(ref_padded)
+    warped_t = _prepare(warped_padded)
+
+    with torch.no_grad():
+        flow_preds = model(ref_t, warped_t)
+        flow = flow_preds[-1]  # final iteration, (1, 2, H, W)
+
+    flow_np = flow.squeeze(0).cpu().numpy()  # (2, H, W)
+    flow_np = np.transpose(flow_np, (1, 2, 0))  # (H, W, 2)
+
+    # Remove padding
+    if pad_h > 0 or pad_w > 0:
+        flow_np = flow_np[:h, :w]
+
+    return flow_np
+
+
+# Max tile size for RAFT — keeps MPS/CUDA memory under ~4 GiB per tile
+_RAFT_TILE_SIZE = 1024
+_RAFT_TILE_OVERLAP = 128
+
+
+def _estimate_flow_raft(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray:
+    """Compute dense optical flow using torchvision RAFT.
+
+    Returns flow (H, W, 2) in pixels: flow[y, x] = (dx, dy).
+    For large images, processes in overlapping tiles to manage GPU memory.
+    Falls back to DIS for smaller inputs or on OOM.
+    """
+    import torch
+    model, device = _get_raft_model()
+    if model is None:
+        return _estimate_flow_dis(ref_gray, warped_gray)
+
+    h, w = ref_gray.shape[:2]
+
+    if h < 128 or w < 128:
+        return _estimate_flow_dis(ref_gray, warped_gray)
+
+    # Small enough for a single forward pass
+    if h <= _RAFT_TILE_SIZE and w <= _RAFT_TILE_SIZE:
+        try:
+            return _raft_forward_single(model, device, ref_gray, warped_gray)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"  [RAFT] OOM on {w}x{h}, falling back to DIS", flush=True)
+                if device.type == 'mps':
+                    torch.mps.empty_cache()
+                elif device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                return _estimate_flow_dis(ref_gray, warped_gray)
+            raise
+
+    # Tile-based processing for large images
+    tile_size = _RAFT_TILE_SIZE
+    overlap = _RAFT_TILE_OVERLAP
+    stride = tile_size - overlap
+
+    flow_accum = np.zeros((h, w, 2), dtype=np.float64)
+    weight_accum = np.zeros((h, w), dtype=np.float64)
+
+    # Build 1D cosine blending ramp
+    def _blend_weight_1d(n, ovlp):
+        w = np.ones(n, dtype=np.float64)
+        ramp = np.linspace(0, 1, ovlp)
+        w[:ovlp] = ramp
+        w[-ovlp:] = np.minimum(w[-ovlp:], ramp[::-1])
+        return w
+
+    tiles_y = max(1, (h - overlap + stride - 1) // stride)
+    tiles_x = max(1, (w - overlap + stride - 1) // stride)
+    total_tiles = tiles_y * tiles_x
+    done = 0
+
+    for ty in range(tiles_y):
+        for tx in range(tiles_x):
+            y0 = min(ty * stride, max(0, h - tile_size))
+            x0 = min(tx * stride, max(0, w - tile_size))
+            y1 = min(y0 + tile_size, h)
+            x1 = min(x0 + tile_size, w)
+            th, tw = y1 - y0, x1 - x0
+
+            if th < 128 or tw < 128:
+                # Tile too small for RAFT, use DIS for this tile
+                tile_flow = _estimate_flow_dis(ref_gray[y0:y1, x0:x1],
+                                                warped_gray[y0:y1, x0:x1])
+            else:
+                try:
+                    tile_flow = _raft_forward_single(
+                        model, device, ref_gray[y0:y1, x0:x1],
+                        warped_gray[y0:y1, x0:x1])
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        print(f"  [RAFT] OOM on tile {done+1}/{total_tiles}, falling back to DIS", flush=True)
+                        if device.type == 'mps':
+                            torch.mps.empty_cache()
+                        elif device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        tile_flow = _estimate_flow_dis(
+                            ref_gray[y0:y1, x0:x1],
+                            warped_gray[y0:y1, x0:x1])
+                    else:
+                        raise
+
+            # Cosine blend weights for smooth tile boundaries
+            wy = _blend_weight_1d(th, min(overlap, th // 2))
+            wx = _blend_weight_1d(tw, min(overlap, tw // 2))
+            tile_weight = wy[:, None] * wx[None, :]
+
+            flow_accum[y0:y1, x0:x1, 0] += tile_flow[:, :, 0] * tile_weight
+            flow_accum[y0:y1, x0:x1, 1] += tile_flow[:, :, 1] * tile_weight
+            weight_accum[y0:y1, x0:x1] += tile_weight
+
+            done += 1
+
+    if done > 1:
+        print(f"  [RAFT] Processed {done} tiles ({tiles_x}x{tiles_y})", flush=True)
+
+    # Normalize by accumulated weights
+    mask = weight_accum > 0
+    flow_accum[mask, 0] /= weight_accum[mask]
+    flow_accum[mask, 1] /= weight_accum[mask]
+
+    return flow_accum.astype(np.float32)
 
 
 def _estimate_flow_dis(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray:
@@ -20,6 +239,14 @@ def _estimate_flow_dis(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndar
     return flow
 
 
+def _estimate_flow(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray:
+    """Compute dense optical flow using best available method (RAFT > DIS)."""
+    model, _ = _get_raft_model()
+    if model is not None:
+        return _estimate_flow_raft(ref_gray, warped_gray)
+    return _estimate_flow_dis(ref_gray, warped_gray)
+
+
 def _forward_backward_mask(
     ref_gray: np.ndarray,
     warped_gray: np.ndarray,
@@ -29,31 +256,40 @@ def _forward_backward_mask(
     """Compute forward-backward consistency mask.
 
     Returns bool mask where True = reliable flow.
+    Uses the same flow estimator as the forward pass (RAFT or DIS).
     """
-    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-    dis.setVariationalRefinementIterations(5)
-    flow_bwd = dis.calc(warped_gray, ref_gray, None)
+    _, _, err = _forward_backward_error(ref_gray, warped_gray, flow_fwd)
+    return err < threshold_px
+
+
+def _forward_backward_error(
+    ref_gray: np.ndarray,
+    warped_gray: np.ndarray,
+    flow_fwd: np.ndarray,
+) -> tuple:
+    """Compute forward-backward consistency error.
+
+    Returns (flow_bwd, bwd_at_fwd, err) where err is per-pixel FB error in pixels.
+    """
+    flow_bwd = _estimate_flow(warped_gray, ref_gray)
 
     h, w = flow_fwd.shape[:2]
     y_coords, x_coords = np.mgrid[0:h, 0:w].astype(np.float32)
 
-    # Map forward: where does each pixel in ref land in warped?
     x_fwd = x_coords + flow_fwd[:, :, 0]
     y_fwd = y_coords + flow_fwd[:, :, 1]
 
-    # Sample backward flow at forward-mapped locations
     bwd_at_fwd = cv2.remap(
         flow_bwd, x_fwd, y_fwd,
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
 
-    # Consistency: fwd + bwd should be ~0
     err = np.sqrt(
         (flow_fwd[:, :, 0] + bwd_at_fwd[:, :, 0])**2 +
         (flow_fwd[:, :, 1] + bwd_at_fwd[:, :, 1])**2
     )
-    return err < threshold_px
+    return flow_bwd, bwd_at_fwd, err
 
 
 def dense_flow_refinement(
@@ -116,7 +352,7 @@ def dense_flow_refinement(
         warped_small = warped_u8
 
     # Compute forward flow: ref → warped (tells us how to shift warped to match ref)
-    flow_fwd = _estimate_flow_dis(ref_small, warped_small)
+    flow_fwd = _estimate_flow(ref_small, warped_small)
 
     # Forward-backward consistency check
     fb_mask = _forward_backward_mask(ref_small, warped_small, flow_fwd, fb_threshold_px)
@@ -277,7 +513,7 @@ def apply_flow_refinement_to_file(
     warped_u8_fr = _to_u8(warped_arr_fr)
 
     # Compute flow
-    flow_fwd = _estimate_flow_dis(ref_u8_fr, warped_u8_fr)
+    flow_fwd = _estimate_flow(ref_u8_fr, warped_u8_fr)
     fb_mask = _forward_backward_mask(ref_u8_fr, warped_u8_fr, flow_fwd, fb_threshold_px)
 
     # Median filter

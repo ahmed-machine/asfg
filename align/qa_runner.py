@@ -111,7 +111,7 @@ def build_candidate_report(candidate_name: str, output_path: str, reference_path
     if image_metrics and float(image_metrics.get("score", 0.0)) > 140.0:
         accepted = False
         reasons.append("image_alignment_score_high")
-    if holdout_metrics and float(holdout_metrics.get("mean_m", 0.0)) > 90.0:
+    if holdout_metrics and float(holdout_metrics.get("median_m", 0.0)) > 90.0:
         accepted = False
         reasons.append("holdout_residual_high")
     if cv_mean_m is not None and float(cv_mean_m) > 90.0:

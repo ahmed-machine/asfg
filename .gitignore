@@ -8,3 +8,6 @@ __pycache__/
 session-*.md
 test_results.py
 test_type.py
+output/
+data/
+diagnostics/

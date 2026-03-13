@@ -1,5 +1,8 @@
 """RANSAC, phase refinement, GCP selection, and outlier removal."""
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import cv2
 import numpy as np
 import rasterio
@@ -134,6 +137,53 @@ def _multiscale_phase_correlate(ref_patch, off_patch, fine_res):
     return dx_px * fine_res, dy_px * fine_res, best_resp
 
 
+def _refine_one_match(pair, arr_ref, arr_off_shifted, ref_transform,
+                      off_transform, shift_px_x, shift_py_y, fine_res,
+                      phase_half, h_img, w_img):
+    """Refine a single match via multi-scale phase correlation (thread-safe).
+
+    Returns (refined_pair, was_refined).
+    """
+    ref_gx, ref_gy, off_gx, off_gy, quality, name = pair
+
+    ref_row, ref_col = rasterio.transform.rowcol(ref_transform, ref_gx, ref_gy)
+    ref_row, ref_col = int(ref_row), int(ref_col)
+
+    off_row_raw, off_col_raw = rasterio.transform.rowcol(off_transform, off_gx, off_gy)
+    off_row_shifted = int(off_row_raw) - shift_py_y
+    off_col_shifted = int(off_col_raw) - shift_px_x
+
+    if (ref_row - phase_half < 0 or ref_row + phase_half > h_img or
+            ref_col - phase_half < 0 or ref_col + phase_half > w_img or
+            off_row_shifted - phase_half < 0 or
+            off_row_shifted + phase_half > h_img or
+            off_col_shifted - phase_half < 0 or
+            off_col_shifted + phase_half > w_img):
+        return pair, False
+
+    ref_patch = arr_ref[
+        ref_row - phase_half:ref_row + phase_half,
+        ref_col - phase_half:ref_col + phase_half
+    ].astype(np.float64)
+    off_patch = arr_off_shifted[
+        off_row_shifted - phase_half:off_row_shifted + phase_half,
+        off_col_shifted - phase_half:off_col_shifted + phase_half
+    ].astype(np.float64)
+
+    if ref_patch.shape[0] < 32 or ref_patch.shape[1] < 32:
+        return pair, False
+
+    sub_dx_m, sub_dy_m, response = _multiscale_phase_correlate(
+        ref_patch, off_patch, fine_res)
+
+    if response > 0.03:
+        new_off_gx = off_gx + sub_dx_m
+        new_off_gy = off_gy + sub_dy_m
+        return (ref_gx, ref_gy, new_off_gx, new_off_gy, quality, name), True
+    else:
+        return (ref_gx, ref_gy, off_gx, off_gy, quality * 0.7, name), False
+
+
 def refine_matches_phase_correlation(matched_pairs, arr_ref, arr_off_shifted,
                                      ref_transform, off_transform,
                                      shift_px_x, shift_py_y, fine_res):
@@ -141,57 +191,30 @@ def refine_matches_phase_correlation(matched_pairs, arr_ref, arr_off_shifted,
 
     Uses multiple patch sizes and iterative refinement for improved
     sub-pixel accuracy. Always attempts refinement on every match.
+    Runs in parallel using threads (OpenCV/NumPy release the GIL).
     """
+    if not matched_pairs:
+        return []
+
     h_img, w_img = arr_ref.shape
     phase_half = int(128 / fine_res)
-    refined = []
-    n_refined = 0
 
-    for pair in matched_pairs:
-        ref_gx, ref_gy, off_gx, off_gy, quality, name = pair
+    n_workers = min(os.cpu_count() or 4, len(matched_pairs), 8)
 
-        ref_row, ref_col = rasterio.transform.rowcol(ref_transform, ref_gx, ref_gy)
-        ref_row, ref_col = int(ref_row), int(ref_col)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [
+            pool.submit(_refine_one_match, pair, arr_ref, arr_off_shifted,
+                        ref_transform, off_transform, shift_px_x, shift_py_y,
+                        fine_res, phase_half, h_img, w_img)
+            for pair in matched_pairs
+        ]
+        results = [f.result() for f in futures]
 
-        off_row_raw, off_col_raw = rasterio.transform.rowcol(off_transform, off_gx, off_gy)
-        off_row_shifted = int(off_row_raw) - shift_py_y
-        off_col_shifted = int(off_col_raw) - shift_px_x
+    refined = [r[0] for r in results]
+    n_refined = sum(1 for r in results if r[1])
 
-        if (ref_row - phase_half < 0 or ref_row + phase_half > h_img or
-                ref_col - phase_half < 0 or ref_col + phase_half > w_img or
-                off_row_shifted - phase_half < 0 or
-                off_row_shifted + phase_half > h_img or
-                off_col_shifted - phase_half < 0 or
-                off_col_shifted + phase_half > w_img):
-            refined.append(pair)
-            continue
-
-        ref_patch = arr_ref[
-            ref_row - phase_half:ref_row + phase_half,
-            ref_col - phase_half:ref_col + phase_half
-        ].astype(np.float64)
-        off_patch = arr_off_shifted[
-            off_row_shifted - phase_half:off_row_shifted + phase_half,
-            off_col_shifted - phase_half:off_col_shifted + phase_half
-        ].astype(np.float64)
-
-        if ref_patch.shape[0] < 32 or ref_patch.shape[1] < 32:
-            refined.append(pair)
-            continue
-
-        sub_dx_m, sub_dy_m, response = _multiscale_phase_correlate(
-            ref_patch, off_patch, fine_res)
-
-        if response > 0.03:
-            new_off_gx = off_gx + sub_dx_m
-            new_off_gy = off_gy + sub_dy_m
-            refined.append((ref_gx, ref_gy, new_off_gx, new_off_gy, quality, name))
-            n_refined += 1
-        else:
-            refined.append((ref_gx, ref_gy, off_gx, off_gy, quality * 0.7, name))
-
-    if matched_pairs:
-        print(f"    Phase correlation refined {n_refined}/{len(matched_pairs)} matches")
+    print(f"    Phase correlation refined {n_refined}/{len(matched_pairs)} matches"
+          f" ({n_workers} threads)")
 
     return refined
 

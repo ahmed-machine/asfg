@@ -67,8 +67,14 @@ def compute_patch_residual_median(ref_arr, test_arr, valid_mask, res_m,
             mags.append(float(np.hypot(shift[0], shift[1]) * res_m))
 
     if not mags:
-        return float("inf")
-    return float(np.median(np.array(mags, dtype=np.float32)))
+        return {"median": float("inf"), "p90": float("inf"), "max": float("inf"), "count": 0}
+    arr = np.array(mags, dtype=np.float32)
+    return {
+        "median": float(np.median(arr)),
+        "p90": float(np.percentile(arr, 90)),
+        "max": float(np.max(arr)),
+        "count": int(len(arr)),
+    }
 
 
 def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0, mask_mode="coastal_obia"):
@@ -114,7 +120,7 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
     shore_union = np.sum(m_ref | m_out)
     shore_iou = float(np.sum(m_ref & m_out) / shore_union) if shore_union > 0 else 0.0
 
-    patch_med = compute_patch_residual_median(
+    patch_result = compute_patch_residual_median(
         to_u8(ref_arr),
         to_u8(out_arr),
         valid_mask & (stable_ref | stable_out),
@@ -122,31 +128,49 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
         patch=192,
         stride=96,
     )
+    patch_med = patch_result["median"]
 
     west = float(np.median(west_vals)) if west_vals.size else np.inf
     center = float(np.median(center_vals)) if center_vals.size else np.inf
     east = float(np.median(east_vals)) if east_vals.size else np.inf
-    
+
     capped_north = min(abs(float(north_shift)), 150.0)
+
+    west_contrib = 0.22 * west
+    center_contrib = 0.28 * center
+    east_contrib = 0.15 * east
+    north_contrib = 0.15 * capped_north
+    patch_contrib = 0.20 * patch_med
+    stable_iou_penalty = 18.0 * (1.0 - stable_iou)
+    shore_iou_penalty = 12.0 * (1.0 - shore_iou)
+
     score = (
-        0.22 * west
-        + 0.28 * center
-        + 0.15 * east
-        + 0.15 * capped_north
-        + 0.20 * patch_med
-        + (18.0 * (1.0 - stable_iou))
-        + (12.0 * (1.0 - shore_iou))
+        west_contrib + center_contrib + east_contrib
+        + north_contrib + patch_contrib
+        + stable_iou_penalty + shore_iou_penalty
     )
-    
+
     return {
         "west": west,
         "center": center,
         "east": east,
         "north_shift": float(north_shift),
         "patch_med": patch_med,
+        "patch_p90": patch_result["p90"],
+        "patch_max": patch_result["max"],
+        "patch_count": patch_result["count"],
         "stable_iou": stable_iou,
         "shore_iou": shore_iou,
         "score": float(score),
+        "score_breakdown": {
+            "west_contrib": round(float(west_contrib), 2),
+            "center_contrib": round(float(center_contrib), 2),
+            "east_contrib": round(float(east_contrib), 2),
+            "north_contrib": round(float(north_contrib), 2),
+            "patch_contrib": round(float(patch_contrib), 2),
+            "stable_iou_penalty": round(float(stable_iou_penalty), 2),
+            "shore_iou_penalty": round(float(shore_iou_penalty), 2),
+        },
     }
 
 

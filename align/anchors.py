@@ -18,13 +18,11 @@ from rasterio.crs import CRS
 from rasterio.warp import transform as transform_coords
 
 import torch
-import torch.nn.functional as F
 import kornia.feature as KF
 
 from .geo import get_torch_device
 from .image import to_u8, make_land_mask, clahe_normalize, sobel_gradient
 from .scale import fit_affine_from_gcps
-from .roma import roma_outdoor
 
 
 # ---------------------------------------------------------------------------
@@ -512,72 +510,6 @@ class StandardNCCMatcher(AnchorMatcher):
         return AnchorMatchResult(total_dx, total_dy, 1.0, self.name)
 
 
-class DensePhaseMatcher(AnchorMatcher):
-    """Dense grid phase correlation matching."""
-    name = "DensePhase"
-
-    def match(self, ref_patch, off_patch, patch_half, name,
-              arr_ref, arr_off_shifted, ref_row, ref_col,
-              h_img, w_img, fine_res,
-              off_row_adj, off_col_adj,
-              ref_transform, offset_transform,
-              shift_px_x, shift_py_y,
-              loftr_model=None, loftr_device=None,
-              phase_half=32, mask_mode="heuristic",
-              roma_model=None) -> Optional[AnchorMatchResult]:
-        if ref_patch is None or off_patch is None:
-            return None
-
-        ref_p = ref_patch.astype(np.float64)
-        off_p = off_patch.astype(np.float64)
-
-        sub_size = 64
-        step = sub_size // 2
-        points_ref = []
-        points_off = []
-
-        for r0 in range(0, ref_p.shape[0] - sub_size, step):
-            for c0 in range(0, ref_p.shape[1] - sub_size, step):
-                ref_sub = ref_p[r0:r0 + sub_size, c0:c0 + sub_size]
-                off_sub = off_p[r0:r0 + sub_size, c0:c0 + sub_size]
-
-                if np.mean(ref_sub > 0) < 0.5 or np.mean(off_sub > 0) < 0.5:
-                    continue
-
-                window = np.outer(np.hanning(sub_size), np.hanning(sub_size))
-                shift, response = cv2.phaseCorrelate(ref_sub * window, off_sub * window)
-
-                if response > 0.08:
-                    cx = c0 + sub_size / 2
-                    cy = r0 + sub_size / 2
-                    points_ref.append([cx, cy])
-                    points_off.append([cx + shift[0], cy + shift[1]])
-
-        if len(points_ref) < 4:
-            return None
-
-        src = np.array(points_ref, dtype=np.float32).reshape(-1, 1, 2)
-        dst = np.array(points_off, dtype=np.float32).reshape(-1, 1, 2)
-        M, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC,
-                                                  ransacReprojThreshold=5.0)
-
-        if M is None or inliers is None:
-            return None
-
-        n_inliers = int(inliers.sum())
-        inlier_ratio = n_inliers / len(points_ref)
-        if n_inliers < 4 or inlier_ratio < 0.3:
-            return None
-
-        center = np.array([[[float(patch_half), float(patch_half)]]], dtype=np.float32)
-        pred = cv2.transform(center, M)
-        total_dx = float(pred[0, 0, 0]) - float(patch_half) + off_col_adj
-        total_dy = float(pred[0, 0, 1]) - float(patch_half) + off_row_adj
-
-        print(f"    Located: {name} (dense phase: {n_inliers}/{len(points_ref)} sub-patches)")
-        return AnchorMatchResult(total_dx, total_dy, 1.0, self.name)
-
-
 class RoMaMatcher(AnchorMatcher):
     """Robust Dense Feature Matching (RoMa) with foundation model guidance."""
     name = "RoMa"
@@ -665,14 +597,23 @@ class RoMaMatcher(AnchorMatcher):
             return matches, certs
 
         # Single deterministic run (no stochastic sampling)
-        seed = hash(name) % 10000
+        # Use hashlib instead of hash() which is randomized per-process (PEP 456)
+        import hashlib
+        seed = int(hashlib.sha256(name.encode()).hexdigest(), 16) % 10000
         torch.manual_seed(seed)
         np.random.seed(seed)
         cv2.setRNGSeed(seed)
 
         try:
             with torch.no_grad():
-                warp, certainty = roma_model.match(ref_t, off_t, batched=True)
+                roma_model.apply_setting("satast")  # high quality for anchor matching (B=1)
+                preds = roma_model.match(ref_t, off_t)
+                warp_AB = preds["warp_AB"]  # (1, H, W, 2)
+                B, H, W, _ = warp_AB.shape
+                from .romav2.geometry import get_normalized_grid
+                grid = get_normalized_grid(B, H, W, overload_device=warp_AB.device)
+                warp = torch.cat([grid, warp_AB], dim=-1)  # (1, H, W, 4)
+                certainty = preds["confidence_AB"][..., 0]  # (1, H, W) logits
                 matches, certs = _deterministic_topk_sample(warp, certainty, num=400)
                 if matches is None:
                     return None
@@ -706,7 +647,7 @@ class RoMaMatcher(AnchorMatcher):
             return None
 
         n_inliers = int(inliers.sum())
-        if n_inliers < 10:
+        if n_inliers < 6:
             return None
 
         # Calculate center displacement
@@ -1134,7 +1075,7 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
         # feature.  For corners (e.g. fort), the mask NCC is less precise but
         # still useful when the offset is modest (< 300m) and NCC is strong.
         presearch_offset_m = np.sqrt(off_row_adj**2 + off_col_adj**2) * fine_res
-        if best_match is None and presearch_ncc >= 0.45 and feature_type in ("island_center", "reef_feature"):
+        if best_match is None and presearch_ncc >= 0.44 and feature_type in ("island_center", "reef_feature"):
             print(f"    Located: {name} (presearch mask fallback: NCC={presearch_ncc:.2f})")
             best_match = AnchorMatchResult(float(off_col_adj), float(off_row_adj), presearch_ncc * 0.8, "PresearchMask")
         elif best_match is None and presearch_ncc >= 0.50 and feature_type == "corner" and presearch_offset_m < 300.0:
