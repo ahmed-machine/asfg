@@ -1,6 +1,6 @@
 """Scale and rotation detection: 3 methods with a registry cascade.
 
-Method A (LoFTR) runs first. Methods B+C (NCC grids) run sequentially as fallback.
+Method A (ELoFTR) runs first. Methods B+C (NCC grids) run sequentially as fallback.
 """
 
 import multiprocessing as mp
@@ -18,8 +18,8 @@ from rasterio.warp import transform as transform_coords, transform_bounds
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 import torch
-import kornia.feature as KF
 
+from .constants import RANSAC_REPROJ_THRESHOLD
 from .geo import get_torch_device, read_overlap_region
 from .image import shift_array, make_land_mask, clahe_normalize, sobel_gradient
 
@@ -46,7 +46,7 @@ def _solve_scale_affine(kpts0, kpts1):
     # RANSAC
     try:
         M, inliers = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC,
-                                           ransacReprojThreshold=5.0)
+                                           ransacReprojThreshold=RANSAC_REPROJ_THRESHOLD)
     except Exception:
         return None
 
@@ -66,9 +66,9 @@ def _solve_scale_affine(kpts0, kpts1):
     return scale_x, scale_y, rotation_deg, n_inliers
 
 
-def _get_loftr_crops(ref_img, off_img):
-    """Generate patches for LoFTR inference (single center or 3x3 grid).
-    
+def _get_matcher_crops(ref_img, off_img):
+    """Generate patches for ELoFTR inference (single center or 3x3 grid).
+
     Returns list of dicts: {'ref': ref_crop, 'off': off_crop, 'r0': r0, 'c0': c0}
     """
     h, w = ref_img.shape
@@ -103,9 +103,9 @@ def _get_loftr_crops(ref_img, off_img):
         })
     return crops
 
-def _run_loftr_batch(crops, model, device, batch_size=4):
-    """Run LoFTR on a list of crops using batching.
-    
+def _run_eloftr_batch(crops, model, device, batch_size=4):
+    """Run ELoFTR on a list of crops using batching.
+
     Returns list of (kpts0, kpts1, conf) corresponding to crops.
     Returns empty arrays for failed/skipped items in the batch.
     """
@@ -151,10 +151,10 @@ def _run_loftr_batch(crops, model, device, batch_size=4):
                 with torch.no_grad():
                     out = model({"image0": batch_ref, "image1": batch_off})
 
-                kpts0 = out['keypoints0'].cpu().numpy()
-                kpts1 = out['keypoints1'].cpu().numpy()
-                conf = out['confidence'].cpu().numpy()
-                batch_ids = out['batch_indexes'].cpu().numpy()
+                kpts0 = out['mkpts0_f'].cpu().numpy()
+                kpts1 = out['mkpts1_f'].cpu().numpy()
+                conf = out['mconf'].cpu().numpy()
+                batch_ids = out['m_bids'].cpu().numpy()
 
                 for local_idx, global_idx in enumerate(original_indices):
                     # Extract matches for this item
@@ -173,7 +173,7 @@ def _run_loftr_batch(crops, model, device, batch_size=4):
                     torch.cuda.empty_cache()
                 elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
                     torch.mps.empty_cache()
-                print(f"      LoFTR batch OOM ({len(group_items)} items), retrying one-by-one")
+                print(f"      ELoFTR batch OOM ({len(group_items)} items), retrying one-by-one")
                 for local_idx, (global_idx, item) in enumerate(group_items):
                     try:
                         rt = torch.from_numpy(item['ref']).float()[None, None] / 255.0
@@ -182,43 +182,39 @@ def _run_loftr_batch(crops, model, device, batch_size=4):
                         single_off = ot.to(device)
                         with torch.no_grad():
                             out = model({"image0": single_ref, "image1": single_off})
-                        kp0 = out['keypoints0'].cpu().numpy()
-                        kp1 = out['keypoints1'].cpu().numpy()
-                        cf = out['confidence'].cpu().numpy()
+                        kp0 = out['mkpts0_f'].cpu().numpy()
+                        kp1 = out['mkpts1_f'].cpu().numpy()
+                        cf = out['mconf'].cpu().numpy()
                         results[global_idx] = (kp0, kp1, cf)
                         del single_ref, single_off
                     except Exception as e2:
-                        print(f"      LoFTR single-item retry also failed: {e2}")
+                        print(f"      ELoFTR single-item retry also failed: {e2}")
             except Exception as e:
-                print(f"      LoFTR batch inference error: {e}")
+                print(f"      ELoFTR batch inference error: {e}")
                 
     return results
 
-def detect_loftr_scale(ref_img, offset_img, model=None):
-    """LoFTR dense matching + RANSAC affine (tiled over 3x3 grid).
+def detect_eloftr_scale(ref_img, offset_img, model=None):
+    """ELoFTR dense matching + RANSAC affine (tiled over 3x3 grid).
 
     Returns (scale_x, scale_y, rotation_deg, n_inliers) or None.
     """
     device = get_torch_device()
-    _own_model = model is None
     if model is None:
-        try:
-            model = KF.LoFTR(pretrained="outdoor").eval().to(device)
-        except Exception as e:
-            print(f"      LoFTR init failed: {e}")
-            return None
+        print("      ELoFTR model not provided")
+        return None
 
     ref_u8 = clahe_normalize(ref_img)
     off_u8 = clahe_normalize(offset_img)
 
     h, w = ref_u8.shape
 
-    crops = _get_loftr_crops(ref_u8, off_u8)
+    crops = _get_matcher_crops(ref_u8, off_u8)
     if not crops:
          return None
 
     # Run batched inference
-    batch_results = _run_loftr_batch(crops, model, device, batch_size=4)
+    batch_results = _run_eloftr_batch(crops, model, device, batch_size=4)
 
     # Aggregate keypoints from batch results
     all_kpts0 = []
@@ -239,16 +235,8 @@ def detect_loftr_scale(ref_img, offset_img, model=None):
         all_kpts0.append(kp0_global)
         all_kpts1.append(kp1_global)
 
-    if _own_model:
-        del model
-        if device != 'cpu':
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-
     if not all_kpts0:
-        print("      LoFTR scale: no patches yielded matches")
+        print("      ELoFTR scale: no patches yielded matches")
         return None
 
     kpts0 = np.vstack(all_kpts0).astype(np.float32)
@@ -256,11 +244,11 @@ def detect_loftr_scale(ref_img, offset_img, model=None):
 
     result = _solve_scale_affine(kpts0, kpts1)
     if result is None:
-        print("      LoFTR scale: affine estimation failed")
+        print("      ELoFTR scale: affine estimation failed")
         return None
 
     scale_x, scale_y, rotation_deg, n_inliers = result
-    print(f"      LoFTR scale: {n_inliers} inliers from {len(kpts0)} matches, "
+    print(f"      ELoFTR scale: {n_inliers} inliers from {len(kpts0)} matches, "
           f"scale_x={scale_x:.4f}, scale_y={scale_y:.4f}")
 
     return scale_x, scale_y, rotation_deg, n_inliers
@@ -347,7 +335,7 @@ def detect_multiscale_ncc(ref_land, offset_land, expected_scale):
 # Registry / cascade
 # ---------------------------------------------------------------------------
 
-def _gate_loftr(result):
+def _gate_neural(result):
     if result is None:
         return False
     sx, sy, rot, n_inliers = result
@@ -381,7 +369,7 @@ def _to_scale_result_ncc(result, method):
 
 def detect_scale_rotation(src_offset, src_ref, overlap, work_crs,
                           coarse_dx, coarse_dy, expected_scale, model_cache=None):
-    """Orchestrate scale/rotation detection: LoFTR first, NCC grids as fallback.
+    """Orchestrate scale/rotation detection: ELoFTR first, NCC grids as fallback.
 
     Returns ScaleResult (scale_x, scale_y, rotation, method_name).
     """
@@ -398,13 +386,13 @@ def detect_scale_rotation(src_offset, src_ref, overlap, work_crs,
     arr_off_shifted = cv2.warpAffine(arr_off, M_shift, (w, h),
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
-    # --- Method A: LoFTR ---
-    print("    Method: LoFTR...")
+    # --- Method A: ELoFTR ---
+    print("    Method: ELoFTR...")
     try:
-        loftr_model = model_cache.loftr if model_cache else None
-        result = detect_loftr_scale(arr_ref, arr_off_shifted, model=loftr_model)
-        if _gate_loftr(result):
-            sr = _to_scale_result_4(result, "loftr")
+        eloftr_model = model_cache.eloftr if model_cache else None
+        result = detect_eloftr_scale(arr_ref, arr_off_shifted, model=eloftr_model)
+        if _gate_neural(result):
+            sr = _to_scale_result_4(result, "eloftr")
             avg = (sr.scale_x + sr.scale_y) / 2
             print(f"      Accepted (scale={avg:.4f}, rotation={sr.rotation:.3f} deg)")
             return sr
@@ -457,7 +445,7 @@ def detect_scale_rotation(src_offset, src_ref, overlap, work_crs,
 def detect_local_scales(src_offset, src_ref, overlap, work_crs,
                         coarse_dx, coarse_dy, grid_cols=3, grid_rows=3,
                         model_cache=None):
-    """Detect scale and rotation per-patch across the overlap region using LoFTR.
+    """Detect scale and rotation per-patch across the overlap region using ELoFTR.
 
     Returns list of dicts with keys: cx, cy, scale_x, scale_y, rotation,
     n_inliers, row, col, status.  Returns None if fewer than 3 patches succeed.
@@ -477,15 +465,10 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
     print(f"    Grid: {grid_cols} x {grid_rows} = {grid_cols * grid_rows} patches")
 
     device = get_torch_device()
-    _own_model = model_cache is None
-    if model_cache is not None:
-        model = model_cache.loftr
-    else:
-        try:
-            model = KF.LoFTR(pretrained="outdoor").eval().to(device)
-        except Exception as e:
-            print(f"    LoFTR init failed: {e}")
-            return None
+    if model_cache is None:
+        print(f"    ELoFTR model cache not provided")
+        return None
+    model = model_cache.eloftr
 
     patch_w = min(int(w / grid_cols * 1.2), w)
     patch_h = min(int(h / grid_rows * 1.2), h)
@@ -526,7 +509,7 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
                 continue
 
             # Prepare crops for this patch
-            crops = _get_loftr_crops(ref_patch, off_patch)
+            crops = _get_matcher_crops(ref_patch, off_patch)
             if not crops:
                 print(f"{label}: no valid crops")
                 patch_results.append({
@@ -556,8 +539,8 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
             end = len(all_crops)
             task_ranges.append((p_idx, start, end, x0, y0, label))
             
-        print(f"    Running batched LoFTR on {len(all_crops)} total crops/sub-patches...")
-        batch_results = _run_loftr_batch(all_crops, model, device, batch_size=4)
+        print(f"    Running batched ELoFTR on {len(all_crops)} total crops/sub-patches...")
+        batch_results = _run_eloftr_batch(all_crops, model, device, batch_size=4)
         
         # Process results
         for p_idx, start, end, x0, y0, label in task_ranges:
@@ -576,9 +559,7 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
                     continue
                 
                 # Crops are relative to patch (which is at x0,y0 in overlap)
-                # But _get_loftr_crops returned coords relative to patch
-                # We need to reconstruct patch-local coords to run RANSAC on the PATCH
-                # (which is what detect_loftr_scale did effectively)
+                # Reconstruct patch-local coords for RANSAC
                 
                 c0_c, r0_c = all_crops[i]['c0'], all_crops[i]['r0']
                 kp0_local = kp0[mask] + np.array([c0_c, r0_c])
@@ -609,7 +590,7 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
                 else:
                     print(f"{label}: affine failed")
             else:
-                print(f"{label}: LoFTR failed (no matches)")
+                print(f"{label}: ELoFTR failed (no matches)")
                 
             # Update result
             p = patch_results[p_idx]
@@ -618,14 +599,6 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
             p['rotation'] = rot
             p['n_inliers'] = n_inliers
             p['status'] = status
-
-    if _own_model:
-        del model
-        if device != 'cpu':
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
 
     valid = [p for p in patch_results if p['status'] == 'ok']
     print(f"    Valid patches: {len(valid)}/{len(patch_results)}")
@@ -711,48 +684,11 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
 
 
 # ---------------------------------------------------------------------------
-# Affine fitting (used by scale detection and elsewhere)
+# Affine fitting — canonical implementation lives in align.affine;
+# re-exported here for backwards compatibility with existing imports.
 # ---------------------------------------------------------------------------
 
-def fit_affine_from_gcps(src_points, dst_points, weights=None):
-    """Fit a 6-parameter affine transformation from matched point pairs.
-
-    Returns the 2x3 affine matrix M and the per-point residuals in metres.
-    """
-    n = len(src_points)
-    A = np.zeros((2 * n, 6))
-    b = np.zeros(2 * n)
-    for i in range(n):
-        sx, sy = src_points[i]
-        dx, dy = dst_points[i]
-        A[2 * i] = [sx, sy, 1, 0, 0, 0]
-        A[2 * i + 1] = [0, 0, 0, sx, sy, 1]
-        b[2 * i] = dx
-        b[2 * i + 1] = dy
-
-    if weights is not None:
-        W = np.zeros(2 * n)
-        for i in range(n):
-            W[2 * i] = weights[i]
-            W[2 * i + 1] = weights[i]
-        W_sqrt = np.sqrt(W)
-        A = A * W_sqrt[:, np.newaxis]
-        b = b * W_sqrt
-
-    result, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-    a, bv, tx, c, d, ty = result
-    M = np.array([[a, bv, tx], [c, d, ty]])
-
-    residuals = []
-    for i in range(n):
-        sx, sy = src_points[i]
-        dx_expected, dy_expected = dst_points[i]
-        dx_pred = a * sx + bv * sy + tx
-        dy_pred = c * sx + d * sy + ty
-        res = np.sqrt((dx_pred - dx_expected) ** 2 + (dy_pred - dy_expected) ** 2)
-        residuals.append(res)
-
-    return M, residuals
+from .affine import fit_affine_from_gcps, compute_affine_residuals, ransac_affine  # noqa: F401,E402
 
 
 # ---------------------------------------------------------------------------

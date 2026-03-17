@@ -174,6 +174,7 @@ class VGG19BN(VGG):
         )
 
 
+
 class FineFeatures(nn.Module):
     @dataclass(frozen=True)
     class Cfg:

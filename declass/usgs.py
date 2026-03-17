@@ -74,12 +74,28 @@ class USGSClient:
 
         Returns list of dicts with 'entityId', 'url', 'filesize' keys.
         """
+        # Look up the correct product ID for each entity via download-options
+        product_ids = {}
+        options = self._request("download-options", {
+            "datasetName": dataset_alias,
+            "entityIds": entity_ids,
+        })
+        for opt in (options or []):
+            eid = opt.get("entityId", "")
+            pid = opt.get("id", "")
+            if eid and pid:
+                product_ids[eid] = pid
+
         # Build download list
         downloads = []
         for eid in entity_ids:
+            pid = product_ids.get(eid)
+            if not pid:
+                print(f"  WARNING: No product ID found for {eid}, skipping download")
+                continue
             downloads.append({
                 "entityId": eid,
-                "productId": "5e83d0b84df8d8c2",  # Standard product
+                "productId": pid,
             })
 
         # Request downloads
@@ -92,14 +108,29 @@ class USGSClient:
         preparing = result.get("preparingDownloads", [])
 
         if preparing:
-            # Need to poll for preparation
-            print(f"  {len(preparing)} downloads preparing, polling...")
-            label = result.get("downloadOptions", result.get("label", ""))
-            available.extend(self._poll_downloads(preparing))
+            # Check if preparing downloads already have usable URLs
+            # (the staging URL is often immediately usable)
+            usable = [p for p in preparing if p.get("url")]
+            remaining = [p for p in preparing if not p.get("url")]
+
+            if usable:
+                print(f"  {len(usable)} downloads have staging URLs")
+                available.extend(usable)
+
+            if remaining:
+                print(f"  {len(remaining)} downloads preparing, polling...")
+                # Extract label from newRecords in the response
+                new_records = result.get("newRecords", {})
+                label = ""
+                if new_records:
+                    # Label is the value (all records share the same label)
+                    label = next(iter(new_records.values()), "")
+                available.extend(self._poll_downloads(remaining, label=label))
 
         return available
 
-    def _poll_downloads(self, preparing: list, max_wait: int = 600) -> list:
+    def _poll_downloads(self, preparing: list, label: str = "",
+                        max_wait: int = 600) -> list:
         """Poll download-retrieve until files are ready."""
         ready = []
         waited = 0
@@ -110,7 +141,7 @@ class USGSClient:
             waited += poll_interval
 
             result = self._request("download-retrieve", {
-                "label": preparing[0].get("label", ""),
+                "label": label,
             })
 
             if result and result.get("available"):

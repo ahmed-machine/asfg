@@ -1,12 +1,10 @@
-"""Anchor GCP matching: framework with 5 pluggable matchers.
+"""Anchor GCP matching with RoMa foundation model.
 
 The common boilerplate (bounds check, patch extraction, quality validation,
-sub-pixel phase refinement, geo conversion) lives in :func:`locate_anchor`.
-Each matcher implements only its unique matching logic.
+sub-pixel phase refinement, geo conversion) lives in :func:`locate_anchors`.
 """
 
 import json
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
@@ -18,10 +16,10 @@ from rasterio.crs import CRS
 from rasterio.warp import transform as transform_coords
 
 import torch
-import kornia.feature as KF
 
+from .constants import ANCHOR_INLIER_THRESHOLD, RANSAC_REPROJ_THRESHOLD
 from .geo import get_torch_device
-from .image import to_u8, make_land_mask, clahe_normalize, sobel_gradient
+from .image import to_u8, make_land_mask
 from .scale import fit_affine_from_gcps
 
 
@@ -217,533 +215,130 @@ def _filter_anchor_displacement_outliers(results, min_keep=4):
 
 
 # ---------------------------------------------------------------------------
-# ABC matcher base class + concrete matchers
+# Standalone matcher functions (replacing former ABC class hierarchy)
 # ---------------------------------------------------------------------------
 
-class AnchorMatcher(ABC):
-    """Base class for anchor matching strategies."""
-    name: str
+def match_anchor_roma(ref_patch, off_patch, patch_half, name,
+                      off_row_adj, off_col_adj, roma_model) -> Optional[AnchorMatchResult]:
+    """Match an anchor using RoMa foundation model with deterministic top-k."""
+    if roma_model is None:
+        return None
 
-    @abstractmethod
-    def match(self, ref_patch, off_patch, patch_half, name,
-              arr_ref, arr_off_shifted, ref_row, ref_col,
-              h_img, w_img, fine_res,
-              off_row_adj, off_col_adj,
-              ref_transform, offset_transform,
-              shift_px_x, shift_py_y,
-              loftr_model=None, loftr_device=None,
-              phase_half=32, mask_mode="heuristic",
-              roma_model=None) -> Optional[AnchorMatchResult]:
-        ...
+    device = get_torch_device()
 
-
-class LoFTRMatcher(AnchorMatcher):
-    """LoFTR dense matching with local affine prediction."""
-
-    def __init__(self, edge_preprocess=False):
-        self.name = f"LoFTR{'(edge)' if edge_preprocess else ''}"
-        self.edge_preprocess = edge_preprocess
-
-    def match(self, ref_patch, off_patch, patch_half, name,
-              arr_ref, arr_off_shifted, ref_row, ref_col,
-              h_img, w_img, fine_res,
-              off_row_adj, off_col_adj,
-              ref_transform, offset_transform,
-              shift_px_x, shift_py_y,
-              loftr_model=None, loftr_device=None,
-              phase_half=32, mask_mode="heuristic",
-              roma_model=None) -> Optional[AnchorMatchResult]:
-        if loftr_model is None:
-            return None
-
-        device = loftr_device or 'cpu'
-        ref_u8 = clahe_normalize(ref_patch)
-        off_u8 = clahe_normalize(off_patch)
-
-        if self.edge_preprocess:
-            ref_u8 = clahe_normalize(to_u8(sobel_gradient(ref_u8)))
-            off_u8 = clahe_normalize(to_u8(sobel_gradient(off_u8)))
-
-        ref_t = torch.from_numpy(ref_u8).float()[None, None] / 255.0
-        off_t = torch.from_numpy(off_u8).float()[None, None] / 255.0
-        ref_t = ref_t.to(device)
-        off_t = off_t.to(device)
-
-        try:
-            with torch.no_grad():
-                correspondences = loftr_model({"image0": ref_t, "image1": off_t})
-            kpts0 = correspondences['keypoints0'].cpu().numpy()
-            kpts1 = correspondences['keypoints1'].cpu().numpy()
-            conf = correspondences['confidence'].cpu().numpy()
-        except Exception as e:
-            print(f"    LoFTR error for {name}: {e}")
-            return None
-
-        mask = conf > 0.5
-        if not mask.any():
-            return None
-
-        kpts0 = kpts0[mask]
-        kpts1 = kpts1[mask]
-        conf = conf[mask]
-
-        # Filter water pixels using the anchor-specific mask mode
-        ref_land_mask = make_land_mask(ref_patch, mode=mask_mode)
-        off_land_mask = make_land_mask(off_patch, mode=mask_mode)
-        ref_land_frac = np.mean(ref_land_mask > 0)
-
-        if ref_land_frac < 0.7:
-            kpt0_rows = np.clip(kpts0[:, 1].astype(int), 0, ref_land_mask.shape[0] - 1)
-            kpt0_cols = np.clip(kpts0[:, 0].astype(int), 0, ref_land_mask.shape[1] - 1)
-            kpt1_rows = np.clip(kpts1[:, 1].astype(int), 0, off_land_mask.shape[0] - 1)
-            kpt1_cols = np.clip(kpts1[:, 0].astype(int), 0, off_land_mask.shape[1] - 1)
-            on_land = ((ref_land_mask[kpt0_rows, kpt0_cols] > 0) &
-                       (off_land_mask[kpt1_rows, kpt1_cols] > 0))
-            n_before = len(kpts0)
-            kpts0, kpts1, conf = kpts0[on_land], kpts1[on_land], conf[on_land]
-            if len(kpts0) < n_before:
-                print(f"    Land-pixel filter: {n_before} -> {len(kpts0)} matches "
-                      f"for {name} (land={ref_land_frac:.0%})")
-
-        if len(kpts0) < 4:
-            return None
-
-        center_x = float(patch_half)
-        center_y = float(patch_half)
-
-        src_pts = kpts0.astype(np.float32).reshape(-1, 1, 2)
-        dst_pts = kpts1.astype(np.float32).reshape(-1, 1, 2)
-        M_local, inliers = cv2.estimateAffine2D(
-            src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=5.0)
-
-        if M_local is None or inliers is None:
-            return None
-
-        n_inliers = int(inliers.sum())
-        if n_inliers < 4:
-            return None
-        if n_inliers < 6:
-            inlier_ratio = n_inliers / len(kpts0)
-            if inlier_ratio < 0.6:
-                return None
-
-        # Quality gate
-        a_qg, b_qg = M_local[0, 0], M_local[0, 1]
-        c_qg, d_qg = M_local[1, 0], M_local[1, 1]
-        qg_scale = (np.sqrt(a_qg ** 2 + c_qg ** 2) + np.sqrt(b_qg ** 2 + d_qg ** 2)) / 2
-        qg_rot = abs(np.degrees(np.arctan2(c_qg, a_qg)))
-
-        use_translation = qg_rot > 5.0 or qg_scale < 0.6 or qg_scale > 1.4
-
-        if use_translation:
-            inlier_mask = inliers.ravel().astype(bool)
-            if np.sum(inlier_mask) < 3:
-                return None
-            displacements = kpts1[inlier_mask] - kpts0[inlier_mask]
-            median_dx = float(np.median(displacements[:, 0]))
-            median_dy = float(np.median(displacements[:, 1]))
-            residuals = np.sqrt(np.sum((displacements - [median_dx, median_dy]) ** 2, axis=1))
-            if float(np.mean(residuals)) > 15:
-                return None
-            total_dx = median_dx + off_col_adj
-            total_dy = median_dy + off_row_adj
-            print(f"    Located: {name} (TRANSLATION fallback: {np.sum(inlier_mask)} inliers)")
+    def _to_roma_tensor(patch):
+        p_rgb = cv2.cvtColor(to_u8(patch), cv2.COLOR_GRAY2RGB)
+        cur_h, cur_w = patch.shape[:2]
+        min_dim = 448
+        if cur_h < min_dim or cur_w < min_dim:
+            scale = max(min_dim / cur_h, min_dim / cur_w)
+            target_h = int(round((cur_h * scale) / 14) * 14)
+            target_w = int(round((cur_w * scale) / 14) * 14)
+            p_rgb = cv2.resize(p_rgb, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
         else:
-            center_pt = np.array([[[center_x, center_y]]], dtype=np.float32)
-            pred_pt = cv2.transform(center_pt, M_local)
-            total_dx = float(pred_pt[0, 0, 0]) - center_x + off_col_adj
-            total_dy = float(pred_pt[0, 0, 1]) - center_y + off_row_adj
+            target_h = (cur_h // 14) * 14
+            target_w = (cur_w // 14) * 14
+            p_rgb = cv2.resize(p_rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        p_t = torch.from_numpy(p_rgb).permute(2, 0, 1).float() / 255.0
+        return p_t[None].to(device)
+
+    ref_t = _to_roma_tensor(ref_patch)
+    off_t = _to_roma_tensor(off_patch)
+
+    def _deterministic_topk_sample(warp, certainty, num=400, grid_cells=8):
+        cert_2d = certainty[0]
+        warp_2d = warp[0]
+        H, W = cert_2d.shape
+        per_cell = max(1, num // (grid_cells * grid_cells))
+        cell_h = max(1, H // grid_cells)
+        cell_w = max(1, W // grid_cells)
+        all_matches = []
+        all_certs = []
+        for gi in range(grid_cells):
+            for gj in range(grid_cells):
+                r0 = gi * cell_h
+                r1 = min(r0 + cell_h, H) if gi < grid_cells - 1 else H
+                c0 = gj * cell_w
+                c1 = min(c0 + cell_w, W) if gj < grid_cells - 1 else W
+                cell_cert = cert_2d[r0:r1, c0:c1]
+                cell_warp = warp_2d[r0:r1, c0:c1]
+                cell_flat_cert = cell_cert.reshape(-1)
+                cell_flat_warp = cell_warp.reshape(-1, 4)
+                k = min(per_cell, cell_flat_cert.numel())
+                if k == 0:
+                    continue
+                topk_vals, topk_idx = cell_flat_cert.topk(k)
+                all_matches.append(cell_flat_warp[topk_idx])
+                all_certs.append(topk_vals)
+        if not all_matches:
+            return None, None
+        matches = torch.cat(all_matches, dim=0).unsqueeze(0)
+        certs = torch.cat(all_certs, dim=0).unsqueeze(0)
+        return matches, certs
+
+    import hashlib
+    seed = int(hashlib.sha256(name.encode()).hexdigest(), 16) % 10000
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    cv2.setRNGSeed(seed)
+
+    try:
+        with torch.no_grad():
+            roma_model.apply_setting("satast")
+            preds = roma_model.match(ref_t, off_t)
+            warp_AB = preds["warp_AB"]
+            B, H, W, _ = warp_AB.shape
+            from .romav2.geometry import get_normalized_grid
+            grid = get_normalized_grid(B, H, W, overload_device=warp_AB.device)
+            warp = torch.cat([grid, warp_AB], dim=-1)
+            certainty = preds["confidence_AB"][..., 0]
+            matches, certs = _deterministic_topk_sample(warp, certainty, num=400)
+            if matches is None:
+                return None
+            matches = matches.cpu().numpy()
+            certs = certs.cpu().numpy()
+    except Exception as e:
+        print(f"    RoMa error for {name}: {e}")
+        return None
+
+    mask = certs.squeeze(0) > 0.2
+    if not mask.any():
+        return None
+    matches = matches[0][mask]
+
+    psize = patch_half * 2
+    mkpts0 = (matches[:, :2] + 1) / 2 * psize
+    mkpts1 = (matches[:, 2:] + 1) / 2 * psize
+
+    src_pts = mkpts0.astype(np.float32).reshape(-1, 1, 2)
+    dst_pts = mkpts1.astype(np.float32).reshape(-1, 1, 2)
+    M, inliers = cv2.estimateAffinePartial2D(
+        src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=RANSAC_REPROJ_THRESHOLD)
+
+    if M is None or inliers is None:
+        return None
+
+    scale_x = np.sqrt(M[0, 0]**2 + M[0, 1]**2)
+    scale_y = np.sqrt(M[1, 0]**2 + M[1, 1]**2)
+    rot_deg = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
+    if abs(rot_deg) > 5.0 or abs(scale_x - 1.0) > 0.20 or abs(scale_y - 1.0) > 0.20:
+        return None
+
+    n_inliers = int(inliers.sum())
+    if n_inliers < ANCHOR_INLIER_THRESHOLD:
+        return None
+
+    center_pt = np.array([[[float(patch_half), float(patch_half)]]], dtype=np.float32)
+    pred_pt = cv2.transform(center_pt, M)
+    total_dx = float(pred_pt[0, 0, 0]) - patch_half + off_col_adj
+    total_dy = float(pred_pt[0, 0, 1]) - patch_half + off_row_adj
+
+    a, b = M[0, 0], M[0, 1]
+    c, d = M[1, 0], M[1, 1]
+    local_rot = np.degrees(np.arctan2(c, a))
+    print(f"    Located: {name} (RoMa foundation: {n_inliers} inliers, deterministic top-k, rot={local_rot:.2f}deg)")
 
-            inlier_mask = inliers.ravel().astype(bool)
-            inlier_src = kpts0[inlier_mask]
-            inlier_dst = kpts1[inlier_mask]
-            pred_all = cv2.transform(
-                inlier_src.astype(np.float32).reshape(-1, 1, 2), M_local
-            ).reshape(-1, 2)
-            residuals = np.sqrt(np.sum((pred_all - inlier_dst) ** 2, axis=1))
-            mean_res_m = float(np.mean(residuals)) * fine_res
-            local_scale = (np.sqrt(a_qg ** 2 + c_qg ** 2) + np.sqrt(b_qg ** 2 + d_qg ** 2)) / 2
-            local_rot = np.degrees(np.arctan2(c_qg, a_qg))
-            print(f"    Located: {name} (local affine: {n_inliers}/{len(kpts0)} inliers, "
-                  f"res={mean_res_m:.1f}m, scale={local_scale:.3f}, rot={local_rot:.2f}deg)")
-
-        return AnchorMatchResult(total_dx, total_dy, 1.0, self.name)
-
-
-class GradientNCCMatcher(AnchorMatcher):
-    """Gradient-enhanced NCC template matching."""
-    name = "GradientNCC"
-
-    def match(self, ref_patch, off_patch, patch_half, name,
-              arr_ref, arr_off_shifted, ref_row, ref_col,
-              h_img, w_img, fine_res,
-              off_row_adj, off_col_adj,
-              ref_transform, offset_transform,
-              shift_px_x, shift_py_y,
-              loftr_model=None, loftr_device=None,
-              phase_half=32, mask_mode="heuristic",
-              roma_model=None, template_half=None, search_margin=None) -> Optional[AnchorMatchResult]:
-        if template_half is None:
-            template_half = patch_half // 2
-        if search_margin is None:
-            search_margin = patch_half
-
-        tr0 = ref_row - template_half
-        tr1 = ref_row + template_half
-        tc0 = ref_col - template_half
-        tc1 = ref_col + template_half
-        if tr0 < 0 or tr1 > h_img or tc0 < 0 or tc1 > w_img:
-            return None
-
-        template = arr_ref[tr0:tr1, tc0:tc1]
-        if np.mean(template > 0) < 0.3:
-            return None
-
-        off_tr0 = tr0 + off_row_adj
-        off_tr1 = tr1 + off_row_adj
-        off_tc0 = tc0 + off_col_adj
-        off_tc1 = tc1 + off_col_adj
-        sr0 = max(0, off_tr0 - search_margin)
-        sr1 = min(h_img, off_tr1 + search_margin)
-        sc0 = max(0, off_tc0 - search_margin)
-        sc1 = min(w_img, off_tc1 + search_margin)
-
-        template_u8 = to_u8(template)
-        if sr1 - sr0 <= template_u8.shape[0] or sc1 - sc0 <= template_u8.shape[1]:
-            return None
-
-        off_search = arr_off_shifted[sr0:sr1, sc0:sc1]
-        if np.mean(off_search > 0) < 0.3:
-            return None
-
-        off_search_u8 = to_u8(off_search)
-        template_grad = to_u8(sobel_gradient(template_u8))
-        off_grad = to_u8(sobel_gradient(off_search_u8))
-
-        result = cv2.matchTemplate(off_grad, template_grad, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-        if max_val < 0.4:
-            return None
-
-        dx_int = (sc0 + max_loc[0]) - tc0
-        dy_int = (sr0 + max_loc[1]) - tr0
-
-        sub_dx, sub_dy = _anchor_phase_refine(
-            ref_row, ref_col, dx_int, dy_int,
-            arr_ref, arr_off_shifted, h_img, w_img, phase_half)
-
-        total_dx = float(dx_int) + sub_dx
-        total_dy = float(dy_int) + sub_dy
-        print(f"    Located: {name} (gradient NCC={max_val:.3f})")
-        return AnchorMatchResult(total_dx, total_dy, 1.0, self.name)
-
-
-class StandardNCCMatcher(AnchorMatcher):
-    """Standard CLAHE-enhanced NCC template matching."""
-    name = "StandardNCC"
-
-    def __init__(self, threshold=0.5):
-        self.threshold = threshold
-
-    def match(self, ref_patch, off_patch, patch_half, name,
-              arr_ref, arr_off_shifted, ref_row, ref_col,
-              h_img, w_img, fine_res,
-              off_row_adj, off_col_adj,
-              ref_transform, offset_transform,
-              shift_px_x, shift_py_y,
-              loftr_model=None, loftr_device=None,
-              phase_half=32, mask_mode="heuristic",
-              roma_model=None, template_half=None, search_margin=None) -> Optional[AnchorMatchResult]:
-        if template_half is None:
-            template_half = patch_half // 2
-        if search_margin is None:
-            search_margin = patch_half
-
-        tr0 = ref_row - template_half
-        tr1 = ref_row + template_half
-        tc0 = ref_col - template_half
-        tc1 = ref_col + template_half
-        if tr0 < 0 or tr1 > h_img or tc0 < 0 or tc1 > w_img:
-            return None
-
-        template = arr_ref[tr0:tr1, tc0:tc1]
-        if np.mean(template > 0) < 0.3:
-            return None
-
-        template_u8 = clahe_normalize(template)
-
-        off_tr0 = tr0 + off_row_adj
-        off_tr1 = tr1 + off_row_adj
-        off_tc0 = tc0 + off_col_adj
-        off_tc1 = tc1 + off_col_adj
-        sr0 = max(0, off_tr0 - search_margin)
-        sr1 = min(h_img, off_tr1 + search_margin)
-        sc0 = max(0, off_tc0 - search_margin)
-        sc1 = min(w_img, off_tc1 + search_margin)
-
-        if sr1 - sr0 <= template_u8.shape[0] or sc1 - sc0 <= template_u8.shape[1]:
-            return None
-
-        off_search = arr_off_shifted[sr0:sr1, sc0:sc1]
-        if np.mean(off_search > 0) < 0.3:
-            return None
-
-        off_search_u8 = clahe_normalize(off_search)
-
-        result = cv2.matchTemplate(off_search_u8, template_u8, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-        if max_val < self.threshold:
-            return None
-
-        dx_int = (sc0 + max_loc[0]) - tc0
-        dy_int = (sr0 + max_loc[1]) - tr0
-
-        sub_dx, sub_dy = _anchor_phase_refine(
-            ref_row, ref_col, dx_int, dy_int,
-            arr_ref, arr_off_shifted, h_img, w_img, phase_half)
-
-        total_dx = float(dx_int) + sub_dx
-        total_dy = float(dy_int) + sub_dy
-        print(f"    Located: {name} (NCC={max_val:.3f})")
-        return AnchorMatchResult(total_dx, total_dy, 1.0, self.name)
-
-
-class RoMaMatcher(AnchorMatcher):
-    """Robust Dense Feature Matching (RoMa) with foundation model guidance."""
-    name = "RoMa"
-
-    def match(self, ref_patch, off_patch, patch_half, name,
-              arr_ref, arr_off_shifted, ref_row, ref_col,
-              h_img, w_img, fine_res,
-              off_row_adj, off_col_adj,
-              ref_transform, offset_transform,
-              shift_px_x, shift_py_y,
-              loftr_model=None, loftr_device=None,
-              phase_half=32, mask_mode="heuristic",
-              roma_model=None) -> Optional[AnchorMatchResult]:
-        if roma_model is None:
-            return None
-
-        device = loftr_device or 'cpu'
-
-        # RoMa expects 3-channel RGB [0, 1] normalized tensors
-        def _to_roma_tensor(patch):
-            p_rgb = cv2.cvtColor(to_u8(patch), cv2.COLOR_GRAY2RGB)
-
-            cur_h, cur_w = patch.shape[:2]
-            min_dim = 448
-            if cur_h < min_dim or cur_w < min_dim:
-                scale = max(min_dim / cur_h, min_dim / cur_w)
-                target_h = int(round((cur_h * scale) / 14) * 14)
-                target_w = int(round((cur_w * scale) / 14) * 14)
-                p_rgb = cv2.resize(p_rgb, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-            else:
-                target_h = (cur_h // 14) * 14
-                target_w = (cur_w // 14) * 14
-                p_rgb = cv2.resize(p_rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-            p_t = torch.from_numpy(p_rgb).permute(2, 0, 1).float() / 255.0
-            return p_t[None].to(device)
-
-        ref_t = _to_roma_tensor(ref_patch)
-        off_t = _to_roma_tensor(off_patch)
-
-        def _deterministic_topk_sample(warp, certainty, num=400, grid_cells=8):
-            """Deterministic top-k sampling with spatial distribution.
-
-            Divides the certainty map into grid_cells x grid_cells regions and
-            picks the top-k highest-certainty matches per cell, ensuring spatial
-            coverage instead of clustering in one high-confidence area.
-            """
-            cert_2d = certainty[0]  # [H, W]
-            warp_2d = warp[0]       # [H, W, 4]
-            H, W = cert_2d.shape
-
-            per_cell = max(1, num // (grid_cells * grid_cells))
-            cell_h = max(1, H // grid_cells)
-            cell_w = max(1, W // grid_cells)
-
-            all_matches = []
-            all_certs = []
-
-            for gi in range(grid_cells):
-                for gj in range(grid_cells):
-                    r0 = gi * cell_h
-                    r1 = min(r0 + cell_h, H) if gi < grid_cells - 1 else H
-                    c0 = gj * cell_w
-                    c1 = min(c0 + cell_w, W) if gj < grid_cells - 1 else W
-
-                    cell_cert = cert_2d[r0:r1, c0:c1]
-                    cell_warp = warp_2d[r0:r1, c0:c1]
-
-                    cell_flat_cert = cell_cert.reshape(-1)
-                    cell_flat_warp = cell_warp.reshape(-1, 4)
-
-                    k = min(per_cell, cell_flat_cert.numel())
-                    if k == 0:
-                        continue
-
-                    topk_vals, topk_idx = cell_flat_cert.topk(k)
-                    all_matches.append(cell_flat_warp[topk_idx])
-                    all_certs.append(topk_vals)
-
-            if not all_matches:
-                return None, None
-
-            matches = torch.cat(all_matches, dim=0).unsqueeze(0)  # [1, K, 4]
-            certs = torch.cat(all_certs, dim=0).unsqueeze(0)       # [1, K]
-            return matches, certs
-
-        # Single deterministic run (no stochastic sampling)
-        # Use hashlib instead of hash() which is randomized per-process (PEP 456)
-        import hashlib
-        seed = int(hashlib.sha256(name.encode()).hexdigest(), 16) % 10000
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        cv2.setRNGSeed(seed)
-
-        try:
-            with torch.no_grad():
-                roma_model.apply_setting("satast")  # high quality for anchor matching (B=1)
-                preds = roma_model.match(ref_t, off_t)
-                warp_AB = preds["warp_AB"]  # (1, H, W, 2)
-                B, H, W, _ = warp_AB.shape
-                from .romav2.geometry import get_normalized_grid
-                grid = get_normalized_grid(B, H, W, overload_device=warp_AB.device)
-                warp = torch.cat([grid, warp_AB], dim=-1)  # (1, H, W, 4)
-                certainty = preds["confidence_AB"][..., 0]  # (1, H, W) logits
-                matches, certs = _deterministic_topk_sample(warp, certainty, num=400)
-                if matches is None:
-                    return None
-                matches = matches.cpu().numpy()
-                certs = certs.cpu().numpy()
-        except Exception as e:
-            print(f"    RoMa error for {name}: {e}")
-            return None
-
-        mask = certs.squeeze(0) > 0.2
-        if not mask.any():
-            return None
-        matches = matches[0][mask]
-
-        psize = patch_half * 2
-        mkpts0 = (matches[:, :2] + 1) / 2 * psize
-        mkpts1 = (matches[:, 2:] + 1) / 2 * psize
-
-        src_pts = mkpts0.astype(np.float32).reshape(-1, 1, 2)
-        dst_pts = mkpts1.astype(np.float32).reshape(-1, 1, 2)
-        M, inliers = cv2.estimateAffinePartial2D(
-            src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=5.0)
-
-        if M is None or inliers is None:
-            return None
-
-        scale_x = np.sqrt(M[0, 0]**2 + M[0, 1]**2)
-        scale_y = np.sqrt(M[1, 0]**2 + M[1, 1]**2)
-        rot_deg = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
-        if abs(rot_deg) > 5.0 or abs(scale_x - 1.0) > 0.20 or abs(scale_y - 1.0) > 0.20:
-            return None
-
-        n_inliers = int(inliers.sum())
-        if n_inliers < 6:
-            return None
-
-        # Calculate center displacement
-        center_pt = np.array([[[float(patch_half), float(patch_half)]]], dtype=np.float32)
-        pred_pt = cv2.transform(center_pt, M)
-        total_dx = float(pred_pt[0, 0, 0]) - patch_half + off_col_adj
-        total_dy = float(pred_pt[0, 0, 1]) - patch_half + off_row_adj
-
-        # Quality stats
-        a, b = M[0, 0], M[0, 1]
-        c, d = M[1, 0], M[1, 1]
-        local_rot = np.degrees(np.arctan2(c, a))
-        print(f"    Located: {name} (RoMa foundation: {n_inliers} inliers, deterministic top-k, rot={local_rot:.2f}deg)")
-
-        return AnchorMatchResult(total_dx, total_dy, 1.0, self.name)
-
-
-class MutualInfoMatcher(AnchorMatcher):
-    """Mutual information template matching."""
-    name = "MI"
-
-    def match(self, ref_patch, off_patch, patch_half, name,
-              arr_ref, arr_off_shifted, ref_row, ref_col,
-              h_img, w_img, fine_res,
-              off_row_adj, off_col_adj,
-              ref_transform, offset_transform,
-              shift_px_x, shift_py_y,
-              loftr_model=None, loftr_device=None,
-              phase_half=32, mask_mode="heuristic",
-              roma_model=None, template_half=None, search_margin=None) -> Optional[AnchorMatchResult]:
-        from skimage.metrics import normalized_mutual_information
-
-        if template_half is None:
-            template_half = patch_half // 2
-        if search_margin is None:
-            search_margin = patch_half
-
-        tr0 = max(0, ref_row - template_half)
-        tr1 = min(h_img, ref_row + template_half)
-        tc0 = max(0, ref_col - template_half)
-        tc1 = min(w_img, ref_col + template_half)
-        template = arr_ref[tr0:tr1, tc0:tc1]
-
-        off_center_r = ref_row + off_row_adj
-        off_center_c = ref_col + off_col_adj
-        sr0 = max(0, off_center_r - template_half - search_margin)
-        sr1 = min(h_img, off_center_r + template_half + search_margin)
-        sc0 = max(0, off_center_c - template_half - search_margin)
-        sc1 = min(w_img, off_center_c + template_half + search_margin)
-        search = arr_off_shifted[sr0:sr1, sc0:sc1]
-
-        if template.size == 0 or search.size == 0:
-            return None
-
-        th, tw = template.shape
-        sh, sw = search.shape
-        if th >= sh or tw >= sw:
-            return None
-
-        if np.mean(template > 0) < 0.3 or np.mean(search > 0) < 0.3:
-            return None
-
-        template_u8 = to_u8(template)
-        search_u8 = to_u8(search)
-
-        best_mi = -np.inf
-        best_dy, best_dx = 0, 0
-
-        for dy in range(0, sh - th + 1, 4):
-            for dx in range(0, sw - tw + 1, 4):
-                candidate = search_u8[dy:dy + th, dx:dx + tw]
-                mi = normalized_mutual_information(template_u8, candidate, bins=32)
-                if mi > best_mi:
-                    best_mi = mi
-                    best_dy, best_dx = dy, dx
-
-        fine_best_mi = best_mi
-        fine_dy, fine_dx = best_dy, best_dx
-        for dy in range(max(0, best_dy - 4), min(sh - th + 1, best_dy + 5)):
-            for dx in range(max(0, best_dx - 4), min(sw - tw + 1, best_dx + 5)):
-                candidate = search_u8[dy:dy + th, dx:dx + tw]
-                mi = normalized_mutual_information(template_u8, candidate, bins=32)
-                if mi > fine_best_mi:
-                    fine_best_mi = mi
-                    fine_dy, fine_dx = dy, dx
-
-        match_row = sr0 + fine_dy + th // 2
-        match_col = sc0 + fine_dx + tw // 2
-        total_dy = match_row - ref_row
-        total_dx = match_col - ref_col
-
-        if fine_best_mi < 1.15:
-            return None
-
-        print(f"    Located: {name} (MI match: NMI={fine_best_mi:.3f})")
-        return AnchorMatchResult(total_dx, total_dy, 1.0, self.name)
+    return AnchorMatchResult(total_dx, total_dy, 1.0, "RoMa")
 
 
 # ---------------------------------------------------------------------------
@@ -797,11 +392,10 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                    diagnostics_dir=None):
     """Locate anchor GCPs in both reference and offset images.
 
-    *matcher_type*: "roma", "lightglue", or "loftr".  Controls priority.
+    *matcher_type*: "roma" (default).  Controls priority.
     """
-    anchor_file = open(anchors_path)
-    anchor_data = json.load(anchor_file)
-    anchor_file.close()
+    with open(anchors_path) as anchor_file:
+        anchor_data = json.load(anchor_file)
 
     # Auto-detect format
     if "type" in anchor_data and anchor_data["type"] == "FeatureCollection":
@@ -836,44 +430,14 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
     phase_half = 32
 
     # Initialise models from cache
-    loftr_model = None
     roma_model = None
-    loftr_device = None
     if model_cache is not None:
-        loftr_device = model_cache.device
-        if matcher_type == "loftr":
-            try:
-                loftr_model = model_cache.loftr
-            except Exception as e:
-                print(f"    WARNING: LoFTR from cache failed ({e})")
-        elif matcher_type == "roma":
-            try:
-                roma_model = model_cache.roma
-            except Exception as e:
-                print(f"    WARNING: RoMa from cache failed ({e}), using LoFTR")
-                try:
-                    loftr_model = model_cache.loftr
-                except Exception: pass
-    
-    # Fallback to local init if cache failed/missing
-    if matcher_type == "loftr" and loftr_model is None:
         try:
-            loftr_device = get_torch_device()
-            loftr_model = KF.LoFTR(pretrained="outdoor").eval().to(loftr_device)
-        except Exception: pass
+            roma_model = model_cache.roma
+        except Exception as e:
+            print(f"    WARNING: RoMa from cache failed ({e})")
 
-    # Build matcher cascade based on preference
-    matchers_neural = []
-    if matcher_type == "roma" and roma_model is not None:
-        matchers_neural.append(RoMaMatcher())
-    elif (matcher_type == "loftr" or roma_model is None) and loftr_model is not None:
-        matchers_neural.append(LoFTRMatcher(edge_preprocess=False))
-        matchers_neural.append(LoFTRMatcher(edge_preprocess=True))
-
-    # We no longer use NCC/Phase matchers as fallbacks because they are prone
-    # to hallucinating matches on flat terrain (e.g. ocean, missing data borders)
-    # which poisons the consensus. If neural models fail, the anchor is skipped.
-    matchers_ncc = []
+    has_roma = roma_model is not None
 
     for anchor in gcps_list:
         name = anchor["name"]
@@ -952,7 +516,7 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
         if feature_type in ("island_center", "reef_feature"):
             min_land = 0.005
         else:
-            min_land = 0.05 if (roma_model or loftr_model) else 0.15
+            min_land = 0.05 if roma_model else 0.15
         
         for try_ph in shrink_sizes:
             if try_ph < 16:
@@ -1028,48 +592,13 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                 ref_row, ref_col, try_ph, arr_ref, arr_off_shifted,
                 h_img, w_img, off_row_adj, off_col_adj)
 
-            # Try neural matchers first
-            if ref_patch is not None:
-                for matcher in matchers_neural:
-                    result = matcher.match(
-                        ref_patch, off_patch, try_ph, name,
-                        arr_ref, arr_off_shifted, ref_row, ref_col,
-                        h_img, w_img, fine_res,
-                        off_row_adj, off_col_adj,
-                        ref_transform, offset_transform,
-                        shift_px_x, shift_py_y,
-                        loftr_model=loftr_model, loftr_device=loftr_device,
-                        phase_half=phase_half, mask_mode=anchor_mm,
-                        roma_model=roma_model)
-                    if result is not None:
-                        best_match = result
-                        break
-
-            if best_match is not None:
-                break
-
-            # NCC-based matchers (use the full arrays, not extracted patches)
-            for matcher in matchers_ncc:
-                kwargs = {}
-                if isinstance(matcher, (GradientNCCMatcher, StandardNCCMatcher, MutualInfoMatcher)):
-                    kwargs = {'template_half': eff_th, 'search_margin': eff_sm}
-
-                result = matcher.match(
+            if ref_patch is not None and has_roma:
+                result = match_anchor_roma(
                     ref_patch, off_patch, try_ph, name,
-                    arr_ref, arr_off_shifted, ref_row, ref_col,
-                    h_img, w_img, fine_res,
-                    off_row_adj, off_col_adj,
-                    ref_transform, offset_transform,
-                    shift_px_x, shift_py_y,
-                    loftr_model=loftr_model, loftr_device=loftr_device,
-                    phase_half=phase_half, mask_mode=anchor_mm,
-                    **kwargs)
+                    off_row_adj, off_col_adj, roma_model)
                 if result is not None:
                     best_match = result
                     break
-
-            if best_match is not None:
-                break
 
         # Presearch fallback: for island/reef types the land mask shape IS the
         # feature.  For corners (e.g. fort), the mask NCC is less precise but
@@ -1237,24 +766,13 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
             # the matcher.  For geo conversion we compute the result
             # directly from the predicted offset position + matcher delta.
             best_match = None
-            if ref_patch_direct is not None and off_patch_direct is not None:
+            if ref_patch_direct is not None and off_patch_direct is not None and has_roma:
                 try_ph = min(ref_patch_direct.shape) // 2
-                for matcher in matchers_neural:
-                    result = matcher.match(
-                        ref_patch_direct, off_patch_direct,
-                        try_ph, fname,
-                        arr_ref, arr_off_shifted, frow, fcol,
-                        h_img, w_img, fine_res,
-                        0, 0,  # patches already aligned
-                        ref_transform, offset_transform,
-                        shift_px_x, shift_py_y,
-                        loftr_model=loftr_model,
-                        loftr_device=loftr_device,
-                        phase_half=phase_half, mask_mode=fa_mm,
-                        roma_model=roma_model)
-                    if result is not None:
-                        best_match = result
-                        break
+                result = match_anchor_roma(
+                    ref_patch_direct, off_patch_direct, try_ph, fname,
+                    0, 0, roma_model)
+                if result is not None:
+                    best_match = result
 
             if best_match is not None:
                 # Convert to geo: the matcher returns (dx, dy) displacement
@@ -1282,17 +800,7 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
         failed_anchors = still_failed
 
     # Pass 2: Retry failed anchors at different patch sizes.
-    # Lazy-load LoFTR if only RoMa was used, so failed RoMa anchors still
-    # get a chance with a different matcher.
-    if len(failed_anchors) > 0 and loftr_model is None and len(results) >= 2:
-        try:
-            loftr_device = loftr_device or get_torch_device()
-            loftr_model = KF.LoFTR(pretrained="outdoor").eval().to(loftr_device)
-            print("  [Pass 2] Lazy-loaded LoFTR for failed anchor retry", flush=True)
-        except Exception:
-            pass
-
-    if len(failed_anchors) > 0 and loftr_model is not None and len(results) >= 2:
+    if len(failed_anchors) > 0 and len(results) >= 2:
         print(f"\n    Pass 2: Re-evaluating {len(failed_anchors)} failed anchors "
               f"with relaxed quality gates ({len(results)} anchors succeeded in Pass 1)", flush=True)
         for fa in failed_anchors:
@@ -1321,17 +829,10 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                 if ref_patch is None:
                     continue
 
-                for matcher in matchers_neural:
-                    result = matcher.match(
+                if has_roma:
+                    result = match_anchor_roma(
                         ref_patch, off_patch, rph, fname,
-                        arr_ref, arr_off_shifted, frow, fcol,
-                        h_img, w_img, fine_res,
-                        f_ora, f_oca,
-                        ref_transform, offset_transform,
-                        shift_px_x, shift_py_y,
-                        loftr_model=loftr_model, loftr_device=loftr_device,
-                        phase_half=phase_half, mask_mode=fa_mm,
-                        roma_model=roma_model)
+                        f_ora, f_oca, roma_model)
                     if result is not None:
                         ref_gx, ref_gy, off_gx, off_gy = _anchor_to_geo(
                             frow, fcol, result.dx_px, result.dy_px,
@@ -1340,9 +841,6 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                         results.append((ref_gx, ref_gy, off_gx, off_gy,
                                        result.quality, f"anchor:{fname}"))
                         break
-                else:
-                    continue
-                break
 
     results = _filter_anchor_displacement_outliers(results)
     return results

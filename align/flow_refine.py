@@ -11,8 +11,17 @@ RAFT (torchvision) is preferred over DIS for cross-temporal satellite imagery:
 - Falls back to DIS if RAFT unavailable (no GPU, import failure, etc.)
 """
 
+import gc
+
 import cv2
 import numpy as np
+import rasterio
+import rasterio.transform
+import torch
+from rasterio.warp import reproject, Resampling
+
+from .constants import MAX_FLOW_BIAS_M as _DEFAULT_MAX_BIAS_M
+from .image import chunked_remap, to_u8_percentile
 
 # ---------------------------------------------------------------------------
 # RAFT (torchvision) — preferred flow estimator
@@ -34,7 +43,6 @@ def _get_raft_model():
     if _RAFT_MODEL is not None:
         return _RAFT_MODEL, _RAFT_DEVICE
     try:
-        import torch
         from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
         if torch.cuda.is_available():
@@ -47,7 +55,6 @@ def _get_raft_model():
             return None, None
 
         # Force garbage collection to free GPU memory from previous models
-        import gc
         gc.collect()
         if device.type == 'mps':
             torch.mps.empty_cache()
@@ -84,8 +91,6 @@ def _get_raft_model():
 
 def _raft_forward_single(model, device, ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray:
     """Run RAFT on a single (small enough) image pair. Returns flow (H, W, 2)."""
-    import torch
-
     h, w = ref_gray.shape[:2]
 
     def _prepare(gray):
@@ -119,19 +124,66 @@ def _raft_forward_single(model, device, ref_gray: np.ndarray, warped_gray: np.nd
     return flow_np
 
 
+def _raft_forward_batch(
+    model, device,
+    ref_tiles: list[np.ndarray],
+    warped_tiles: list[np.ndarray],
+) -> list[np.ndarray]:
+    """Run RAFT on a batch of same-sized tile pairs.
+
+    All tiles must have the same dimensions. Returns list of flow arrays (H, W, 2).
+    """
+    if not ref_tiles:
+        return []
+
+    batch_size = len(ref_tiles)
+    h, w = ref_tiles[0].shape[:2]
+
+    # Pad to multiple of 8
+    pad_h = (8 - h % 8) % 8
+    pad_w = (8 - w % 8) % 8
+
+    def _prepare_batch(tiles):
+        tensors = []
+        for gray in tiles:
+            if pad_h > 0 or pad_w > 0:
+                gray = np.pad(gray, ((0, pad_h), (0, pad_w)), mode='reflect')
+            rgb = np.stack([gray, gray, gray], axis=0).astype(np.float32) / 255.0
+            tensors.append(torch.from_numpy(rgb))
+        return torch.stack(tensors).to(device)
+
+    ref_batch = _prepare_batch(ref_tiles)
+    warped_batch = _prepare_batch(warped_tiles)
+
+    with torch.no_grad():
+        flow_preds = model(ref_batch, warped_batch)
+        flow = flow_preds[-1]  # (B, 2, H, W)
+
+    results = []
+    for i in range(batch_size):
+        flow_np = flow[i].cpu().numpy()  # (2, H, W)
+        flow_np = np.transpose(flow_np, (1, 2, 0))  # (H, W, 2)
+        if pad_h > 0 or pad_w > 0:
+            flow_np = flow_np[:ref_tiles[i].shape[0], :ref_tiles[i].shape[1]]
+        results.append(flow_np)
+
+    return results
+
+
 # Max tile size for RAFT — keeps MPS/CUDA memory under ~4 GiB per tile
 _RAFT_TILE_SIZE = 1024
 _RAFT_TILE_OVERLAP = 128
+_RAFT_BATCH_SIZE = 4
 
 
-def _estimate_flow_raft(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray:
+def _estimate_flow_raft(ref_gray: np.ndarray, warped_gray: np.ndarray,
+                        batch_size: int = _RAFT_BATCH_SIZE) -> np.ndarray:
     """Compute dense optical flow using torchvision RAFT.
 
     Returns flow (H, W, 2) in pixels: flow[y, x] = (dx, dy).
     For large images, processes in overlapping tiles to manage GPU memory.
-    Falls back to DIS for smaller inputs or on OOM.
+    Tiles are batched for throughput (OOM falls back to batch_size=1, then DIS).
     """
-    import torch
     model, device = _get_raft_model()
     if model is None:
         return _estimate_flow_dis(ref_gray, warped_gray)
@@ -174,48 +226,85 @@ def _estimate_flow_raft(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.nda
     tiles_y = max(1, (h - overlap + stride - 1) // stride)
     tiles_x = max(1, (w - overlap + stride - 1) // stride)
     total_tiles = tiles_y * tiles_x
-    done = 0
 
+    # Collect tile coordinates
+    tile_specs = []
     for ty in range(tiles_y):
         for tx in range(tiles_x):
             y0 = min(ty * stride, max(0, h - tile_size))
             x0 = min(tx * stride, max(0, w - tile_size))
             y1 = min(y0 + tile_size, h)
             x1 = min(x0 + tile_size, w)
-            th, tw = y1 - y0, x1 - x0
+            tile_specs.append((y0, x0, y1, x1))
 
-            if th < 128 or tw < 128:
-                # Tile too small for RAFT, use DIS for this tile
-                tile_flow = _estimate_flow_dis(ref_gray[y0:y1, x0:x1],
-                                                warped_gray[y0:y1, x0:x1])
+    # Process in batches
+    done = 0
+    raft_batch_refs = []
+    raft_batch_warps = []
+    raft_batch_specs = []
+    effective_batch = batch_size
+
+    def _flush_batch():
+        nonlocal done, raft_batch_refs, raft_batch_warps, raft_batch_specs, effective_batch
+        if not raft_batch_refs:
+            return
+        try:
+            flows = _raft_forward_batch(model, device, raft_batch_refs, raft_batch_warps)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() and effective_batch > 1:
+                print(f"  [RAFT] OOM on batch of {len(raft_batch_refs)}, retrying individually", flush=True)
+                if device.type == 'mps':
+                    torch.mps.empty_cache()
+                elif device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                effective_batch = 1
+                flows = [_raft_forward_single(model, device, r, w)
+                         for r, w in zip(raft_batch_refs, raft_batch_warps)]
+            elif "out of memory" in str(e).lower():
+                print(f"  [RAFT] OOM on single tile, falling back to DIS", flush=True)
+                if device.type == 'mps':
+                    torch.mps.empty_cache()
+                elif device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                flows = [_estimate_flow_dis(r, w)
+                         for r, w in zip(raft_batch_refs, raft_batch_warps)]
             else:
-                try:
-                    tile_flow = _raft_forward_single(
-                        model, device, ref_gray[y0:y1, x0:x1],
-                        warped_gray[y0:y1, x0:x1])
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
-                        print(f"  [RAFT] OOM on tile {done+1}/{total_tiles}, falling back to DIS", flush=True)
-                        if device.type == 'mps':
-                            torch.mps.empty_cache()
-                        elif device.type == 'cuda':
-                            torch.cuda.empty_cache()
-                        tile_flow = _estimate_flow_dis(
-                            ref_gray[y0:y1, x0:x1],
-                            warped_gray[y0:y1, x0:x1])
-                    else:
-                        raise
+                raise
 
-            # Cosine blend weights for smooth tile boundaries
+        for (y0, x0, y1, x1), tile_flow in zip(raft_batch_specs, flows):
+            th, tw = y1 - y0, x1 - x0
             wy = _blend_weight_1d(th, min(overlap, th // 2))
             wx = _blend_weight_1d(tw, min(overlap, tw // 2))
             tile_weight = wy[:, None] * wx[None, :]
-
             flow_accum[y0:y1, x0:x1, 0] += tile_flow[:, :, 0] * tile_weight
             flow_accum[y0:y1, x0:x1, 1] += tile_flow[:, :, 1] * tile_weight
             weight_accum[y0:y1, x0:x1] += tile_weight
-
             done += 1
+
+        raft_batch_refs.clear()
+        raft_batch_warps.clear()
+        raft_batch_specs.clear()
+
+    for y0, x0, y1, x1 in tile_specs:
+        th, tw = y1 - y0, x1 - x0
+        if th < 128 or tw < 128:
+            tile_flow = _estimate_flow_dis(ref_gray[y0:y1, x0:x1],
+                                            warped_gray[y0:y1, x0:x1])
+            wy = _blend_weight_1d(th, min(overlap, th // 2))
+            wx = _blend_weight_1d(tw, min(overlap, tw // 2))
+            tile_weight = wy[:, None] * wx[None, :]
+            flow_accum[y0:y1, x0:x1, 0] += tile_flow[:, :, 0] * tile_weight
+            flow_accum[y0:y1, x0:x1, 1] += tile_flow[:, :, 1] * tile_weight
+            weight_accum[y0:y1, x0:x1] += tile_weight
+            done += 1
+        else:
+            raft_batch_refs.append(ref_gray[y0:y1, x0:x1])
+            raft_batch_warps.append(warped_gray[y0:y1, x0:x1])
+            raft_batch_specs.append((y0, x0, y1, x1))
+            if len(raft_batch_refs) >= effective_batch:
+                _flush_batch()
+
+    _flush_batch()
 
     if done > 1:
         print(f"  [RAFT] Processed {done} tiles ({tiles_x}x{tiles_y})", flush=True)
@@ -292,6 +381,61 @@ def _forward_backward_error(
     return flow_bwd, bwd_at_fwd, err
 
 
+# ---------------------------------------------------------------------------
+# Shared flow post-processing helpers
+# ---------------------------------------------------------------------------
+
+def clamp_flow_magnitude(flow: np.ndarray, max_m: float, res_m: float) -> np.ndarray:
+    """Clamp flow vectors whose magnitude exceeds *max_m* metres.
+
+    *flow* is (H, W, 2) in pixel units; *res_m* converts pixels to metres.
+    Returns the (H, W) magnitude array (post-clamping).
+    """
+    mag = np.sqrt(flow[:, :, 0] ** 2 + flow[:, :, 1] ** 2)
+    max_px = max_m / res_m
+    too_large = mag > max_px
+    if np.any(too_large):
+        clip = np.where(too_large, max_px / (mag + 1e-8), 1.0)
+        flow[:, :, 0] *= clip
+        flow[:, :, 1] *= clip
+        mag = np.clip(mag, 0, max_px)
+    return mag
+
+
+def subtract_flow_bias(
+    flow: np.ndarray,
+    mask: np.ndarray,
+    res_m: float,
+    max_bias_m: float = _DEFAULT_MAX_BIAS_M,
+    label: str = "FlowRefine",
+) -> None:
+    """Subtract systematic median bias from *flow* using reliable *mask* pixels.
+
+    Modifies *flow* in-place.  Only subtracts if per-axis bias exceeds 5 m,
+    and caps the subtraction at *max_bias_m*.
+    """
+    if not mask.any():
+        return
+    reliable_dx = flow[mask, 0]
+    reliable_dy = flow[mask, 1]
+    median_dx = float(np.median(reliable_dx))
+    median_dy = float(np.median(reliable_dy))
+    bias_m_dx = abs(median_dx) * res_m
+    bias_m_dy = abs(median_dy) * res_m
+    if bias_m_dx > 5.0 or bias_m_dy > 5.0:
+        max_bias_px = max_bias_m / res_m
+        capped_dx = float(np.clip(median_dx, -max_bias_px, max_bias_px))
+        capped_dy = float(np.clip(median_dy, -max_bias_px, max_bias_px))
+        flow[:, :, 0] -= capped_dx
+        flow[:, :, 1] -= capped_dy
+        print(
+            f"  [{label}] Subtracted median bias: "
+            f"dx={median_dx * res_m:+.1f}m, dy={median_dy * res_m:+.1f}m"
+            f" (capped to dx={capped_dx * res_m:+.1f}m, dy={capped_dy * res_m:+.1f}m)",
+            flush=True,
+        )
+
+
 def dense_flow_refinement(
     ref_arr: np.ndarray,
     warped_arr: np.ndarray,
@@ -332,17 +476,8 @@ def dense_flow_refinement(
         scale = 1.0
 
     # Convert to uint8 for optical flow
-    def to_u8(arr):
-        valid = arr[arr > 0]
-        if len(valid) == 0:
-            return np.zeros_like(arr, dtype=np.uint8)
-        lo, hi = np.percentile(valid, [1, 99])
-        if hi <= lo:
-            return np.zeros_like(arr, dtype=np.uint8)
-        return np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
-
-    ref_u8 = to_u8(ref_arr)
-    warped_u8 = to_u8(warped_arr)
+    ref_u8 = to_u8_percentile(ref_arr)
+    warped_u8 = to_u8_percentile(warped_arr)
 
     if scale < 1.0:
         ref_small = cv2.resize(ref_u8, (work_w, work_h), interpolation=cv2.INTER_AREA)
@@ -362,28 +497,7 @@ def dense_flow_refinement(
         flow_fwd[:, :, 0] = cv2.medianBlur(flow_fwd[:, :, 0], median_kernel)
         flow_fwd[:, :, 1] = cv2.medianBlur(flow_fwd[:, :, 1], median_kernel)
 
-    # Subtract systematic flow bias (median of reliable pixels) to remove
-    # directional drift introduced by coastline-dominated DIS flow.
-    # Cap at 15m/axis: larger biases are usually legitimate warp corrections
-    # (especially for TPS), not DIS artifacts.
-    MAX_BIAS_M = 15.0
-    if fb_mask.any():
-        reliable_dx = flow_fwd[fb_mask, 0]
-        reliable_dy = flow_fwd[fb_mask, 1]
-        median_dx = float(np.median(reliable_dx))
-        median_dy = float(np.median(reliable_dy))
-        bias_m_dx = abs(median_dx) * work_res_m
-        bias_m_dy = abs(median_dy) * work_res_m
-        if bias_m_dx > 5.0 or bias_m_dy > 5.0:
-            max_bias_px = MAX_BIAS_M / work_res_m
-            capped_dx = float(np.clip(median_dx, -max_bias_px, max_bias_px))
-            capped_dy = float(np.clip(median_dy, -max_bias_px, max_bias_px))
-            flow_fwd[:, :, 0] -= capped_dx
-            flow_fwd[:, :, 1] -= capped_dy
-            print(f"  [FlowRefine] Subtracted median bias: "
-                  f"dx={median_dx * work_res_m:+.1f}m, dy={median_dy * work_res_m:+.1f}m"
-                  f" (capped to dx={capped_dx * work_res_m:+.1f}m, dy={capped_dy * work_res_m:+.1f}m)",
-                  flush=True)
+    subtract_flow_bias(flow_fwd, fb_mask, work_res_m)
 
     # Zero out unreliable flow
     flow_fwd[~fb_mask] = 0
@@ -400,13 +514,7 @@ def dense_flow_refinement(
     flow_fwd[~(ref_valid & warped_valid)] = 0
 
     # Clamp corrections
-    max_px = max_correction_m / work_res_m
-    flow_mag = np.sqrt(flow_fwd[:, :, 0]**2 + flow_fwd[:, :, 1]**2)
-    too_large = flow_mag > max_px
-    if np.any(too_large):
-        clip_factor = np.where(too_large, max_px / (flow_mag + 1e-8), 1.0)
-        flow_fwd[:, :, 0] *= clip_factor
-        flow_fwd[:, :, 1] *= clip_factor
+    flow_mag = clamp_flow_magnitude(flow_fwd, max_correction_m, work_res_m)
 
     # Upsample flow to full resolution if needed
     if scale < 1.0:
@@ -455,10 +563,6 @@ def apply_flow_refinement_to_file(
 
     Returns True if flow was applied, False if skipped (insufficient reliability).
     """
-    import gc
-    import rasterio
-    from rasterio.warp import reproject, Resampling
-
     # Open warped file to get dimensions and transform
     with rasterio.open(warped_path) as warped_ds:
         out_w = warped_ds.width
@@ -500,17 +604,8 @@ def apply_flow_refinement_to_file(
     warped_arr_fr = cv2.resize(warped_full, (fr_w, fr_h), interpolation=cv2.INTER_AREA)
 
     # Convert to uint8
-    def _to_u8(arr):
-        valid = arr[arr > 0]
-        if len(valid) == 0:
-            return np.zeros_like(arr, dtype=np.uint8)
-        lo, hi = np.percentile(valid, [1, 99])
-        if hi <= lo:
-            return np.zeros_like(arr, dtype=np.uint8)
-        return np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
-
-    ref_u8_fr = _to_u8(ref_arr_fr)
-    warped_u8_fr = _to_u8(warped_arr_fr)
+    ref_u8_fr = to_u8_percentile(ref_arr_fr)
+    warped_u8_fr = to_u8_percentile(warped_arr_fr)
 
     # Compute flow
     flow_fwd = _estimate_flow(ref_u8_fr, warped_u8_fr)
@@ -521,27 +616,7 @@ def apply_flow_refinement_to_file(
         flow_fwd[:, :, 0] = cv2.medianBlur(flow_fwd[:, :, 0], median_kernel)
         flow_fwd[:, :, 1] = cv2.medianBlur(flow_fwd[:, :, 1], median_kernel)
 
-    # Subtract systematic flow bias before zeroing unreliable pixels.
-    # Cap at 15m/axis: larger biases are usually legitimate warp corrections
-    # (especially for TPS), not DIS artifacts.
-    MAX_BIAS_M = 15.0
-    if fb_mask.any():
-        reliable_dx = flow_fwd[fb_mask, 0]
-        reliable_dy = flow_fwd[fb_mask, 1]
-        median_dx = float(np.median(reliable_dx))
-        median_dy = float(np.median(reliable_dy))
-        bias_m_dx = abs(median_dx) * fr_work_res
-        bias_m_dy = abs(median_dy) * fr_work_res
-        if bias_m_dx > 5.0 or bias_m_dy > 5.0:
-            max_bias_px = MAX_BIAS_M / fr_work_res
-            capped_dx = float(np.clip(median_dx, -max_bias_px, max_bias_px))
-            capped_dy = float(np.clip(median_dy, -max_bias_px, max_bias_px))
-            flow_fwd[:, :, 0] -= capped_dx
-            flow_fwd[:, :, 1] -= capped_dy
-            print(f"  [FlowRefine-TPS] Subtracted median bias: "
-                  f"dx={median_dx * fr_work_res:+.1f}m, dy={median_dy * fr_work_res:+.1f}m"
-                  f" (capped to dx={capped_dx * fr_work_res:+.1f}m, dy={capped_dy * fr_work_res:+.1f}m)",
-                  flush=True)
+    subtract_flow_bias(flow_fwd, fb_mask, fr_work_res, label="FlowRefine-TPS")
 
     flow_fwd[~fb_mask] = 0
 
@@ -550,14 +625,7 @@ def apply_flow_refinement_to_file(
     flow_fwd[~valid_mask_fr] = 0
 
     # Clamp corrections
-    max_px = max_correction_m / fr_work_res
-    flow_mag = np.sqrt(flow_fwd[:, :, 0] ** 2 + flow_fwd[:, :, 1] ** 2)
-    too_large = flow_mag > max_px
-    if np.any(too_large):
-        clip_factor = np.where(too_large, max_px / (flow_mag + 1e-8), 1.0)
-        flow_fwd[:, :, 0] *= clip_factor
-        flow_fwd[:, :, 1] *= clip_factor
-        flow_mag = np.clip(flow_mag, 0, max_px)
+    flow_mag = clamp_flow_magnitude(flow_fwd, max_correction_m, fr_work_res)
 
     reliable_pct = float(fb_mask.sum()) / max(1, fb_mask.size) * 100
     mean_corr = float(np.mean(flow_mag[fb_mask])) * fr_work_res if fb_mask.any() else 0.0
@@ -607,45 +675,6 @@ def apply_flow_refinement_to_file(
     strip_h = min(2048, out_h)
     n_strips = (out_h + strip_h - 1) // strip_h
 
-    def _chunked_remap_flow(src, mx, my):
-        """cv2.remap with column chunking for images exceeding SHRT_MAX."""
-        src_h, src_w = src.shape
-        dst_h, dst_w = mx.shape
-        if src_h <= _REMAP_MAX and src_w <= _REMAP_MAX and dst_h <= _REMAP_MAX and dst_w <= _REMAP_MAX:
-            return cv2.remap(src, mx, my, interpolation=cv2.INTER_LINEAR,
-                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        result = np.zeros((dst_h, dst_w), dtype=np.float32)
-        n_col_chunks = (dst_w + _REMAP_MAX - 1) // _REMAP_MAX
-        for ci in range(n_col_chunks):
-            c0 = ci * _REMAP_MAX
-            c1 = min(c0 + _REMAP_MAX, dst_w)
-            chunk_mx = mx[:, c0:c1]
-            chunk_my = my[:, c0:c1]
-            valid = (chunk_mx >= 0) & (chunk_my >= 0)
-            if not np.any(valid):
-                continue
-            sx_min = max(0, int(np.floor(chunk_mx[valid].min())) - 2)
-            sx_max = min(src_w, int(np.ceil(chunk_mx[valid].max())) + 3)
-            sy_min = max(0, int(np.floor(chunk_my[valid].min())) - 2)
-            sy_max = min(src_h, int(np.ceil(chunk_my[valid].max())) + 3)
-            if sx_max <= sx_min or sy_max <= sy_min:
-                continue
-            src_crop = src[sy_min:sy_max, sx_min:sx_max]
-            adj_mx = chunk_mx - sx_min
-            adj_my = chunk_my - sy_min
-            crop_h, crop_w = src_crop.shape
-            if crop_h <= _REMAP_MAX and crop_w <= _REMAP_MAX:
-                result[:, c0:c1] = cv2.remap(src_crop, adj_mx, adj_my,
-                                              interpolation=cv2.INTER_LINEAR,
-                                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            else:
-                from scipy.ndimage import map_coordinates
-                coords = np.array([adj_my.astype(np.float64), adj_mx.astype(np.float64)])
-                result[:, c0:c1] = map_coordinates(src_crop, coords, order=1,
-                                                    mode='constant', cval=0.0,
-                                                    prefilter=False).astype(np.float32)
-        return result
-
     with rasterio.open(warped_path, "r+") as dst:
         for si in range(n_strips):
             rs = si * strip_h
@@ -661,7 +690,7 @@ def apply_flow_refinement_to_file(
             map_y = yg + flow_y_full[rs:re].astype(np.float32)
 
             # Remap from full image (flow can pull from outside the strip)
-            strip_out = _chunked_remap_flow(warped_full, map_x, map_y)
+            strip_out = chunked_remap(warped_full, map_x, map_y)
 
             # Preserve nodata where remap went out of bounds
             oob = (map_x < 0) | (map_x >= out_w - 1) | (map_y < 0) | (map_y >= out_h - 1)

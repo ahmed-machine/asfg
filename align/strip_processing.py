@@ -65,7 +65,7 @@ def _job_to_namespace(job: AlignmentJob, shared_options: dict):
         tin_tarr_thresh=float(options.pop("tin_tarr_thresh", 1.5)),
         skip_fpp=bool(options.pop("skip_fpp", False)),
         matcher_anchor=options.pop("matcher_anchor", "roma"),
-        matcher_dense=options.pop("matcher_dense", "eloftr"),
+        matcher_dense=options.pop("matcher_dense", "roma"),
         grid_size=int(options.pop("grid_size", 20)),
         grid_iters=int(options.pop("grid_iters", 300)),
         arap_weight=float(options.pop("arap_weight", 1.0)),

@@ -4,12 +4,7 @@ import json
 import os
 import subprocess
 
-
-def _run_cmd(cmd, check=True):
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if check and result.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
-    return result
+from .shell import run_gdal_cmd as _run_cmd
 
 
 def georef_with_corners(input_path: str, output_path: str, corners: dict):

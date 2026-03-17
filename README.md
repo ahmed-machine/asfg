@@ -1,185 +1,95 @@
 # declass-process
 
-Tools for processing declassified satellite imagery — from rough georeferencing to globally-seeded, QA-scored alignment outputs ready for web map display.
+Automated georectification pipeline for declassified Cold War-era reconnaissance satellite imagery acquired by the United States between 1960 and 1984. Given a scanned film frame (or multi-frame strip) and a modern georeferenced basemap, the pipeline estimates and corrects the spatial mapping between the historical image and the reference through a sequence of increasingly fine-grained registration stages. The output is a geometrically corrected GeoTIFF suitable for change detection, land-use analysis, and historical GIS work.
 
-These scripts were developed for the [mapBH](https://www.mapbh.org) project, but the alignment pipeline now supports metadata priors, full-reference global localization, independent QA, and manifest-driven strip/block runs.
+![Feature matching between reference (left) and target KH-9 frame (right)](assets/feature-matching-example.jpg)
 
-## Scripts
+## Supported camera systems
 
-### `auto-align.py`
+| Designation | Program | Period | Entity prefix | Notes |
+|---|---|---|---|---|
+| KH-4 | CORONA | 1962–1972 | `DS1` | Panoramic stereo pairs; sub-frame segments stitched into strips |
+| KH-7 | GAMBIT | 1963–1967 | `DZB` | High-resolution spot collection |
+| KH-9 | HEXAGON | 1971–1984 | `D3C` | Mapping camera; multi-frame `.tgz` archives |
 
-Multi-stage alignment pipeline that takes a roughly-georeferenced GeoTIFF and aligns it against a trusted reference image.
+## Entry points
 
-**Pipeline stages:**
-
-1. **Setup + priors** — loads optional metadata priors from JSON/XML sidecars and chooses a local metric CRS even when rough overlap is absent
-2. **Global localization** — searches the full reference image at coarse resolution to seed translation before any overlap-dependent step
-3. **Coarse offset detection** — semantic-weighted mask matching at 15m/px -> 5m/px for local translation refinement
-4. **Scale/rotation detection** — LoFTR/local-patch scale estimation plus fallback NCC-based correction when needed
-5. **Neural feature matching cascade** — anchors, SuperPoint+LightGlue, and tiled LoFTR/ELoFTR/RoMa matching with semantic tile prioritization
-6. **Filtering + GCP selection** — spatial filtering, holdout split for QA, topology checks, and GCP distribution control
-7. **Warp + fallback** — grid-optimized warp plus TPS fallback, both scored with independent QA
-8. **Independent QA** — writes JSON QA reports, confidence scores, and can abstain on low-confidence results with `--allow-abstain`
-
-**Key features:**
-- Full-reference global localization before overlap-dependent matching
-- Metadata prior ingestion from JSON/XML sidecars
-- Semantic mask provider abstraction for coarse search, matching, and QA
-- Holdout-based independent QA report output (`_qa.json`)
-- Manifest-driven strip/block execution through `--strip-manifest` and `--block-manifest`
-- Diagnostic visualization output (`_debug.jpg`)
-- Apple Silicon MPS GPU acceleration for neural matchers
+**`process.py`** — End-to-end pipeline: USGS catalog parsing, scene download via the M2M API, archive extraction, frame stitching, rough georeferencing from corner coordinates, alignment against a reference image, and mosaic assembly. All stages are idempotent.
 
 ```bash
-# Basic alignment with anchor GCPs
-python3 auto-align.py target.tif \
-  --reference reference.tif \
-  --anchors data/bahrain_anchor_gcps.json \
-  --output aligned.tif \
-  -y
-
-# Without anchors (pure neural matching)
-python3 auto-align.py target.tif \
-  --reference reference.tif \
-  --output aligned.tif \
-  -y
-
-# Force a full-reference global search and keep a QA report
-python3 auto-align.py target.tif \
-  --reference reference.tif \
-  --global-search-res 30 \
-  --qa-json aligned_qa.json \
-  -y
-
-# Maximum quality mode (slower, more memory)
-python3 auto-align.py target.tif \
-  --reference reference.tif \
-  --anchors data/bahrain_anchor_gcps.json \
-  --best -y
-
-# Allow low-confidence runs to abstain instead of forcing an output
-python3 auto-align.py target.tif \
-  --reference reference.tif \
-  --allow-abstain \
-  -y
-
-# Run a strip manifest
-python3 auto-align.py --strip-manifest manifests/example_strip.json
-
-# Run a block manifest
-python3 auto-align.py --block-manifest manifests/example_block.json
+python process.py --csv catalog.csv --reference reference.tif --output-dir output/
+python process.py --csv catalog.csv --auto-reference --entities D3C1213-200346A003
 ```
 
-Common optional flags:
-
-- `--metadata-priors ...` or `--metadata-priors-dir PATH` — load sidecar rough-location priors
-- `--global-search` / `--no-global-search` — enable or disable the pre-overlap search stage
-- `--reference-window left,bottom,right,top` — restrict the global search window in the work CRS
-- `--mask-provider coastal_obia` — choose the semantic mask provider used for localization and QA
-- `--diagnostics-dir DIR` — redirect debug images and QA artifacts
-- `--qa-json PATH` — persist independent QA metrics
-- `--allow-abstain` — drop low-confidence outputs instead of forcing a result
-
-### `process_d3c.py`
-
-End-to-end KH-9 (Declass 3) satellite imagery pipeline:
-
-1. Download EarthExplorer "full" metadata XML (4 corner coordinates + acquisition date)
-2. Extract `.tgz` archives
-3. Stitch frames into a panoramic strip (GDAL VRT-based, with automatic frame ordering)
-4. Parse metadata XML for corner coordinates
-5. Georectify using corner GCPs (handles rotated panoramic strips via center-pivot rotation)
-6. Crop to Bahrain maritime boundary
-7. Trim nodata borders
-8. Rename to final format: `YYYY-MM-DD - Bahrain - ENTITY.tif`
-
-Handles 9 KH-9 entities covering Bahrain, with per-entity frame ordering configuration (some strips run east-to-west).
+**`auto-align.py`** — Alignment-only entry point. Takes a roughly georeferenced input GeoTIFF and a reference GeoTIFF and produces an aligned output. Also accepts strip and block manifests for batch processing.
 
 ```bash
-# Process all entities
-python3 process_d3c.py
-
-# Process specific entities
-python3 process_d3c.py --entities D3C1213-200346A003 D3C1214-200421F003
-
-# Re-stitch and reprocess from step 3
-python3 process_d3c.py --restitch
+python auto-align.py input.tif --reference reference.tif -y
+python auto-align.py input.tif --reference reference.tif --anchors gcps.json --qa-json qa.json -y
+python auto-align.py --strip-manifest manifest.json
 ```
 
-### `stitch_frames.py`
+### Single-stage entry points
 
-SIFT-based panoramic frame stitcher for consecutive satellite scan frames.
+These run individual pipeline stages in isolation, useful for manual preprocessing or debugging. They delegate to the `declass/` modules.
 
-- Uses SIFT feature detection on downscaled images for speed
-- Computes homography at reduced resolution, then applies at full resolution
-- Feathered distance-transform blending in overlap regions
-- Validates homography determinant to catch bad matches
+**`stitch_frames.py`** — Stitch consecutive satellite frames into a single panoramic strip. Auto-detects frame ordering and handles 180° rotation correction.
 
 ```bash
-python3 stitch_frames.py frame1.tif frame2.tif frame3.tif -o mosaic.tif
-
-# Custom downscale factor for feature detection
-python3 stitch_frames.py frame1.tif frame2.tif -o mosaic.tif --scale 0.5
+python stitch_frames.py frame1.tif frame2.tif frame3.tif -o stitched.tif
+python stitch_frames.py frame1.tif frame2.tif -o stitched.tif --preserve-order
 ```
 
-### `georef.py`
-
-Rough georeferencing of CORONA/LANYARD (DS1) imagery from USGS XML bounding boxes.
-
-For each image:
-1. Parses associated USGS metadata XML for bounding box coordinates
-2. For stitched images (multiple XMLs), computes the union bounding box
-3. Assigns WGS84 coordinates via `gdal_translate -a_ullr`
-4. Reprojects to Web Mercator (EPSG:3857) for tile serving
-
-Note: USGS documents ~10-mile positional error for CORONA/LANYARD corner points. This gives a rough georeference suitable for initial placement; use `auto-align.py` for precise alignment.
+**`georef.py`** — Rough-georeference imagery using USGS XML bounding boxes. Assigns WGS84 coordinates and reprojects to EPSG:3857.
 
 ```bash
-python3 georef.py
+python georef.py --input image.tif --xml metadata1.xml metadata2.xml
+python georef.py  # process all images in the built-in mapping
 ```
 
-## Data Files
+## Alignment pipeline
 
-### `data/bahrain_anchor_gcps.json`
+The core registration pipeline (`align/pipeline.py`) proceeds through the following stages:
 
-10 stable anchor Ground Control Points — manually identified landmarks that existed throughout the 1960-2000 period:
+1. **Global localization** — When the input lacks usable geolocation or falls outside the reference footprint, a coarse search localizes the image against the full reference at ~40 m/px using land/water mask cross-correlation.
 
-- **Forts**: Bahrain Fort NW corner, Arad Fort NW corner
-- **Water features**: Adhari Pool, Ayn Al Hakim
-- **Boundaries**: Hoora Graveyard wall
-- **Islands**: Jazirat Ash Shaykh, Ya'sub Island, Muhammediyya Island, Al Sayah Island
-- **Urban features**: Casino Fountain (Muharraq)
+2. **Coarse offset detection** — Land/water mask template matching at 15 m/px, refined to 5 m/px, to estimate the initial translation.
 
-Each GCP includes coordinates, feature type, confidence level, and optional `patch_size_m` for custom matching window sizes.
+3. **Scale and rotation correction** — ELoFTR dense matching with RANSAC affine estimation (primary), with multi-scale NCC on land masks and gradient images as fallback, to detect and pre-correct geometric distortions before fine matching.
 
-### `data/bahrain_boundary.geojson`
+4. **Feature matching** — Dense correspondence estimation using RoMa v2 with a satellite-pretrained DINOv3 backbone (sat493m) on tiled image patches, producing candidate ground control points. Optional anchor GCPs from known landmarks supplement the neural matches.
 
-GeoJSON polygon covering Bahrain's maritime extent (50.27-50.90E, 25.55-26.35N). Used by `process_d3c.py` to crop georectified imagery to the area of interest.
+5. **Filtering and validation** — Iterative outlier removal, RANSAC-based geometric verification, local consistency filtering, and holdout splitting for independent QA.
+
+6. **Grid optimization** — A PyTorch-based optimizer fits an affine baseline plus a learnable per-cell residual displacement field on a hierarchical multi-resolution grid. The composite loss includes GCP fidelity, displacement smoothness, and land-mask chamfer distance.
+
+7. **Flow refinement** — Sub-pixel optical flow at native resolution corrects residual local distortions below the grid cell size.
+
+8. **QA scoring** — Holdout cross-validation on withheld GCPs, shoreline IoU, and regional offset metrics. The pipeline can optionally abstain from producing output when confidence is low (`--allow-abstain`).
 
 ## Dependencies
 
-Install required packages:
-
-```bash
+```
 pip install -r requirements.txt
 ```
 
-**Required:**
-- `numpy` — array operations
-- `opencv-python` — SIFT/FLANN feature matching, image processing
-- `rasterio` — GeoTIFF I/O with coordinate system support
-- `scipy` — spatial algorithms, interpolation
-- `scikit-image` — image processing utilities
-- `Pillow` — image I/O
+**Core:** numpy, opencv-python, rasterio, scipy, scikit-image, Pillow
 
-**Optional (for neural matching in `auto-align.py`):**
-- `torch` — PyTorch for neural network inference
-- `torchvision` — RAFT optical-flow model
-- `kornia` — geometric vision utilities
-- `lightglue` — LightGlue + SuperPoint feature matching
+**Neural matching and optimization:** torch, torchvision, kornia
 
-**Vendored model code:**
-- `align/roma/` and `align/eloftr/` are intentionally vendored in-repo for reproducible production runs.
+**Vendored models:** `align/romav2/` is checked into the repository for reproducibility.
 
-**System dependencies:**
-- `gdal` / `gdalwarp` / `gdal_translate` — geospatial processing (install via `brew install gdal` or system package manager)
+**System:** GDAL (`gdalwarp`, `gdal_translate`) — install via `brew install gdal` or system package manager.
+
+A CUDA or Apple MPS GPU is recommended. CPU inference is supported but substantially slower for the matching and optimization stages.
+
+## References
+
+1. Edstedt, J., Nordström, D., Zhang, Y., et al. (2025). RoMa v2: Harder Better Faster Denser Feature Matching. *arXiv:2511.15706*.
+2. He, X., Yu, H., Peng, S., et al. (2025). MatchAnything: Universal Cross-Modality Image Matching with Large-Scale Pre-Training. *arXiv:2501.07556*. (EfficientLoFTR variant, used for scale/rotation detection)
+3. Wang, Y., He, X., Peng, S., Bao, H., & Zhou, X. (2024). Efficient LoFTR: Semi-Dense Local Feature Matching with Sparse-Like Speed. *CVPR 2024*.
+4. Teed, Z. & Deng, J. (2020). RAFT: Recurrent All-Pairs Field Transforms for Optical Flow. *ECCV 2020*.
+5. Siméoni, O., Vo, H. V., Seitzer, M., et al. (2025). DINOv3. *arXiv:2508.10104*. (Satellite-pretrained sat493m weights via timm, used for both the RoMa v2 backbone and the grid optimizer feature loss)
+6. Guo, H., Liu, J., Yang, B., et al. (2022). Outlier removal and feature point pairs optimization for piecewise linear transformation in the co-registration of very high-resolution optical remote sensing imagery. *ISPRS J. Photogrammetry and Remote Sensing*.
+7. Lowe, D. G. (2004). Distinctive Image Features from Scale-Invariant Keypoints. *IJCV*, 60(2), 91–110. (SIFT used for frame stitching and alignment validation)
+8. Donovan, M. et al. sPyMicMac: TPS-based réseau correction for KH-9 Hexagon imagery. Adapted for film distortion flattening.

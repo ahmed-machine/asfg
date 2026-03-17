@@ -89,12 +89,12 @@ def main():
     )
     parser.add_argument(
         "--matcher-anchor", type=str, default="roma",
-        choices=["roma", "lightglue", "loftr"],
+        choices=["roma"],
         help="Model to use for anchor GCP matching (default: roma)"
     )
     parser.add_argument(
         "--matcher-dense", type=str, default="roma",
-        choices=["eloftr", "roma", "loftr"],
+        choices=["roma"],
         help="Model to use for dense tiled matching (default: roma)"
     )
     parser.add_argument(

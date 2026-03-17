@@ -19,14 +19,98 @@ def get_torch_device(override: str | None = None) -> str:
     return "cpu"
 
 
+class ELoFTRWrapper:
+    """Wraps HuggingFace EfficientLoFTR to match the dict-based API.
+
+    Accepts: {"image0": [B, 1, H, W], "image1": [B, 1, H, W]}
+    Returns: {"mkpts0_f": [M, 2], "mkpts1_f": [M, 2], "mconf": [M], "m_bids": [M]}
+    """
+
+    def __init__(self, hf_model, device: str):
+        self.model = hf_model
+        self.device = device
+        self.training = False
+
+    def _forward_single(self, img0_single, img1_single):
+        """Run inference on a single pair [1, 1, H, W] each."""
+        _, _, H, W = img0_single.shape
+        pixel_values = torch.stack([img0_single, img1_single], dim=1)  # [1, 2, 1, H, W]
+
+        with torch.no_grad():
+            outputs = self.model(pixel_values=pixel_values)
+
+        kpts = outputs.keypoints[0]            # [2, N, 2]
+        matches = outputs.matches[0]           # [2, N]
+        scores = outputs.matching_scores[0]    # [2, N]
+
+        kpts_px = kpts.clone()
+        kpts_px[:, :, 0] *= W
+        kpts_px[:, :, 1] *= H
+
+        valid = torch.logical_and(scores[0] > 0, matches[0] > -1)
+        if valid.any():
+            mkpts0 = kpts_px[0][valid]
+            matched_idx = matches[0][valid].long()
+            mkpts1 = kpts_px[1][matched_idx]
+            mconf = scores[0][valid]
+            return mkpts0, mkpts1, mconf
+        return None
+
+    def __call__(self, batch: dict) -> dict:
+        img0 = batch["image0"]  # [B, 1, H, W]
+        img1 = batch["image1"]  # [B, 1, H, W]
+        B = img0.shape[0]
+
+        # Process pairs one-by-one (HF EfficientLoFTR has a batch bug
+        # where fine-matching keypoints get corrupted at B>1)
+        all_mkpts0 = []
+        all_mkpts1 = []
+        all_mconf = []
+        all_bids = []
+
+        for b in range(B):
+            result = self._forward_single(img0[b:b+1], img1[b:b+1])
+            if result is not None:
+                mkpts0, mkpts1, mconf = result
+                all_mkpts0.append(mkpts0)
+                all_mkpts1.append(mkpts1)
+                all_mconf.append(mconf)
+                all_bids.append(torch.full((mkpts0.shape[0],), b,
+                                           dtype=torch.long, device=mkpts0.device))
+
+        if all_mkpts0:
+            return {
+                "mkpts0_f": torch.cat(all_mkpts0, dim=0),
+                "mkpts1_f": torch.cat(all_mkpts1, dim=0),
+                "mconf": torch.cat(all_mconf, dim=0),
+                "m_bids": torch.cat(all_bids, dim=0),
+            }
+        else:
+            dev = img0.device
+            return {
+                "mkpts0_f": torch.zeros((0, 2), device=dev),
+                "mkpts1_f": torch.zeros((0, 2), device=dev),
+                "mconf": torch.zeros((0,), device=dev),
+                "m_bids": torch.zeros((0,), dtype=torch.long, device=dev),
+            }
+
+    def eval(self):
+        self.model.eval()
+        return self
+
+    def to(self, device):
+        self.model.to(device)
+        self.device = str(device)
+        return self
+
+
 class ModelCache:
     """Lazy-loaded cache for neural models."""
 
     def __init__(self, device: str = "cpu"):
         self.device = device
-        self._loftr = None
-        self._roma = None
         self._eloftr = None
+        self._roma = None
 
     @property
     def roma(self):
@@ -44,66 +128,20 @@ class ModelCache:
     @property
     def eloftr(self):
         if self._eloftr is None:
-            from .eloftr.config.default import get_cfg_defaults
-            from .eloftr.loftr import LoFTR
-            from .eloftr.utils.misc import lower_config
+            from transformers import AutoModelForKeypointMatching
 
-            print(f"  [ModelCache] Loading EfficientLoFTR on {self.device}")
-            cfg = get_cfg_defaults()
-            cfg.LOFTR.COARSE.NPE = [832, 832, 1024, 1024]
-            model = LoFTR(config=lower_config(cfg.LOFTR))
-
-            ckpt_name = "eloftr_outdoor_modified.ckpt"
-            ckpt_url = (
-                "https://huggingface.co/kornia/Efficient_LOFTR/resolve/main/"
-                f"{ckpt_name}"
+            print(f"  [ModelCache] Loading MatchAnything-ELoFTR on {self.device}")
+            hf_model = AutoModelForKeypointMatching.from_pretrained(
+                "zju-community/matchanything_eloftr"
             )
-            hub_dir = torch.hub.get_dir()
-            ckpt_path = os.path.join(hub_dir, "checkpoints", ckpt_name)
-
-            if not os.path.exists(ckpt_path):
-                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-                print("  [ModelCache] Downloading EfficientLoFTR weights...")
-                torch.hub.download_url_to_file(ckpt_url, ckpt_path)
-
-            try:
-                state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-            except Exception:
-                print("  [ModelCache] Standard load failed, attempting safe weights-only extract...")
-                state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-
-            if "state_dict" in state_dict:
-                state_dict = state_dict["state_dict"]
-
-            clean_state_dict = {}
-            for key, value in state_dict.items():
-                clean_key = key.replace("matcher.", "") if key.startswith("matcher.") else key
-                clean_state_dict[clean_key] = value
-
-            model.load_state_dict(clean_state_dict, strict=False)
-            self._eloftr = model.eval().to(self.device)
+            hf_model.eval().to(self.device)
+            self._eloftr = ELoFTRWrapper(hf_model, self.device)
+            print(f"  [ModelCache] MatchAnything-ELoFTR ready")
         return self._eloftr
 
-    @property
-    def loftr(self):
-        if self._loftr is None:
-            import kornia.feature as KF
-
-            print(f"  [ModelCache] Loading LoFTR on {self.device}")
-            model = KF.LoFTR(pretrained="outdoor").eval().to(self.device)
-            try:
-                if hasattr(torch, "compile") and self.device == "cuda":
-                    self._loftr = torch.compile(model)
-                else:
-                    self._loftr = model
-            except Exception:
-                self._loftr = model
-        return self._loftr
-
     def close(self) -> None:
-        self._loftr = None
-        self._roma = None
         self._eloftr = None
+        self._roma = None
         if self.device != "cpu":
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

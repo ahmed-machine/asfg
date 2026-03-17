@@ -23,10 +23,11 @@ from declass.catalog import parse_csvs, group_into_strips, filter_scenes
 from declass.camera import identify_camera
 from declass.usgs import download_scenes, fetch_corners_batch
 from declass.extract import extract_archive, list_frames
-from declass.stitch import stitch_frames, detect_strip_direction, compute_subset_corners
+from declass.stitch import stitch_frames, compute_subset_corners, detect_subframe_seams, split_at_seams
 from declass.georef import georef_with_corners
 from declass.mosaic import build_all_mosaics, build_mosaic
 from declass.reference import fetch_sentinel2_reference
+from declass.orientation import swap_corners_180, rotate_corners_cw90, rotate_corners_ccw90, detect_orientation, verify_orientation_against_reference
 
 
 def load_progress(output_dir: str) -> dict:
@@ -53,6 +54,41 @@ def ensure_dirs(output_dir: str):
         os.makedirs(os.path.join(output_dir, subdir), exist_ok=True)
 
 
+def _stitch_if_needed(frames: list[str], eid: str, camera,
+                      stitched_path: str, output_dir: str) -> str:
+    """Stitch frames or handle single-frame seam detection.
+
+    Returns the path to use for orientation detection (stitched or original).
+    """
+    if camera.needs_stitching and len(frames) > 1:
+        print(f"\n  --- Stitch: {eid} ({len(frames)} frames) ---")
+        stitch_frames(frames, stitched_path, output_dir, preserve_order=True)
+        return stitched_path
+
+    if len(frames) == 1 and camera.needs_stitching:
+        print(f"\n  --- Sub-frame detection: {eid} ---")
+        seams = detect_subframe_seams(frames[0])
+        if seams:
+            info_result = subprocess.run(
+                ["gdalinfo", "-json", frames[0]],
+                capture_output=True, text=True,
+            )
+            info = json.loads(info_result.stdout)
+            img_w, img_h = info["size"]
+            is_portrait = img_h > img_w
+
+            sub_frames = split_at_seams(frames[0], seams,
+                                        os.path.dirname(frames[0]),
+                                        is_portrait=is_portrait)
+            if len(sub_frames) > 1:
+                print(f"\n  --- Re-stitch: {eid} ({len(sub_frames)} sub-frames) ---")
+                stitch_frames(sub_frames, stitched_path, output_dir,
+                              preserve_order=True)
+                return stitched_path
+
+    return frames[0]
+
+
 def process_scene(scene, output_dir: str, file_map: dict, reference: str,
                   progress: dict, dry_run: bool = False) -> bool:
     """Process a single scene through extract → stitch → georef.
@@ -67,6 +103,7 @@ def process_scene(scene, output_dir: str, file_map: dict, reference: str,
     if os.path.exists(georef_path):
         print(f"  [skip] Already georeferenced: {eid}")
         progress["completed"][eid] = {"stage": "georef"}
+        progress["failed"].pop(eid, None)
         return True
 
     if dry_run:
@@ -91,36 +128,36 @@ def process_scene(scene, output_dir: str, file_map: dict, reference: str,
             progress["failed"][eid] = "no_frames"
             return False
 
-        # Step 4: Stitch (KH-9 only — multi-frame strips)
+        # Step 4: Stitch in raw film coordinates (always horizontal)
         corners = scene.corners
-        if camera.needs_stitching and len(frames) > 1:
-            print(f"\n  --- Stitch: {eid} ({len(frames)} frames) ---")
-
-            # Detect strip direction from corner coordinates
-            is_reversed = detect_strip_direction(corners)
-            direction = "reversed" if is_reversed else "forward"
-            print(f"  Strip direction: {direction}")
-
-            stitched_path = os.path.join(output_dir, "stitched", f"{eid}_stitched.tif")
-            stitch_frames(frames, stitched_path, output_dir)
-            input_for_georef = stitched_path
-
-            # No frame subset selection — stitch all frames.
-            # Corner coordinates from CSV cover the full strip.
-        else:
-            input_for_georef = frames[0]
-
-        # Step 5: Georef
-        print(f"\n  --- Georef: {eid} ---")
-        georef_with_corners(input_for_georef, georef_path, corners)
-
-        # Clean up stitched intermediate to save disk
         stitched_path = os.path.join(output_dir, "stitched", f"{eid}_stitched.tif")
-        if os.path.exists(stitched_path):
-            os.remove(stitched_path)
-            print(f"  Removed intermediate: {os.path.basename(stitched_path)}")
+        input_for_orient = _stitch_if_needed(frames, eid, camera, stitched_path, output_dir)
+
+        # Step 4b: Orientation detection — returns GCP corners, no pixel rotation
+        print(f"\n  --- Orientation: {eid} ---")
+        rotation, gcp_corners = detect_orientation(
+            input_for_orient, corners, camera, reference_path=reference)
+
+        if rotation != 0:
+            print(f"  Orientation: {rotation} CW (via GCP assignment, no image rotation)")
+
+        # Step 5: Georef — GDAL handles rotation via affine warp from GCP corners
+        print(f"\n  --- Georef: {eid} ---")
+        georef_with_corners(input_for_orient, georef_path, gcp_corners)
+
+        # Step 5b: Post-georef verification (report only, no auto-correction)
+        if reference and os.path.exists(reference):
+            print(f"\n  --- Post-georef orientation check: {eid} ---")
+            verify_orientation_against_reference(georef_path, reference)
+
+        # Clean up stitched intermediates to save disk
+        stitched_int = os.path.join(output_dir, "stitched", f"{eid}_stitched.tif")
+        if os.path.exists(stitched_int):
+            os.remove(stitched_int)
+            print(f"  Removed intermediate: {os.path.basename(stitched_int)}")
 
         progress["completed"][eid] = {"stage": "georef"}
+        progress["failed"].pop(eid, None)
         return True
 
     except Exception as e:
@@ -219,7 +256,7 @@ def scan_frames_dir(frames_dir: str) -> dict:
 
 
 def process_frames_dir(frames_dir: str, output_dir: str, crop_bbox: tuple = None,
-                       dry_run: bool = False):
+                       dry_run: bool = False, reference: str = None):
     """Process pre-downloaded sub-frame TIFFs: stitch, georef, and optionally crop.
 
     Args:
@@ -227,6 +264,7 @@ def process_frames_dir(frames_dir: str, output_dir: str, crop_bbox: tuple = None
         output_dir: Output directory for stitched/georef/cropped results.
         crop_bbox: Optional (west, south, east, north) to clip output.
         dry_run: If True, just show what would be done.
+        reference: Optional path to a georeferenced reference image for orientation.
     """
     # Create output subdirectories
     for subdir in ["stitched", "georef", "cropped", "mosaic"]:
@@ -281,19 +319,55 @@ def process_frames_dir(frames_dir: str, output_dir: str, crop_bbox: tuple = None
         stitched_path = os.path.join(output_dir, "stitched", f"{eid}_stitched.tif")
 
         if len(frames) == 1:
-            # Single frame, just copy
-            import shutil
-            shutil.copy2(frames[0], stitched_path)
-            print(f"  Single frame, copied")
-        else:
-            is_reversed = detect_strip_direction(corners)
-            if is_reversed:
-                print(f"  Strip direction: reversed (east→west)")
+            # Single frame — check for sub-frame seams
+            seams = detect_subframe_seams(frames[0])
+            if seams:
+                info_result = subprocess.run(
+                    ["gdalinfo", "-json", frames[0]],
+                    capture_output=True, text=True,
+                )
+                info_data = json.loads(info_result.stdout)
+                img_w, img_h = info_data["size"]
+                is_portrait = img_h > img_w
+
+                sub_frames = split_at_seams(frames[0], seams,
+                                            os.path.dirname(frames[0]),
+                                            is_portrait=is_portrait)
+                if len(sub_frames) > 1:
+                    print(f"  Re-stitching {len(sub_frames)} sub-frames")
+                    stitch_frames(sub_frames, stitched_path, output_dir,
+                                  preserve_order=True)
+                else:
+                    import shutil
+                    shutil.copy2(frames[0], stitched_path)
+                    print(f"  Single frame, copied")
             else:
-                print(f"  Strip direction: forward (west→east)")
-            stitch_frames(frames, stitched_path, output_dir)
+                import shutil
+                shutil.copy2(frames[0], stitched_path)
+                print(f"  Single frame, copied")
+        else:
+            # Multi-frame strip: alphabetical ordering is reliable for all camera types
+            keep_order = True
+            stitch_frames(frames, stitched_path, output_dir,
+                          preserve_order=keep_order)
 
         stitched_paths[eid] = stitched_path
+
+    # Step 3b: Orientation detection and correction
+    print("\n" + "=" * 60)
+    print("Step 3b: Orientation detection")
+    print("=" * 60)
+
+    for eid in entity_ids:
+        stitched_path = stitched_paths[eid]
+        corners = corners_map[eid]
+
+        rotation, gcp_corners = detect_orientation(
+            stitched_path, corners, camera, reference_path=reference
+        )
+        corners_map[eid] = gcp_corners  # GCP mapping for georef (no pixel rotation)
+        if rotation != 0:
+            print(f"  Orientation: {rotation} CW (via GCP assignment, no image rotation)")
 
     # Step 4: Georeference
     print("\n" + "=" * 60)
@@ -463,6 +537,7 @@ def main():
             output_dir=args.output_dir,
             crop_bbox=crop_bbox,
             dry_run=args.dry_run,
+            reference=args.reference,
         )
         return
 

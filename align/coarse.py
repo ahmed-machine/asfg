@@ -54,6 +54,7 @@ def detect_offset_at_resolution(src_offset, src_ref, overlap, work_crs, res,
     if template.shape[0] < 10 or template.shape[1] < 10:
         return None, None, 0
 
+    restricted = False
     if coarse_offset and search_margin_m:
         coarse_dx_px = int(round(coarse_offset[0] / res))
         coarse_dy_px = int(round(coarse_offset[1] / res))
@@ -68,11 +69,41 @@ def detect_offset_at_resolution(src_offset, src_ref, overlap, work_crs, res,
         search = search_img
         base_c, base_r = 0, 0
 
+        # Restrict search to valid-data region — prevents spurious matches
+        # when a long strip (e.g. 270km KH-4) overlaps a small reference
+        valid_rows = np.any(search > 0, axis=1)
+        valid_cols = np.any(search > 0, axis=0)
+        restricted = False
+        if valid_rows.any() and valid_cols.any():
+            r_idxs = np.where(valid_rows)[0]
+            c_idxs = np.where(valid_cols)[0]
+            pad = max(template.shape[0], template.shape[1])
+            r0 = max(0, r_idxs[0] - pad)
+            r1 = min(search.shape[0], r_idxs[-1] + pad + 1)
+            c0 = max(0, c_idxs[0] - pad)
+            c1 = min(search.shape[1], c_idxs[-1] + pad + 1)
+            # Only restrict if the crop is meaningfully smaller
+            if (r1 - r0) < search.shape[0] * 0.95 or (c1 - c0) < search.shape[1] * 0.95:
+                search = search[r0:r1, c0:c1]
+                base_c, base_r = c0, r0
+                restricted = True
+
     if search.shape[0] <= template.shape[0] or search.shape[1] <= template.shape[1]:
         return None, None, 0
 
     result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+    # If restricted search gave a poor result, retry with full search area
+    if max_val < 0.3 and restricted:
+        search = search_img
+        base_c, base_r = 0, 0
+        if search.shape[0] > template.shape[0] and search.shape[1] > template.shape[1]:
+            result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+    if max_val < 0.3:
+        return None, None, 0
 
     # Sub-pixel refinement via parabolic interpolation
     pr, pc = max_loc[1], max_loc[0]

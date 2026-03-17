@@ -79,7 +79,7 @@ def parse_log(log_text):
         "coarse_offset": {},
         "anchors": {"located": 0, "total": 0, "rejected": 0},
         "anchor_details": [],
-        "auto_gcps": {"lightglue": 0, "ransac_survivors": 0, "roma_coverage": 0},
+        "auto_gcps": {"ransac_survivors": 0, "roma_coverage": 0},
         "gcp_selection": {"count": 0, "coverage": 0.0},
         "grid_optimizer": {},
         "flow": {"reliable_pct": None, "mean_correction_m": None, "bias_dx_m": None, "bias_dy_m": None, "applied": None},
@@ -165,11 +165,6 @@ def parse_log(log_text):
     m = re.search(r"Loaded (\d+) anchors", log_text)
     if m:
         result["anchors"]["total"] = int(m.group(1))
-
-    # LightGlue
-    m = re.search(r"LightGlue:\s+(\d+)\s+matches", log_text)
-    if m:
-        result["auto_gcps"]["lightglue"] = int(m.group(1))
 
     # RoMa coverage
     m = re.search(r"RoMa coverage:\s+(\d+)\s+matches", log_text)
@@ -502,13 +497,13 @@ def run_pipeline(version, timeout):
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             env=env,
             cwd=str(PROJECT_ROOT),
             bufsize=1,
         )
 
-        # Read stdout line by line for live streaming
+        # Read stdout line by line for live streaming (stderr merged in)
         stderr_data = b""
         try:
             while True:
@@ -534,7 +529,6 @@ def run_pipeline(version, timeout):
                         proc.wait()
                     break
 
-            stderr_data = proc.stderr.read()
             exit_code = proc.returncode
 
         except KeyboardInterrupt:
@@ -545,7 +539,6 @@ def run_pipeline(version, timeout):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-            stderr_data = proc.stderr.read()
             exit_code = proc.returncode if proc.returncode is not None else -2
 
     except Exception as e:
@@ -662,8 +655,8 @@ def main():
     parser = argparse.ArgumentParser(description="Run Bahrain alignment test")
     parser.add_argument("--version", "-v", type=int, default=None,
                         help="Version number (default: auto-detect next)")
-    parser.add_argument("--timeout", "-t", type=int, default=6000,
-                        help="Timeout in seconds (default: 6000 = 100 min)")
+    parser.add_argument("--timeout", "-t", type=int, default=9000,
+                        help="Timeout in seconds (default: 9000 = 150 min)")
     args = parser.parse_args()
 
     version = args.version if args.version is not None else detect_next_version()

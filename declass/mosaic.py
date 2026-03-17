@@ -5,12 +5,7 @@ import subprocess
 import tempfile
 from collections import defaultdict
 
-
-def _run_cmd(cmd, check=True):
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if check and result.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
-    return result
+from .shell import run_gdal_cmd as _run_cmd
 
 
 def _resample_to_common_grid(paths, tmp_dir):

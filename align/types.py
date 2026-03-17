@@ -3,8 +3,68 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any, Iterable, Optional, Sequence
 
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# String enums for scattered literals
+# ---------------------------------------------------------------------------
+
+class MatcherType(str, Enum):
+    """Dense feature matcher backend."""
+    ROMA = "roma"
+
+
+class MaskMode(str, Enum):
+    """Land mask segmentation strategy."""
+    HEURISTIC = "heuristic"
+    COASTAL_OBIA = "coastal_obia"
+
+
+# ---------------------------------------------------------------------------
+# Result dataclasses for function returns (replacing bare tuples)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class CoarseOffset:
+    """Result of coarse offset detection."""
+    dx_m: Optional[float]
+    dy_m: Optional[float]
+    correlation: float
+    method: str = "land_mask_ncc"
+
+
+@dataclass(frozen=True, slots=True)
+class AffineEstimate:
+    """Result of RANSAC or least-squares affine fitting."""
+    M: np.ndarray
+    residuals: list[float]
+    n_inliers: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class OutlierRemovalResult:
+    """Result of iterative outlier removal."""
+    matched_pairs: list[Any]
+    M_geo: np.ndarray
+    geo_residuals: list[float]
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceOffsetCorrection:
+    """Result of reference offset detection and correction."""
+    matched_pairs: list[Any]
+    M_geo: np.ndarray
+    geo_residuals: list[float]
+    was_corrected: bool
+
+
+# ---------------------------------------------------------------------------
+# Legacy type aliases
+# ---------------------------------------------------------------------------
 
 LegacyMatch = tuple[float, float, float, float, float, str]
 LegacyGCP = tuple[float, float, float, float]

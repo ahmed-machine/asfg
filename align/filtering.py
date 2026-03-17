@@ -9,8 +9,172 @@ import rasterio
 import rasterio.transform
 from scipy.spatial import cKDTree  # type: ignore
 
-from .scale import fit_affine_from_gcps
+from .affine import fit_affine_from_gcps
 from .image import make_land_mask
+
+
+def _fit_initial_affine(anchors, auto, correction_outliers=None, top_n_auto=None):
+    """Fit initial affine from anchors (preferred) or mixed pool.
+
+    Returns (M_init, med_res, raw_med_res, fit_anchors, anchor_fit_unreliable).
+    M_init may be None if insufficient data.
+    """
+    outlier_set = set(correction_outliers) if correction_outliers else set()
+    fit_anchors = ([a for a in anchors
+                    if a[5].replace("anchor:", "") not in outlier_set]
+                   if outlier_set else anchors)
+
+    if top_n_auto is None:
+        top_n_auto = min(max(10, len(auto) // 3), len(auto))
+
+    anchor_fit_unreliable = False
+    M_init = None
+    med_res = None
+    raw_med_res = None
+
+    if len(fit_anchors) >= 4:
+        src_pts = np.array([(p[2], p[3]) for p in fit_anchors])
+        dst_pts = np.array([(p[0], p[1]) for p in fit_anchors])
+        M_init, residuals = fit_affine_from_gcps(src_pts, dst_pts)
+        raw_med_res = float(np.median(residuals))
+        n_excluded = len(anchors) - len(fit_anchors)
+        extra = f" ({n_excluded} outlier(s) excluded)" if n_excluded else ""
+        if raw_med_res > 30:
+            print(f"  WARNING: Anchors are internally inconsistent "
+                  f"(median error: {raw_med_res:.1f}m) -- reference may have "
+                  f"different distortion than target")
+        if raw_med_res > 120:
+            anchor_fit_unreliable = True
+        print(f"  Initial fit driven by {len(fit_anchors)} anchors "
+              f"(median error: {raw_med_res:.1f}m){extra}")
+        med_res = min(raw_med_res, 30.0)
+
+        if anchor_fit_unreliable:
+            print("  Anchor fit is too inconsistent for truth-filtering; "
+                  "falling back to auto-match consensus")
+            M_init = None
+            med_res = None
+            raw_med_res = None
+    else:
+        fit_pool = fit_anchors + auto[:top_n_auto]
+        if len(fit_pool) >= 3:
+            src_pts = np.array([(p[2], p[3]) for p in fit_pool])
+            dst_pts = np.array([(p[0], p[1]) for p in fit_pool])
+            fit_weights = np.array([50.0 if p[5].startswith("anchor:") else 1.0
+                                    for p in fit_pool])
+            M_init, residuals = fit_affine_from_gcps(src_pts, dst_pts, weights=fit_weights)
+            med_res = float(np.median(residuals))
+            raw_med_res = med_res
+
+    return M_init, med_res, raw_med_res, fit_anchors, anchor_fit_unreliable
+
+
+def _filter_by_anchor_truth(auto, anchors, M_init, med_res):
+    """Filter neural matches by distance from anchor-driven affine truth.
+
+    Returns (filtered_auto, rejected_auto).
+    """
+    if len(auto) < 6:
+        return auto, []
+
+    all_src = np.array([(p[2], p[3]) for p in auto])
+    all_dst = np.array([(p[0], p[1]) for p in auto])
+    pred_all = cv2.transform(
+        all_src.astype(np.float32).reshape(-1, 1, 2), M_init).reshape(-1, 2)
+    all_residuals = np.sqrt(np.sum((pred_all - all_dst)**2, axis=1))
+
+    global_threshold = max(5.0 * float(med_res), 100.0)
+
+    auto_filtered = []
+    auto_rejected = []
+    n_rejected_by_anchor = 0
+    for p, r in zip(auto, all_residuals):
+        if r < global_threshold:
+            auto_filtered.append(p)
+        else:
+            n_rejected_by_anchor += 1
+            auto_rejected.append(p)
+
+    if n_rejected_by_anchor > 0:
+        print(f"  Anchor-truth filter: rejected {n_rejected_by_anchor} neural matches "
+              f"not matching anchor geometry (> {global_threshold:.0f}m error)")
+
+    # Local consistency rescue
+    if auto_rejected and auto_filtered:
+        rescued = local_consistency_filter(
+            auto_rejected, anchors + auto_filtered,
+            threshold_m=50.0, k_neighbors=5, search_radius=5000.0)
+        if rescued:
+            print(f"  Local consistency rescue: recovered {len(rescued)} "
+                  f"of {len(auto_rejected)} rejected matches")
+            auto_filtered.extend(rescued)
+
+    return auto_filtered, auto_rejected
+
+
+def _validate_anchors(anchors, M_init, med_res, raw_med_res, overlap, target_count):
+    """Validate anchors against the initial affine and force-include for diversity.
+
+    Returns validated anchor list.
+    """
+    a, bv, tx = M_init[0]
+    c, d, ty = M_init[1]
+    anchor_threshold = max(4.0 * float(med_res), 100.0)
+    valid_anchors = []
+    rejected_anchors = []
+    for anc in anchors:
+        ogx, ogy = anc[2], anc[3]
+        rgx, rgy = anc[0], anc[1]
+        pred_x = a * ogx + bv * ogy + tx
+        pred_y = c * ogx + d * ogy + ty
+        dx = rgx - pred_x
+        dy = rgy - pred_y
+        res = np.sqrt(dx ** 2 + dy ** 2)
+        aname = anc[5].replace("anchor:", "")
+        if res <= anchor_threshold:
+            valid_anchors.append(anc)
+        else:
+            rejected_anchors.append((anc, res))
+            print(f"    Rejected anchor {aname} (res={res:.0f}m "
+                  f"[dx={dx:.1f}, dy={dy:.1f}] > {anchor_threshold:.0f}m)")
+
+    # Force-include rejected anchors for spatial diversity when anchors are consistent
+    n_rejected = len(rejected_anchors)
+    raw_med_res_val = raw_med_res if raw_med_res is not None else 1e9
+    if n_rejected >= 2 and raw_med_res_val <= 30:
+        rejected_anchors.sort(key=lambda x: x[1])
+        o_left, o_bottom, o_right, o_top = overlap
+        gc = 7 if target_count > 25 else 5
+        gr = 7 if target_count > 25 else 5
+        cw = (o_right - o_left) / gc
+        ch = (o_top - o_bottom) / gr
+        occupied = set()
+        for va in valid_anchors:
+            col = min(gc - 1, max(0, int((va[0] - o_left) / cw)))
+            row = min(gr - 1, max(0, int((va[1] - o_bottom) / ch)))
+            occupied.add((row, col))
+        forced = 0
+        max_force = min(3, n_rejected)
+        for anc, res in rejected_anchors:
+            col = min(gc - 1, max(0, int((anc[0] - o_left) / cw)))
+            row = min(gr - 1, max(0, int((anc[1] - o_bottom) / ch)))
+            if (row, col) not in occupied:
+                valid_anchors.append(anc)
+                occupied.add((row, col))
+                aname = anc[5].replace("anchor:", "")
+                print(f"    Force-included anchor {aname} (residual={res:.0f}m, spatial diversity)")
+                forced += 1
+                if forced >= max_force:
+                    break
+        if forced > 0:
+            print(f"    Neural model appears spatially biased "
+                  f"({n_rejected}/{len(anchors)} anchors rejected), "
+                  f"force-included {forced} for coverage")
+
+    if len(valid_anchors) < len(anchors):
+        print(f"    Kept {len(valid_anchors)}/{len(anchors)} anchors")
+
+    return valid_anchors
 
 
 def local_consistency_filter(candidates, reference_pairs, threshold_m=50.0,
@@ -512,172 +676,23 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
     auto.sort(key=lambda x: -x[4])
 
     remaining_target = target_count - len(anchors)
-
-    # Fit initial affine and reject outliers.
-    # CRITICAL: We prioritize anchors to define the global truth.
-    # If we have enough anchors, they ALONE define the initial transformation.
-    M_init = None
-    med_res = None
-    raw_med_res = None
     rejected_auto = []
-    
-    top_n_auto = min(max(10, len(auto) // 3), len(auto))
-    
-    # Exclude correction outliers from the anchor fit if provided
-    outlier_set = set(correction_outliers) if correction_outliers else set()
-    fit_anchors = ([a for a in anchors
-                    if a[5].replace("anchor:", "") not in outlier_set]
-                   if outlier_set else anchors)
 
-    anchor_fit_unreliable = False
+    # Fit initial affine (anchors-first, then mixed pool fallback)
+    M_init, med_res, raw_med_res, _, anchor_fit_unreliable = _fit_initial_affine(
+        anchors, auto, correction_outliers=correction_outliers)
 
-    if len(fit_anchors) >= 4:
-        # Use ONLY anchors to define the initial fit if we have a decent number.
-        # This prevents biased LoFTR clusters from stealing the global alignment.
-        src_pts = np.array([(p[2], p[3]) for p in fit_anchors])
-        dst_pts = np.array([(p[0], p[1]) for p in fit_anchors])
-        M_init, residuals = fit_affine_from_gcps(src_pts, dst_pts)
-        raw_med_res = float(np.median(residuals))
-        n_excluded = len(anchors) - len(fit_anchors)
-        extra = f" ({n_excluded} outlier(s) excluded)" if n_excluded else ""
-        if raw_med_res > 30:
-            print(f"  WARNING: Anchors are internally inconsistent "
-                  f"(median error: {raw_med_res:.1f}m) -- reference may have "
-                  f"different distortion than target")
-        if raw_med_res > 120:
-            anchor_fit_unreliable = True
-        print(f"  Initial fit driven by {len(fit_anchors)} anchors "
-              f"(median error: {raw_med_res:.1f}m){extra}")
-        # Cap med_res so thresholds stay meaningful.  When anchors
-        # disagree badly (e.g. cross-era reference with different distortion),
-        # an uncapped med_res makes the anchor-truth filter useless.
-        med_res = min(raw_med_res, 30.0)
+    if anchor_fit_unreliable:
+        anchors = []
 
-        if anchor_fit_unreliable:
-            print("  Anchor fit is too inconsistent for truth-filtering; "
-                  "falling back to auto-match consensus")
-            M_init = None
-            med_res = None
-            raw_med_res = None
-            anchors = []
-    else:
-        # Fallback: include anchors with heavy weighting
-        fit_pool = fit_anchors + auto[:top_n_auto]
-        if len(fit_pool) >= 3:
-            src_pts = np.array([(p[2], p[3]) for p in fit_pool])
-            dst_pts = np.array([(p[0], p[1]) for p in fit_pool])
-            fit_weights = np.array([50.0 if p[5].startswith("anchor:") else 1.0 
-                                   for p in fit_pool])
-            M_init, residuals = fit_affine_from_gcps(src_pts, dst_pts, weights=fit_weights)
-            med_res = float(np.median(residuals))
-            raw_med_res = med_res
-
+    # Filter neural matches by anchor-driven truth
     if M_init is not None and med_res is not None:
-        if len(auto) >= 6:
-            all_src = np.array([(p[2], p[3]) for p in auto])
-            all_dst = np.array([(p[0], p[1]) for p in auto])
-            
-            # Recalculate residuals against the anchor-driven M_init
-            pred_all = cv2.transform(all_src.astype(np.float32).reshape(-1,1,2), M_init).reshape(-1,2)
-            all_residuals = np.sqrt(np.sum((pred_all - all_dst)**2, axis=1))
-            
-            # LoFTR matches must be within a reasonable distance of the anchor-driven truth.
-            # 100m is a generous threshold for 1970s imagery.
-            global_threshold = max(5.0 * float(med_res), 100.0) 
-            
-            auto_filtered = []
-            auto_rejected = []
-            n_rejected_by_anchor = 0
-            for p, r in zip(auto, all_residuals):
-                if r < global_threshold:
-                    auto_filtered.append(p)
-                else:
-                    n_rejected_by_anchor += 1
-                    auto_rejected.append(p)
+        auto, rejected_auto = _filter_by_anchor_truth(auto, anchors, M_init, med_res)
 
-            if n_rejected_by_anchor > 0:
-                print(f"  Anchor-truth filter: rejected {n_rejected_by_anchor} LoFTR matches "
-                      f"not matching anchor geometry (> {global_threshold:.0f}m error)")
-
-            # Local consistency rescue: recover rejected matches that agree
-            # with surviving neighbours.  This rescues good matches in areas
-            # where the anchor-only affine extrapolates poorly.
-            if auto_rejected and auto_filtered:
-                rescued = local_consistency_filter(
-                    auto_rejected, anchors + auto_filtered,
-                    threshold_m=50.0, k_neighbors=5, search_radius=5000.0)
-                if rescued:
-                    print(f"  Local consistency rescue: recovered {len(rescued)} "
-                          f"of {len(auto_rejected)} rejected matches")
-                    auto_filtered.extend(rescued)
-
-            auto = auto_filtered
-            rejected_auto = auto_rejected
-
-    # Validate anchors (against their own fit or the joint fit)
+    # Validate anchors against the fit
     if M_init is not None and med_res is not None and anchors:
-        a, bv, tx = M_init[0]
-        c, d, ty = M_init[1]
-        # Since M_init is now anchor-driven, we can be much tighter.
-        anchor_threshold = max(4.0 * float(med_res), 100.0) 
-        valid_anchors = []
-        rejected_anchors = []
-        for anc in anchors:
-            ogx, ogy = anc[2], anc[3]
-            rgx, rgy = anc[0], anc[1]
-            pred_x = a * ogx + bv * ogy + tx
-            pred_y = c * ogx + d * ogy + ty
-            dx = rgx - pred_x
-            dy = rgy - pred_y
-            res = np.sqrt(dx ** 2 + dy ** 2)
-            aname = anc[5].replace("anchor:", "")
-            if res <= anchor_threshold:
-                valid_anchors.append(anc)
-            else:
-                rejected_anchors.append((anc, res))
-                print(f"    Rejected anchor {aname} (res={res:.0f}m [dx={dx:.1f}, dy={dy:.1f}] > {anchor_threshold:.0f}m)")
-
-
-
-        # Force-include anchors for spatial diversity, but only when the
-        # anchor set is internally consistent.  When anchors disagree badly
-        # (raw_med_res > 30m, e.g. cross-era reference), force-including
-        # rejected anchors would reintroduce the distortion we just filtered.
-        n_rejected = len(rejected_anchors)
-        raw_med_res_val = raw_med_res if raw_med_res is not None else 1e9
-        if n_rejected >= 2 and raw_med_res_val <= 30:
-            rejected_anchors.sort(key=lambda x: x[1])
-            o_left, o_bottom, o_right, o_top = overlap
-            gc = 7 if target_count > 25 else 5
-            gr = 7 if target_count > 25 else 5
-            cw = (o_right - o_left) / gc
-            ch = (o_top - o_bottom) / gr
-            occupied = set()
-            for va in valid_anchors:
-                col = min(gc - 1, max(0, int((va[0] - o_left) / cw)))
-                row = min(gr - 1, max(0, int((va[1] - o_bottom) / ch)))
-                occupied.add((row, col))
-            forced = 0
-            max_force = min(3, n_rejected)
-            for anc, res in rejected_anchors:
-                col = min(gc - 1, max(0, int((anc[0] - o_left) / cw)))
-                row = min(gr - 1, max(0, int((anc[1] - o_bottom) / ch)))
-                if (row, col) not in occupied:
-                    valid_anchors.append(anc)
-                    occupied.add((row, col))
-                    aname = anc[5].replace("anchor:", "")
-                    print(f"    Force-included anchor {aname} (residual={res:.0f}m, spatial diversity)")
-                    forced += 1
-                    if forced >= max_force:
-                        break
-            if forced > 0:
-                print(f"    Neural model appears spatially biased "
-                      f"({n_rejected}/{len(anchors)} anchors rejected), "
-                      f"force-included {forced} for coverage")
-
-        if len(valid_anchors) < len(anchors):
-            print(f"    Kept {len(valid_anchors)}/{len(anchors)} anchors")
-        anchors = valid_anchors
+        anchors = _validate_anchors(
+            anchors, M_init, med_res, raw_med_res, overlap, target_count)
 
     # Spatial diversity selection
     if len(auto) <= remaining_target:
@@ -957,11 +972,11 @@ def detect_and_correct_reference_offset(original_pairs, filtered_pairs, M_geo,
     """Detect and correct systematic reference image offset using anchor ground truth.
 
     When a reference image has a systematic geographic offset from ground truth,
-    LoFTR matches are self-consistent but shifted.  Anchors (ground truth ref
+    Neural matches are self-consistent but shifted.  Anchors (ground truth ref
     coordinates) get rejected as outliers because they disagree with the
-    LoFTR-dominated affine.  This function detects that pattern and shifts all
-    LoFTR ref positions to align with anchor ground truth, then re-runs outlier
-    removal.
+    match-dominated affine.  This function detects that pattern and shifts all
+    neural match ref positions to align with anchor ground truth, then re-runs
+    outlier removal.
 
     Returns (matched_pairs, M_geo, geo_residuals, was_corrected).
     """
@@ -980,7 +995,7 @@ def detect_and_correct_reference_offset(original_pairs, filtered_pairs, M_geo,
           f"anchors rejected ({removal_fraction:.0%})")
 
     # For each anchor, compute discrepancy between ground truth ref position
-    # and where the LoFTR affine predicts the anchor's offset position maps.
+    # and where the neural-match affine predicts the anchor's offset position maps.
     anchor_positions = []
     shifts = []
     for anchor in original_anchors:

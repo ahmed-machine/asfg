@@ -40,6 +40,17 @@ def to_u8(arr):
     return out
 
 
+def to_u8_percentile(arr, lo_pct=1, hi_pct=99):
+    """Normalize array to uint8 using percentile clipping on valid (>0) pixels."""
+    valid = arr[arr > 0]
+    if len(valid) == 0:
+        return np.zeros_like(arr, dtype=np.uint8)
+    lo, hi = np.percentile(valid, [lo_pct, hi_pct])
+    if hi <= lo:
+        return np.zeros_like(arr, dtype=np.uint8)
+    return np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
+
+
 def clahe_normalize(img, clip_limit=3.0, grid=(8, 8)):
     """Apply CLAHE contrast enhancement to a uint8 image.
 
@@ -121,3 +132,79 @@ def sobel_gradient(img_u8):
     gx = cv2.Sobel(f, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(f, cv2.CV_64F, 0, 1, ksize=3)
     return np.sqrt(gx ** 2 + gy ** 2)
+
+
+# ---------------------------------------------------------------------------
+# Large-image remap with automatic chunking
+# ---------------------------------------------------------------------------
+
+_REMAP_MAX = 30000  # stay under OpenCV's SHRT_MAX (32767) with margin
+
+
+def chunked_remap(src_data: np.ndarray, map_x: np.ndarray,
+                  map_y: np.ndarray) -> np.ndarray:
+    """cv2.remap with automatic column-chunking for images exceeding SHRT_MAX.
+
+    Splits the destination into column chunks and crops the source per-chunk
+    so both src and dst stay under the 32767 pixel limit in each dimension.
+    Falls back to scipy.ndimage.map_coordinates when even the cropped source
+    exceeds the limit.
+
+    Parameters
+    ----------
+    src_data : 2-D float32 array (single band)
+    map_x, map_y : 2-D float32 remap coordinate arrays (destination size)
+
+    Returns
+    -------
+    2-D float32 result array of shape (map_x.shape)
+    """
+    src_h, src_w = src_data.shape
+    dst_h, dst_w = map_x.shape
+
+    if (src_h <= _REMAP_MAX and src_w <= _REMAP_MAX
+            and dst_h <= _REMAP_MAX and dst_w <= _REMAP_MAX):
+        return cv2.remap(src_data, map_x, map_y,
+                         interpolation=cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    result = np.zeros((dst_h, dst_w), dtype=np.float32)
+    n_col_chunks = (dst_w + _REMAP_MAX - 1) // _REMAP_MAX
+
+    for ci in range(n_col_chunks):
+        c0 = ci * _REMAP_MAX
+        c1 = min(c0 + _REMAP_MAX, dst_w)
+        chunk_mx = map_x[:, c0:c1]
+        chunk_my = map_y[:, c0:c1]
+
+        valid = (chunk_mx >= 0) & (chunk_my >= 0)
+        if not np.any(valid):
+            continue
+
+        sx_min = max(0, int(np.floor(chunk_mx[valid].min())) - 2)
+        sx_max = min(src_w, int(np.ceil(chunk_mx[valid].max())) + 3)
+        sy_min = max(0, int(np.floor(chunk_my[valid].min())) - 2)
+        sy_max = min(src_h, int(np.ceil(chunk_my[valid].max())) + 3)
+
+        if sx_max <= sx_min or sy_max <= sy_min:
+            continue
+
+        src_crop = src_data[sy_min:sy_max, sx_min:sx_max]
+        adj_mx = chunk_mx - sx_min
+        adj_my = chunk_my - sy_min
+        crop_h, crop_w = src_crop.shape
+
+        if crop_h <= _REMAP_MAX and crop_w <= _REMAP_MAX:
+            result[:, c0:c1] = cv2.remap(
+                src_crop, adj_mx, adj_my,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        else:
+            from scipy.ndimage import map_coordinates
+            coords = np.array([adj_my.astype(np.float64),
+                               adj_mx.astype(np.float64)])
+            result[:, c0:c1] = map_coordinates(
+                src_crop, coords, order=1, mode='constant',
+                cval=0.0, prefilter=False).astype(np.float32)
+
+    return result
