@@ -62,14 +62,6 @@ class ReferenceOffsetCorrection:
     was_corrected: bool
 
 
-# ---------------------------------------------------------------------------
-# Legacy type aliases
-# ---------------------------------------------------------------------------
-
-LegacyMatch = tuple[float, float, float, float, float, str]
-LegacyGCP = tuple[float, float, float, float]
-
-
 @dataclass(slots=True)
 class MatchPair:
     """Typed representation of a matched correspondence."""
@@ -80,24 +72,29 @@ class MatchPair:
     off_y: float
     confidence: float
     name: str
+    precision: float = 1.0
     source: str = ""
-    semantic_class: str = "unknown"
     hypothesis_id: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_anchor(self) -> bool:
         return self.name.startswith("anchor:")
 
-    def to_legacy(self) -> LegacyMatch:
-        return (
-            float(self.ref_x),
-            float(self.ref_y),
-            float(self.off_x),
-            float(self.off_y),
-            float(self.confidence),
-            str(self.name),
+    def with_confidence(self, confidence: float) -> "MatchPair":
+        """Return a copy with updated confidence."""
+        return MatchPair(
+            ref_x=self.ref_x, ref_y=self.ref_y,
+            off_x=self.off_x, off_y=self.off_y,
+            confidence=confidence, name=self.name,
+            precision=self.precision, source=self.source,
+            hypothesis_id=self.hypothesis_id,
         )
+
+    def ref_coords(self) -> tuple[float, float]:
+        return (self.ref_x, self.ref_y)
+
+    def off_coords(self) -> tuple[float, float]:
+        return (self.off_x, self.off_y)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -106,6 +103,7 @@ class MatchPair:
     def from_legacy(cls, pair: Sequence[Any]) -> "MatchPair":
         if len(pair) < 6:
             raise ValueError(f"Expected 6 values for legacy match pair, got {len(pair)}")
+        prec = float(pair[6]) if len(pair) > 6 else 1.0
         return cls(
             ref_x=float(pair[0]),
             ref_y=float(pair[1]),
@@ -113,12 +111,25 @@ class MatchPair:
             off_y=float(pair[3]),
             confidence=float(pair[4]),
             name=str(pair[5]),
+            precision=prec,
         )
+
+    # Backward-compatible indexing (remove once migration complete)
+    _FIELDS = ('ref_x', 'ref_y', 'off_x', 'off_y', 'confidence', 'name', 'precision')
+
+    def __getitem__(self, idx):
+        return getattr(self, self._FIELDS[idx])
+
+    def __len__(self):
+        return 7
+
+    def __iter__(self):
+        return (getattr(self, f) for f in self._FIELDS)
 
 
 @dataclass(slots=True)
 class GCP:
-    """Typed representation of a correction GCP."""
+    """Ground control point: pixel (col, row) → geographic (gx, gy)."""
 
     col: float
     row: float
@@ -127,9 +138,6 @@ class GCP:
     synthetic: bool = False
     source: str = "match"
     name: str = ""
-
-    def to_legacy(self) -> LegacyGCP:
-        return (float(self.col), float(self.row), float(self.gx), float(self.gy))
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -148,6 +156,18 @@ class GCP:
             source=source,
             name=name,
         )
+
+    # Backward-compatible indexing (remove once migration complete)
+    _FIELDS = ('col', 'row', 'gx', 'gy')
+
+    def __getitem__(self, idx):
+        return getattr(self, self._FIELDS[idx])
+
+    def __len__(self):
+        return 4
+
+    def __iter__(self):
+        return (getattr(self, f) for f in self._FIELDS)
 
 
 @dataclass(slots=True)
@@ -275,17 +295,3 @@ def ensure_gcp(value: GCP | Sequence[Any], *, synthetic: bool = False,
 
 def match_pairs_from_legacy(values: Iterable[MatchPair | Sequence[Any]]) -> list[MatchPair]:
     return [ensure_match_pair(v) for v in values]
-
-
-def match_pairs_to_legacy(values: Iterable[MatchPair | Sequence[Any]]) -> list[LegacyMatch]:
-    return [ensure_match_pair(v).to_legacy() for v in values]
-
-
-def gcps_from_legacy(values: Iterable[GCP | Sequence[Any]], *, synthetic: bool = False,
-                     source: str = "match") -> list[GCP]:
-    return [ensure_gcp(v, synthetic=synthetic, source=source) for v in values]
-
-
-def gcps_to_legacy(values: Iterable[GCP | Sequence[Any]], *, synthetic: bool = False,
-                   source: str = "match") -> list[LegacyGCP]:
-    return [ensure_gcp(v, synthetic=synthetic, source=source).to_legacy() for v in values]

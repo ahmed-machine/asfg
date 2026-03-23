@@ -5,7 +5,8 @@ sub-pixel phase refinement, geo conversion) lives in :func:`locate_anchors`.
 """
 
 import json
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
@@ -17,10 +18,10 @@ from rasterio.warp import transform as transform_coords
 
 import torch
 
-from .constants import ANCHOR_INLIER_THRESHOLD, RANSAC_REPROJ_THRESHOLD
-from .geo import get_torch_device
-from .image import to_u8, make_land_mask
-from .scale import fit_affine_from_gcps
+from . import constants as _C
+from .geo import get_torch_device, fit_affine_from_gcps
+from .image import clahe_normalize, to_u8, make_land_mask
+from .types import MatchPair
 
 
 # ---------------------------------------------------------------------------
@@ -187,19 +188,25 @@ def _filter_anchor_displacement_outliers(results, min_keep=4):
     """Remove gross anchor displacement outliers with robust statistics.
 
     Operates on final anchor matches to avoid poisoning downstream affine fits.
+    High-quality anchors (NCC >= 0.7) get a wider MAD multiplier (5.0x) to
+    tolerate real camera distortion at the edges.
     """
     if len(results) < 6:
         return results
 
-    de = np.array([r[2] - r[0] for r in results], dtype=np.float64)
-    dn = np.array([r[3] - r[1] for r in results], dtype=np.float64)
+    de = np.array([r.off_x - r.ref_x for r in results], dtype=np.float64)
+    dn = np.array([r.off_y - r.ref_y for r in results], dtype=np.float64)
     med_de = float(np.median(de))
     med_dn = float(np.median(dn))
     dist = np.sqrt((de - med_de) ** 2 + (dn - med_dn) ** 2)
     mad = float(np.median(np.abs(dist - np.median(dist))) * 1.4826)
-    threshold = max(180.0, 3.5 * mad)
 
-    keep_mask = dist <= threshold
+    # Per-anchor threshold: quality >= 0.7 gets 5.0x MAD, quality <= 0.4 gets 3.5x
+    qualities = np.array([r.confidence for r in results], dtype=np.float64)
+    mad_mult = np.clip(3.5 + (qualities - 0.4) / 0.3 * 1.5, 3.5, 5.0)
+    thresholds = np.maximum(180.0, mad_mult * mad)
+
+    keep_mask = dist <= thresholds
     if int(np.sum(keep_mask)) < min_keep:
         return results
 
@@ -207,10 +214,17 @@ def _filter_anchor_displacement_outliers(results, min_keep=4):
     if n_rejected <= 0:
         return results
 
-    rejected_names = [results[i][5].replace("anchor:", "")
+    base_thresh = max(180.0, 3.5 * mad)
+    rejected_names = [results[i].name.replace("anchor:", "")
                       for i in range(len(results)) if not keep_mask[i]]
+    kept_by_quality = [results[i].name.replace("anchor:", "")
+                       for i in range(len(results))
+                       if dist[i] > base_thresh and keep_mask[i]]
     print(f"    Anchor QA: rejected {n_rejected} displacement outlier(s) "
-          f"(threshold={threshold:.0f}m): {', '.join(rejected_names)}")
+          f"(base_threshold={base_thresh:.0f}m): {', '.join(rejected_names)}")
+    if kept_by_quality:
+        print(f"    Anchor QA: kept {len(kept_by_quality)} high-quality outlier(s) "
+              f"via confidence boost: {', '.join(kept_by_quality)}")
     return [r for r, keep in zip(results, keep_mask) if keep]
 
 
@@ -227,7 +241,7 @@ def match_anchor_roma(ref_patch, off_patch, patch_half, name,
     device = get_torch_device()
 
     def _to_roma_tensor(patch):
-        p_rgb = cv2.cvtColor(to_u8(patch), cv2.COLOR_GRAY2RGB)
+        p_rgb = cv2.cvtColor(clahe_normalize(patch), cv2.COLOR_GRAY2RGB)
         cur_h, cur_w = patch.shape[:2]
         min_dim = 448
         if cur_h < min_dim or cur_w < min_dim:
@@ -313,7 +327,7 @@ def match_anchor_roma(ref_patch, off_patch, patch_half, name,
     src_pts = mkpts0.astype(np.float32).reshape(-1, 1, 2)
     dst_pts = mkpts1.astype(np.float32).reshape(-1, 1, 2)
     M, inliers = cv2.estimateAffinePartial2D(
-        src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=RANSAC_REPROJ_THRESHOLD)
+        src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=_C.RANSAC_REPROJ_THRESHOLD)
 
     if M is None or inliers is None:
         return None
@@ -325,7 +339,7 @@ def match_anchor_roma(ref_patch, off_patch, patch_half, name,
         return None
 
     n_inliers = int(inliers.sum())
-    if n_inliers < ANCHOR_INLIER_THRESHOLD:
+    if n_inliers < _C.ANCHOR_INLIER_THRESHOLD:
         return None
 
     center_pt = np.array([[[float(patch_half), float(patch_half)]]], dtype=np.float32)
@@ -385,6 +399,160 @@ def _write_anchor_diagnostics(name, ref_p, off_p, mask_mode, diag_dir, fine_res)
         print(f"      diag: {path} (ref_land={ref_land_frac:.1%}, off_land={off_land_frac:.1%})")
 
 
+def _prepare_single_anchor(anchor, arr_ref, arr_off_shifted, h_img, w_img,
+                           patch_half, fine_res, overlap, work_crs,
+                           ref_transform, has_roma, diagnostics_dir):
+    """CPU-heavy prep for one anchor: coords, coverage, land masks, presearch NCC.
+
+    Returns a dict describing the preparation result:
+      status="skip"  — anchor filtered out (with optional fail_info, log_lines)
+      status="ready" — patches extracted, ready for GPU inference
+    """
+    name = anchor["name"]
+    lon, lat = anchor["lon"], anchor["lat"]
+    confidence = anchor.get("confidence", "medium")
+    log_lines = []
+
+    if confidence == "low":
+        return {"status": "skip", "name": name}
+
+    anchor_mm = _anchor_mask_mode(anchor)
+
+    custom_patch = anchor.get("patch_size_m", None)
+    if custom_patch:
+        anchor_patch_half = int(custom_patch / 2 / fine_res)
+        log_lines.append(f"    Using custom patch size: {custom_patch}m for {name}")
+    else:
+        anchor_patch_half = patch_half
+
+    work_xy = transform_coords(CRS.from_epsg(4326), work_crs, [lon], [lat])
+    anchor_x, anchor_y = work_xy[0][0], work_xy[1][0]
+
+    if not (overlap[0] <= anchor_x <= overlap[2] and
+            overlap[1] <= anchor_y <= overlap[3]):
+        log_lines.append(f"    Skipped: {name} (outside overlap)")
+        return {"status": "skip", "name": name, "log_lines": log_lines}
+
+    ref_row, ref_col = rasterio.transform.rowcol(ref_transform, anchor_x, anchor_y)
+    ref_row, ref_col = int(ref_row), int(ref_col)
+
+    # Verify the offset image actually has data at this location.
+    _check_r = max(0, min(ref_row, h_img - 1))
+    _check_c = max(0, min(ref_col, w_img - 1))
+    _check_half = min(32, anchor_patch_half)
+    _cr0 = max(0, _check_r - _check_half)
+    _cr1 = min(h_img, _check_r + _check_half)
+    _cc0 = max(0, _check_c - _check_half)
+    _cc1 = min(w_img, _check_c + _check_half)
+    _off_coverage = float(np.mean(arr_off_shifted[_cr0:_cr1, _cc0:_cc1] > 0))
+    if _off_coverage < 0.05:
+        log_lines.append(f"    Skipped: {name} (offset image has no data at anchor location, "
+                         f"coverage={_off_coverage:.0%})")
+        fail_info = {
+            "name": name, "ref_row": ref_row, "ref_col": ref_col,
+            "ref_gx": anchor_x, "ref_gy": anchor_y,
+            "eff_patch_half": anchor_patch_half,
+            "off_row_adj": 0, "off_col_adj": 0,
+            "no_offset_coverage": True,
+            "mask_mode": anchor_mm,
+        }
+        if diagnostics_dir:
+            diag_ph = anchor_patch_half
+            dr0 = max(0, ref_row - diag_ph)
+            dr1 = min(h_img, ref_row + diag_ph)
+            dc0 = max(0, ref_col - diag_ph)
+            dc1 = min(w_img, ref_col + diag_ph)
+            _write_anchor_diagnostics(
+                name, arr_ref[dr0:dr1, dc0:dc1],
+                arr_off_shifted[dr0:dr1, dc0:dc1],
+                anchor_mm, diagnostics_dir, fine_res)
+        return {"status": "skip", "name": name, "fail_info": fail_info, "log_lines": log_lines}
+
+    # Auto-shrink patches when land content is low
+    eff_patch_half = anchor_patch_half
+    shrink_sizes = [anchor_patch_half, anchor_patch_half // 2, anchor_patch_half // 4]
+
+    feature_type = anchor.get("feature_type", "")
+    if feature_type in ("island_center", "reef_feature"):
+        min_land = 0.005
+    else:
+        min_land = 0.05 if has_roma else 0.15
+
+    land_ok = False
+    for try_ph in shrink_sizes:
+        if try_ph < 16:
+            continue
+        pr0 = max(0, ref_row - try_ph)
+        pr1 = min(h_img, ref_row + try_ph)
+        pc0 = max(0, ref_col - try_ph)
+        pc1 = min(w_img, ref_col + try_ph)
+        ref_p = arr_ref[pr0:pr1, pc0:pc1]
+        off_p = arr_off_shifted[pr0:pr1, pc0:pc1]
+        if (ref_p.size > 0 and off_p.size > 0 and
+                np.mean(ref_p > 0) >= 0.05 and np.mean(off_p > 0) >= 0.05):
+            ref_land_frac = np.mean(make_land_mask(ref_p, mode=anchor_mm) > 0)
+            off_land_frac = np.mean(make_land_mask(off_p, mode=anchor_mm) > 0)
+            if ref_land_frac >= min_land and off_land_frac >= min_land:
+                eff_patch_half = try_ph
+                land_ok = True
+                break
+
+    if not land_ok:
+        log_lines.append(f"    Skipped: {name} (insufficient land content even at smallest patch)")
+        fail_info = {
+            "name": name, "ref_row": ref_row, "ref_col": ref_col,
+            "ref_gx": anchor_x, "ref_gy": anchor_y,
+            "eff_patch_half": anchor_patch_half,
+            "off_row_adj": 0, "off_col_adj": 0,
+            "land_check_failed": True,
+            "mask_mode": anchor_mm,
+        }
+        if diagnostics_dir:
+            diag_ph = anchor_patch_half
+            dr0 = max(0, ref_row - diag_ph)
+            dr1 = min(h_img, ref_row + diag_ph)
+            dc0 = max(0, ref_col - diag_ph)
+            dc1 = min(w_img, ref_col + diag_ph)
+            _write_anchor_diagnostics(
+                name, arr_ref[dr0:dr1, dc0:dc1],
+                arr_off_shifted[dr0:dr1, dc0:dc1],
+                anchor_mm, diagnostics_dir, fine_res)
+        return {"status": "skip", "name": name, "fail_info": fail_info, "log_lines": log_lines}
+
+    if eff_patch_half != anchor_patch_half:
+        eff_size_m = eff_patch_half * 2 * fine_res
+        log_lines.append(f"    Auto-shrunk patch for {name}: "
+                         f"{anchor_patch_half * 2 * fine_res:.0f}m -> {eff_size_m:.0f}m")
+
+    # Pre-search: coarse NCC to correct residual offset before neural matching.
+    off_row_adj, off_col_adj, presearch_ncc = _island_presearch(
+        name, ref_row, ref_col, arr_ref, arr_off_shifted,
+        h_img, w_img, eff_patch_half, fine_res,
+        search_expansion=3.0,
+        mask_mode=anchor_mm)
+    if presearch_ncc > 0.3:
+        log_lines.append(f"    Pre-search: {name} offset by {off_row_adj*fine_res:.0f}m N, "
+                         f"{off_col_adj*fine_res:.0f}m E (NCC={presearch_ncc:.2f})")
+
+    return {
+        "status": "ready",
+        "name": name,
+        "anchor": anchor,
+        "anchor_mm": anchor_mm,
+        "anchor_x": anchor_x,
+        "anchor_y": anchor_y,
+        "ref_row": ref_row,
+        "ref_col": ref_col,
+        "eff_patch_half": eff_patch_half,
+        "anchor_patch_half": anchor_patch_half,
+        "off_row_adj": off_row_adj,
+        "off_col_adj": off_col_adj,
+        "presearch_ncc": presearch_ncc,
+        "feature_type": feature_type,
+        "log_lines": log_lines,
+    }
+
+
 def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                    ref_transform, offset_transform, arr_ref, arr_off_shifted,
                    shift_px_x, shift_py_y, fine_res, model_cache=None,
@@ -439,170 +607,65 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
 
     has_roma = roma_model is not None
 
-    for anchor in gcps_list:
-        name = anchor["name"]
-        lon = anchor["lon"]
-        lat = anchor["lat"]
-        confidence = anchor.get("confidence", "medium")
+    # Phase 1: Parallel CPU prep (coords, coverage, land masks, presearch NCC)
+    prep_results = [None] * len(gcps_list)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {}
+        for idx, anchor in enumerate(gcps_list):
+            fut = executor.submit(
+                _prepare_single_anchor, anchor, arr_ref, arr_off_shifted,
+                h_img, w_img, patch_half, fine_res, overlap, work_crs,
+                ref_transform, has_roma, diagnostics_dir)
+            futures[fut] = idx
+        for fut in as_completed(futures):
+            prep_results[futures[fut]] = fut.result()
 
-        if confidence == "low":
+    # Phase 2: Sequential GPU inference (RoMa) on prepared anchors
+    for prep in prep_results:
+        if prep is None:
+            continue
+        # Print accumulated log lines from prep phase
+        for line in prep.get("log_lines", []):
+            print(line, flush=True)
+
+        if prep["status"] == "skip":
+            if "fail_info" in prep:
+                failed_anchors.append(prep["fail_info"])
             continue
 
-        # Per-anchor mask policy: roads use heuristic to avoid
-        # aggressive coastal demotion near causeways/shorelines;
-        # islands use coastal_obia which better separates shoals.
-        anchor_mm = _anchor_mask_mode(anchor)
-
-        custom_patch = anchor.get("patch_size_m", None)
-        if custom_patch:
-            anchor_patch_half = int(custom_patch / 2 / fine_res)
-            print(f"    Using custom patch size: {custom_patch}m for {name}")
-        else:
-            anchor_patch_half = patch_half
-
-        work_xy = transform_coords(CRS.from_epsg(4326), work_crs, [lon], [lat])
-        anchor_x, anchor_y = work_xy[0][0], work_xy[1][0]
-
-        if not (overlap[0] <= anchor_x <= overlap[2] and
-                overlap[1] <= anchor_y <= overlap[3]):
-            print(f"    Skipped: {name} (outside overlap)")
-            continue
-
-        ref_row, ref_col = rasterio.transform.rowcol(ref_transform, anchor_x, anchor_y)
-        ref_row, ref_col = int(ref_row), int(ref_col)
-
-        # Verify the offset image actually has data at this location.
-        # After shifting, the anchor may fall in a zero-filled region
-        # (outside actual image coverage).
-        _check_r = max(0, min(ref_row, h_img - 1))
-        _check_c = max(0, min(ref_col, w_img - 1))
-        _check_half = min(32, anchor_patch_half)
-        _cr0 = max(0, _check_r - _check_half)
-        _cr1 = min(h_img, _check_r + _check_half)
-        _cc0 = max(0, _check_c - _check_half)
-        _cc1 = min(w_img, _check_c + _check_half)
-        _off_coverage = float(np.mean(arr_off_shifted[_cr0:_cr1, _cc0:_cc1] > 0))
-        if _off_coverage < 0.05:
-            print(f"    Skipped: {name} (offset image has no data at anchor location, "
-                  f"coverage={_off_coverage:.0%})")
-            failed_anchors.append({
-                "name": name, "ref_row": ref_row, "ref_col": ref_col,
-                "ref_gx": anchor_x, "ref_gy": anchor_y,
-                "eff_patch_half": anchor_patch_half,
-                "off_row_adj": 0, "off_col_adj": 0,
-                "no_offset_coverage": True,
-                "mask_mode": anchor_mm,
-            })
-            if diagnostics_dir:
-                diag_ph = anchor_patch_half
-                dr0 = max(0, ref_row - diag_ph)
-                dr1 = min(h_img, ref_row + diag_ph)
-                dc0 = max(0, ref_col - diag_ph)
-                dc1 = min(w_img, ref_col + diag_ph)
-                _write_anchor_diagnostics(
-                    name, arr_ref[dr0:dr1, dc0:dc1],
-                    arr_off_shifted[dr0:dr1, dc0:dc1],
-                    anchor_mm, diagnostics_dir, fine_res)
-            continue
-
-        # Auto-shrink patches when land content is low
-        eff_patch_half = anchor_patch_half
-        shrink_sizes = [anchor_patch_half, anchor_patch_half // 2, anchor_patch_half // 4]
-        
-        # Neural matchers (RoMa/LoFTR) are more robust to low land content
-        # than NCC, so we are more lenient.
-        # For islands, we are extremely lenient because they are small features in big sea.
-        feature_type = anchor.get("feature_type", "")
-        if feature_type in ("island_center", "reef_feature"):
-            min_land = 0.005
-        else:
-            min_land = 0.05 if roma_model else 0.15
-        
-        for try_ph in shrink_sizes:
-            if try_ph < 16:
-                continue
-            pr0 = max(0, ref_row - try_ph)
-            pr1 = min(h_img, ref_row + try_ph)
-            pc0 = max(0, ref_col - try_ph)
-            pc1 = min(w_img, ref_col + try_ph)
-            ref_p = arr_ref[pr0:pr1, pc0:pc1]
-            off_p = arr_off_shifted[pr0:pr1, pc0:pc1]
-            if (ref_p.size > 0 and off_p.size > 0 and
-                    np.mean(ref_p > 0) >= 0.05 and np.mean(off_p > 0) >= 0.05):
-                ref_land_frac = np.mean(make_land_mask(ref_p, mode=anchor_mm) > 0)
-                off_land_frac = np.mean(make_land_mask(off_p, mode=anchor_mm) > 0)
-                if ref_land_frac >= min_land and off_land_frac >= min_land:
-                    eff_patch_half = try_ph
-                    break
-        else:
-            print(f"    Skipped: {name} (insufficient land content even at smallest patch)")
-            failed_anchors.append({
-                "name": name, "ref_row": ref_row, "ref_col": ref_col,
-                "ref_gx": anchor_x, "ref_gy": anchor_y,
-                "eff_patch_half": anchor_patch_half,
-                "off_row_adj": 0, "off_col_adj": 0,
-                "land_check_failed": True,
-                "mask_mode": anchor_mm,
-            })
-            if diagnostics_dir:
-                # Write diagnostic for land-content failure
-                diag_ph = anchor_patch_half
-                dr0 = max(0, ref_row - diag_ph)
-                dr1 = min(h_img, ref_row + diag_ph)
-                dc0 = max(0, ref_col - diag_ph)
-                dc1 = min(w_img, ref_col + diag_ph)
-                _write_anchor_diagnostics(
-                    name, arr_ref[dr0:dr1, dc0:dc1],
-                    arr_off_shifted[dr0:dr1, dc0:dc1],
-                    anchor_mm, diagnostics_dir, fine_res)
-            continue
-
-        if eff_patch_half != anchor_patch_half:
-            eff_size_m = eff_patch_half * 2 * fine_res
-            print(f"    Auto-shrunk patch for {name}: "
-                  f"{anchor_patch_half * 2 * fine_res:.0f}m -> {eff_size_m:.0f}m")
-
-        # Pre-search: coarse NCC to correct residual offset before neural matching.
-        # Applied to ALL anchor types (not just islands) with wider search.
-        feature_type = anchor.get("feature_type", "")
-        off_row_adj, off_col_adj = 0, 0
-        presearch_ncc = 0.0
-        off_row_adj, off_col_adj, presearch_ncc = _island_presearch(
-            name, ref_row, ref_col, arr_ref, arr_off_shifted,
-            h_img, w_img, eff_patch_half, fine_res,
-            search_expansion=3.0,
-            mask_mode=anchor_mm)
-        if presearch_ncc > 0.3:
-            print(f"    Pre-search: {name} offset by {off_row_adj*fine_res:.0f}m N, "
-                  f"{off_col_adj*fine_res:.0f}m E (NCC={presearch_ncc:.2f})")
-
-        # Multi-scale patch cascade
-        patch_sizes = [eff_patch_half]
-        if eff_patch_half > 64:
-            patch_sizes.append(eff_patch_half // 2)
-        if eff_patch_half > 128:
-            patch_sizes.append(eff_patch_half // 4)
+        name = prep["name"]
+        anchor = prep["anchor"]
+        ref_row, ref_col = prep["ref_row"], prep["ref_col"]
+        eff_patch_half = prep["eff_patch_half"]
+        anchor_patch_half = prep["anchor_patch_half"]
+        off_row_adj = prep["off_row_adj"]
+        off_col_adj = prep["off_col_adj"]
+        presearch_ncc = prep["presearch_ncc"]
+        feature_type = prep["feature_type"]
+        anchor_mm = prep["anchor_mm"]
+        anchor_x, anchor_y = prep["anchor_x"], prep["anchor_y"]
 
         best_match = None
-        for try_ph in patch_sizes:
-            eff_th = min(template_half, try_ph // 2)
-            eff_sm = min(search_margin, try_ph)
-
-            ref_patch, off_patch = _extract_patches(
-                ref_row, ref_col, try_ph, arr_ref, arr_off_shifted,
-                h_img, w_img, off_row_adj, off_col_adj)
-
-            if ref_patch is not None and has_roma:
+        if has_roma:
+            patch_sizes = [eff_patch_half]
+            if eff_patch_half > 64:
+                patch_sizes.append(eff_patch_half // 2)
+            if eff_patch_half > 4:
+                patch_sizes.append(eff_patch_half // 4)
+            for try_ph in patch_sizes:
+                rp, op = _extract_patches(
+                    ref_row, ref_col, try_ph, arr_ref, arr_off_shifted,
+                    h_img, w_img, off_row_adj, off_col_adj)
+                if rp is None:
+                    continue
                 result = match_anchor_roma(
-                    ref_patch, off_patch, try_ph, name,
+                    rp, op, try_ph, name,
                     off_row_adj, off_col_adj, roma_model)
                 if result is not None:
                     best_match = result
                     break
 
-        # Presearch fallback: for island/reef types the land mask shape IS the
-        # feature.  For corners (e.g. fort), the mask NCC is less precise but
-        # still useful when the offset is modest (< 300m) and NCC is strong.
+        # Presearch fallback
         presearch_offset_m = np.sqrt(off_row_adj**2 + off_col_adj**2) * fine_res
         if best_match is None and presearch_ncc >= 0.44 and feature_type in ("island_center", "reef_feature"):
             print(f"    Located: {name} (presearch mask fallback: NCC={presearch_ncc:.2f})")
@@ -617,8 +680,12 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
             ref_gx, ref_gy, off_gx, off_gy = _anchor_to_geo(
                 ref_row, ref_col, best_match.dx_px, best_match.dy_px,
                 ref_transform, offset_transform, shift_px_x, shift_py_y)
-            results.append((ref_gx, ref_gy, off_gx, off_gy,
-                           best_match.quality, f"anchor:{name}"))
+            results.append(MatchPair(
+                ref_x=ref_gx, ref_y=ref_gy,
+                off_x=off_gx, off_y=off_gy,
+                confidence=best_match.quality,
+                name=f"anchor:{name}",
+            ))
             disp_e = off_gx - ref_gx
             disp_n = off_gy - ref_gy
             disp_tot = np.sqrt(disp_e ** 2 + disp_n ** 2)
@@ -659,8 +726,8 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
         from .geo import read_overlap_region
 
         # Fit forward affine: offset_pos -> ref_pos
-        succ_off = np.array([(r[2], r[3]) for r in results])
-        succ_ref = np.array([(r[0], r[1]) for r in results])
+        succ_off = np.array([r.off_coords() for r in results])
+        succ_ref = np.array([r.ref_coords() for r in results])
         M_fwd, fit_residuals = fit_affine_from_gcps(succ_off, succ_ref)
         fit_med_res = float(np.median(fit_residuals)) if len(fit_residuals) else np.inf
 
@@ -668,9 +735,13 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
         # coherent affine. With too few anchors or a noisy fit, the predicted
         # offset patch can land on unrelated terrain and RoMa will happily
         # "recover" a bogus landmark.
-        if fit_med_res > 120.0:
+        n_fit = len(results)
+        pass15_threshold = 120.0 + max(0, 15 - n_fit) * (60.0 / 9.0)
+        pass15_threshold = min(pass15_threshold, 180.0)
+        if fit_med_res > pass15_threshold:
             print(f"\n    Pass 1.5 skipped: anchor affine too inconsistent "
-                  f"(median residual {fit_med_res:.1f}m)", flush=True)
+                  f"(median residual {fit_med_res:.1f}m > threshold {pass15_threshold:.0f}m "
+                  f"for {n_fit} anchors)", flush=True)
             results = _filter_anchor_displacement_outliers(results)
             return results
 
@@ -785,8 +856,12 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                 # Offset position = predicted centre + matcher sub-pixel
                 off_gx = pred_off_gx + best_match.dx_px * fine_res
                 off_gy = pred_off_gy - best_match.dy_px * fine_res
-                results.append((ref_gx, ref_gy, off_gx, off_gy,
-                               best_match.quality, f"anchor:{fname}"))
+                results.append(MatchPair(
+                    ref_x=ref_gx, ref_y=ref_gy,
+                    off_x=off_gx, off_y=off_gy,
+                    confidence=best_match.quality,
+                    name=f"anchor:{fname}",
+                ))
                 disp_e = off_gx - ref_gx
                 disp_n = off_gy - ref_gy
                 disp_tot = np.sqrt(disp_e ** 2 + disp_n ** 2)
@@ -838,8 +913,12 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                             frow, fcol, result.dx_px, result.dy_px,
                             ref_transform, offset_transform,
                             shift_px_x, shift_py_y)
-                        results.append((ref_gx, ref_gy, off_gx, off_gy,
-                                       result.quality, f"anchor:{fname}"))
+                        results.append(MatchPair(
+                            ref_x=ref_gx, ref_y=ref_gy,
+                            off_x=off_gx, off_y=off_gy,
+                            confidence=result.quality,
+                            name=f"anchor:{fname}",
+                        ))
                         break
 
     results = _filter_anchor_displacement_outliers(results)

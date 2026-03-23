@@ -1,0 +1,66 @@
+meta:
+  name: base
+  description: Default — tuned on KH-9 Bahrain
+
+coarse:
+  template_radius_m: 6000
+  search_margin_m: 300
+  coarse_res: 15.0
+  refine_res: 5.0
+
+scale_rotation:
+  grid_cols: 3
+  grid_rows: 3
+  detection_res: 5.0
+  min_valid_frac: 0.30
+
+matching:
+  roma_tile_size: 1024
+  roma_tile_overlap: 256
+  roma_size: 640
+  roma_num_corresp: 600
+  land_mask_frac_min: 0.30
+  tile_joint_land_min: 0.08
+  match_quota_grid_m: 2000
+  match_quota_per_cell: 30
+  ransac_reproj_threshold: 5.0
+
+validation:
+  anchor_inlier_threshold: 6
+  cv_refit_threshold_m: 40.0
+
+grid_optim:
+  pyramid_levels: [[8, 300], [24, 300], [64, 500]]
+  early_stop_threshold: 0.0003
+  early_stop_window: 20
+  lr: 0.002
+  w_data: 1.0
+  w_chamfer: 0.30
+  w_feat: 0.0
+  w_arap: 0.5
+  w_laplacian: 0.2
+  w_disp: 0.05
+  max_residual_norm: 0.03
+  # DINOv3 feature loss tuning
+  feat_coverage_gate: true
+  feat_cadence: 10
+  feat_scale_factor: 1.0
+  feat_mid_ratio: 0.3
+  # Per-level multiplicative scales (indexed by level_idx)
+  level_w_data_scale: [1.0, 1.5, 2.0]
+  level_w_disp_scale: [1.0, 0.667, 0.5]
+  level_reg_scale: [1.0, 1.15, 1.30]
+  level_chamfer_scale: [1.0, 0.667, 0.5]
+  level_w_feat_scale: [0.0, 1.0, 1.0]
+
+flow:
+  max_flow_bias_m: 15.0
+  fb_consistency_px: 3.0
+  coast_max_dim: 4096
+
+normalization:
+  clahe_clip_limit: 3.0
+  wallis_matching: true
+  flow_joint_percentile: true
+  flow_percentile_lo: 1
+  flow_percentile_hi: 99

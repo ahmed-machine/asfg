@@ -9,8 +9,9 @@ import rasterio
 import rasterio.transform
 from scipy.spatial import cKDTree  # type: ignore
 
-from .affine import fit_affine_from_gcps
+from .geo import fit_affine_from_gcps
 from .image import make_land_mask
+from .types import GCP, MatchPair
 
 
 def _fit_initial_affine(anchors, auto, correction_outliers=None, top_n_auto=None):
@@ -21,7 +22,7 @@ def _fit_initial_affine(anchors, auto, correction_outliers=None, top_n_auto=None
     """
     outlier_set = set(correction_outliers) if correction_outliers else set()
     fit_anchors = ([a for a in anchors
-                    if a[5].replace("anchor:", "") not in outlier_set]
+                    if a.name.replace("anchor:", "") not in outlier_set]
                    if outlier_set else anchors)
 
     if top_n_auto is None:
@@ -33,8 +34,8 @@ def _fit_initial_affine(anchors, auto, correction_outliers=None, top_n_auto=None
     raw_med_res = None
 
     if len(fit_anchors) >= 4:
-        src_pts = np.array([(p[2], p[3]) for p in fit_anchors])
-        dst_pts = np.array([(p[0], p[1]) for p in fit_anchors])
+        src_pts = np.array([p.off_coords() for p in fit_anchors])
+        dst_pts = np.array([p.ref_coords() for p in fit_anchors])
         M_init, residuals = fit_affine_from_gcps(src_pts, dst_pts)
         raw_med_res = float(np.median(residuals))
         n_excluded = len(anchors) - len(fit_anchors)
@@ -58,9 +59,9 @@ def _fit_initial_affine(anchors, auto, correction_outliers=None, top_n_auto=None
     else:
         fit_pool = fit_anchors + auto[:top_n_auto]
         if len(fit_pool) >= 3:
-            src_pts = np.array([(p[2], p[3]) for p in fit_pool])
-            dst_pts = np.array([(p[0], p[1]) for p in fit_pool])
-            fit_weights = np.array([50.0 if p[5].startswith("anchor:") else 1.0
+            src_pts = np.array([p.off_coords() for p in fit_pool])
+            dst_pts = np.array([p.ref_coords() for p in fit_pool])
+            fit_weights = np.array([50.0 if p.is_anchor else 1.0
                                     for p in fit_pool])
             M_init, residuals = fit_affine_from_gcps(src_pts, dst_pts, weights=fit_weights)
             med_res = float(np.median(residuals))
@@ -77,8 +78,8 @@ def _filter_by_anchor_truth(auto, anchors, M_init, med_res):
     if len(auto) < 6:
         return auto, []
 
-    all_src = np.array([(p[2], p[3]) for p in auto])
-    all_dst = np.array([(p[0], p[1]) for p in auto])
+    all_src = np.array([p.off_coords() for p in auto])
+    all_dst = np.array([p.ref_coords() for p in auto])
     pred_all = cv2.transform(
         all_src.astype(np.float32).reshape(-1, 1, 2), M_init).reshape(-1, 2)
     all_residuals = np.sqrt(np.sum((pred_all - all_dst)**2, axis=1))
@@ -123,14 +124,14 @@ def _validate_anchors(anchors, M_init, med_res, raw_med_res, overlap, target_cou
     valid_anchors = []
     rejected_anchors = []
     for anc in anchors:
-        ogx, ogy = anc[2], anc[3]
-        rgx, rgy = anc[0], anc[1]
+        ogx, ogy = anc.off_x, anc.off_y
+        rgx, rgy = anc.ref_x, anc.ref_y
         pred_x = a * ogx + bv * ogy + tx
         pred_y = c * ogx + d * ogy + ty
         dx = rgx - pred_x
         dy = rgy - pred_y
         res = np.sqrt(dx ** 2 + dy ** 2)
-        aname = anc[5].replace("anchor:", "")
+        aname = anc.name.replace("anchor:", "")
         if res <= anchor_threshold:
             valid_anchors.append(anc)
         else:
@@ -150,18 +151,18 @@ def _validate_anchors(anchors, M_init, med_res, raw_med_res, overlap, target_cou
         ch = (o_top - o_bottom) / gr
         occupied = set()
         for va in valid_anchors:
-            col = min(gc - 1, max(0, int((va[0] - o_left) / cw)))
-            row = min(gr - 1, max(0, int((va[1] - o_bottom) / ch)))
+            col = min(gc - 1, max(0, int((va.ref_x - o_left) / cw)))
+            row = min(gr - 1, max(0, int((va.ref_y - o_bottom) / ch)))
             occupied.add((row, col))
         forced = 0
         max_force = min(3, n_rejected)
         for anc, res in rejected_anchors:
-            col = min(gc - 1, max(0, int((anc[0] - o_left) / cw)))
-            row = min(gr - 1, max(0, int((anc[1] - o_bottom) / ch)))
+            col = min(gc - 1, max(0, int((anc.ref_x - o_left) / cw)))
+            row = min(gr - 1, max(0, int((anc.ref_y - o_bottom) / ch)))
             if (row, col) not in occupied:
                 valid_anchors.append(anc)
                 occupied.add((row, col))
-                aname = anc[5].replace("anchor:", "")
+                aname = anc.name.replace("anchor:", "")
                 print(f"    Force-included anchor {aname} (residual={res:.0f}m, spatial diversity)")
                 forced += 1
                 if forced >= max_force:
@@ -177,7 +178,7 @@ def _validate_anchors(anchors, M_init, med_res, raw_med_res, overlap, target_cou
     return valid_anchors
 
 
-def local_consistency_filter(candidates, reference_pairs, threshold_m=50.0,
+def local_consistency_filter(candidates: list[MatchPair], reference_pairs: list[MatchPair], threshold_m=50.0,
                              k_neighbors=5, search_radius=5000.0,
                              min_confidence=0.65):
     """Keep *candidates* that are locally consistent with *reference_pairs*.
@@ -188,32 +189,32 @@ def local_consistency_filter(candidates, reference_pairs, threshold_m=50.0,
     Candidates with no nearby neighbours are kept if their confidence is at
     least ``min_confidence``.
 
-    Both *candidates* and *reference_pairs* are lists of 6-tuples
-    ``(ref_gx, ref_gy, off_gx, off_gy, quality, name)``.
+    Both *candidates* and *reference_pairs* are lists of ``MatchPair``
+    objects with attributes ``ref_x, ref_y, off_x, off_y, confidence, name``.
 
     Returns the filtered list of candidates.
     """
     if not reference_pairs or not candidates:
         return candidates
 
-    fp_ref = np.array([(m[0], m[1]) for m in reference_pairs])
-    fp_off = np.array([(m[2], m[3]) for m in reference_pairs])
+    fp_ref = np.array([m.ref_coords() for m in reference_pairs])
+    fp_off = np.array([m.off_coords() for m in reference_pairs])
     fp_dx = fp_off[:, 0] - fp_ref[:, 0]
     fp_dy = fp_off[:, 1] - fp_ref[:, 1]
     tree = cKDTree(fp_ref)
 
     kept = []
     for cp in candidates:
-        r_xy = np.array([cp[0], cp[1]])
+        r_xy = np.array([cp.ref_x, cp.ref_y])
         dists, idxs = tree.query(r_xy, k=min(k_neighbors, len(fp_ref)),
                                  distance_upper_bound=search_radius)
         valid = [i for d, i in zip(dists, idxs) if d < search_radius]
         if not valid:
-            if cp[4] >= min_confidence:
+            if cp.confidence >= min_confidence:
                 kept.append(cp)
         else:
-            cp_dx = cp[2] - cp[0]
-            cp_dy = cp[3] - cp[1]
+            cp_dx = cp.off_x - cp.ref_x
+            cp_dy = cp.off_y - cp.ref_y
             neighbor_dx = np.mean(fp_dx[valid])
             neighbor_dy = np.mean(fp_dy[valid])
             offset_diff = np.sqrt(
@@ -223,15 +224,15 @@ def local_consistency_filter(candidates, reference_pairs, threshold_m=50.0,
     return kept
 
 
-def matched_pairs_sufficient(matched_pairs, target=25):
+def matched_pairs_sufficient(matched_pairs: list[MatchPair], target=25):
     """Check if matched pairs have sufficient count AND spatial distribution."""
     if len(matched_pairs) < target:
         return False
     if len(matched_pairs) < 4:
         return False
 
-    xs = [p[0] for p in matched_pairs]
-    ys = [p[1] for p in matched_pairs]
+    xs = [p.ref_x for p in matched_pairs]
+    ys = [p.ref_y for p in matched_pairs]
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
 
@@ -242,8 +243,8 @@ def matched_pairs_sufficient(matched_pairs, target=25):
 
     grid = set()
     for p in matched_pairs:
-        gc = min(2, int((p[0] - x_min) / x_range * 3))
-        gr = min(2, int((p[1] - y_min) / y_range * 3))
+        gc = min(2, int((p.ref_x - x_min) / x_range * 3))
+        gr = min(2, int((p.ref_y - y_min) / y_range * 3))
         grid.add((gr, gc))
 
     return len(grid) >= 4
@@ -308,7 +309,9 @@ def _refine_one_match(pair, arr_ref, arr_off_shifted, ref_transform,
 
     Returns (refined_pair, was_refined).
     """
-    ref_gx, ref_gy, off_gx, off_gy, quality, name = pair
+    ref_gx, ref_gy = pair.ref_x, pair.ref_y
+    off_gx, off_gy = pair.off_x, pair.off_y
+    quality, name = pair.confidence, pair.name
 
     ref_row, ref_col = rasterio.transform.rowcol(ref_transform, ref_gx, ref_gy)
     ref_row, ref_col = int(ref_row), int(ref_col)
@@ -343,12 +346,18 @@ def _refine_one_match(pair, arr_ref, arr_off_shifted, ref_transform,
     if response > 0.03:
         new_off_gx = off_gx + sub_dx_m
         new_off_gy = off_gy + sub_dy_m
-        return (ref_gx, ref_gy, new_off_gx, new_off_gy, quality, name), True
+        return MatchPair(ref_x=ref_gx, ref_y=ref_gy, off_x=new_off_gx,
+                         off_y=new_off_gy, confidence=quality, name=name,
+                         precision=pair.precision, source=pair.source,
+                         hypothesis_id=pair.hypothesis_id), True
     else:
-        return (ref_gx, ref_gy, off_gx, off_gy, quality * 0.7, name), False
+        return MatchPair(ref_x=ref_gx, ref_y=ref_gy, off_x=off_gx,
+                         off_y=off_gy, confidence=quality * 0.7, name=name,
+                         precision=pair.precision, source=pair.source,
+                         hypothesis_id=pair.hypothesis_id), False
 
 
-def refine_matches_phase_correlation(matched_pairs, arr_ref, arr_off_shifted,
+def refine_matches_phase_correlation(matched_pairs: list[MatchPair], arr_ref, arr_off_shifted,
                                      ref_transform, off_transform,
                                      shift_px_x, shift_py_y, fine_res):
     """Refine neural matches using multi-scale phase correlation.
@@ -383,7 +392,7 @@ def refine_matches_phase_correlation(matched_pairs, arr_ref, arr_off_shifted,
     return refined
 
 
-def correct_reference_offset(matched_pairs):
+def correct_reference_offset(matched_pairs: list[MatchPair]) -> tuple[list[MatchPair], bool, list[str]]:
     """Correct systematic reference image offset using anchor ground truth.
 
     Fits a spatially varying (affine) correction from anchor displacements,
@@ -397,15 +406,15 @@ def correct_reference_offset(matched_pairs):
     ``outlier_names`` is a list of anchor name strings excluded from the
     correction fit (useful for downstream filtering).
     """
-    anchors = [p for p in matched_pairs if p[5].startswith("anchor:")]
-    auto = [p for p in matched_pairs if not p[5].startswith("anchor:")]
+    anchors = [p for p in matched_pairs if p.is_anchor]
+    auto = [p for p in matched_pairs if not p.is_anchor]
 
     if len(anchors) < 1 or len(auto) < 6:
         return matched_pairs, False, []
 
     # Fit affine from auto matches only
-    auto_src = np.array([(p[2], p[3]) for p in auto])
-    auto_dst = np.array([(p[0], p[1]) for p in auto])
+    auto_src = np.array([p.off_coords() for p in auto])
+    auto_dst = np.array([p.ref_coords() for p in auto])
     M_auto, _ = fit_affine_from_gcps(auto_src, auto_dst)
 
     # For each anchor, compute displacement between ground truth ref
@@ -413,8 +422,8 @@ def correct_reference_offset(matched_pairs):
     anchor_positions = []
     shifts = []
     for anchor in anchors:
-        anchor_ref_gx, anchor_ref_gy = anchor[0], anchor[1]
-        anchor_off_gx, anchor_off_gy = anchor[2], anchor[3]
+        anchor_ref_gx, anchor_ref_gy = anchor.ref_x, anchor.ref_y
+        anchor_off_gx, anchor_off_gy = anchor.off_x, anchor.off_y
 
         pred_ref_gx = (M_auto[0, 0] * anchor_off_gx
                        + M_auto[0, 1] * anchor_off_gy + M_auto[0, 2])
@@ -446,13 +455,16 @@ def correct_reference_offset(matched_pairs):
                   f"(total: {total:.1f}m), std: E={std_e:.1f}m, N={std_n:.1f}m")
             corrected = []
             for p in matched_pairs:
-                if p[5].startswith("anchor:"):
+                if p.is_anchor:
                     corrected.append(p)
                 else:
-                    corrected.append((
-                        p[0] + median_e,
-                        p[1] + median_n,
-                        p[2], p[3], p[4], p[5],
+                    corrected.append(MatchPair(
+                        ref_x=p.ref_x + median_e,
+                        ref_y=p.ref_y + median_n,
+                        off_x=p.off_x, off_y=p.off_y,
+                        confidence=p.confidence, name=p.name,
+                        precision=p.precision, source=p.source,
+                        hypothesis_id=p.hypothesis_id,
                     ))
             return corrected, True, []
         print(f"  Reference offset check: only {len(anchors)} anchor(s) with "
@@ -473,7 +485,7 @@ def correct_reference_offset(matched_pairs):
     residual_threshold = max(3.0 * med_test_res, 50.0)
     inlier_mask = np.array(test_residuals) < residual_threshold
     n_rejected_anchors = int(np.sum(~inlier_mask))
-    outlier_names = [anchors[i][5].replace("anchor:", "")
+    outlier_names = [anchors[i].name.replace("anchor:", "")
                      for i in range(len(anchors)) if not inlier_mask[i]]
     if n_rejected_anchors > 0:
         print(f"  Reference offset: rejected {n_rejected_anchors} anchor outlier(s) "
@@ -522,27 +534,30 @@ def correct_reference_offset(matched_pairs):
     # Apply spatially varying correction to each auto match
     corrected = []
     for p in matched_pairs:
-        if p[5].startswith("anchor:"):
+        if p.is_anchor:
             corrected.append(p)
         else:
-            off_gx, off_gy = p[2], p[3]
+            off_gx, off_gy = p.off_x, p.off_y
             local_shift_e = (M_corr[0, 0] * off_gx + M_corr[0, 1] * off_gy
                              + M_corr[0, 2])
             local_shift_n = (M_corr[1, 0] * off_gx + M_corr[1, 1] * off_gy
                              + M_corr[1, 2])
-            corrected.append((
-                p[0] + local_shift_e,
-                p[1] + local_shift_n,
-                p[2], p[3], p[4], p[5],
+            corrected.append(MatchPair(
+                ref_x=p.ref_x + local_shift_e,
+                ref_y=p.ref_y + local_shift_n,
+                off_x=p.off_x, off_y=p.off_y,
+                confidence=p.confidence, name=p.name,
+                precision=p.precision, source=p.source,
+                hypothesis_id=p.hypothesis_id,
             ))
 
     return corrected, True, outlier_names
 
 
-def select_best_gcps(matched_pairs, overlap, target_count=25,
+def select_best_gcps(matched_pairs: list[MatchPair], overlap, target_count=25,
                      correction_outliers=None,
                      arr_ref=None, ref_transform=None,
-                     shoreline_quota=0.40):
+                     shoreline_quota=0.40) -> tuple[list[MatchPair], float]:
     """Select the best GCPs with good spatial distribution.
 
     *correction_outliers* is an optional list of anchor name strings
@@ -561,8 +576,8 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
         ch = (o_top - o_bottom) / gr
         occupied = set()
         for p in points:
-            col = min(gc - 1, max(0, int((p[0] - o_left) / cw)))
-            row = min(gr - 1, max(0, int((p[1] - o_bottom) / ch)))
+            col = min(gc - 1, max(0, int((p.ref_x - o_left) / cw)))
+            row = min(gr - 1, max(0, int((p.ref_y - o_bottom) / ch)))
             occupied.add((row, col))
         coverage = len(occupied) / (gc * gr)
 
@@ -610,7 +625,7 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
         labels = []
         for p in points:
             try:
-                rr, cc = rasterio.transform.rowcol(ref_transform, p[0], p[1])
+                rr, cc = rasterio.transform.rowcol(ref_transform, p.ref_x, p.ref_y)
                 rr = int(rr)
                 cc = int(cc)
             except Exception:
@@ -627,8 +642,8 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
         return labels
 
     def _grid_key(p, o_left, o_bottom, cell_w, cell_h, grid_cols, grid_rows):
-        gc = min(grid_cols - 1, max(0, int((p[0] - o_left) / cell_w)))
-        gr = min(grid_rows - 1, max(0, int((p[1] - o_bottom) / cell_h)))
+        gc = min(grid_cols - 1, max(0, int((p.ref_x - o_left) / cell_w)))
+        gr = min(grid_rows - 1, max(0, int((p.ref_y - o_bottom) / cell_h)))
         return gr, gc
 
     def _spatial_pick(pool, target, min_conf, occupied_keys):
@@ -636,7 +651,7 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
             return []
         by_cell = {}
         for p in pool:
-            if p[4] < min_conf:
+            if p.confidence < min_conf:
                 continue
             key = _grid_key(p, o_left, o_bottom, cell_w, cell_h, grid_cols, grid_rows)
             by_cell.setdefault(key, []).append(p)
@@ -646,7 +661,7 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
         for key in sorted(by_cell.keys()):
             if key in occupied_keys:
                 continue
-            cand = max(by_cell[key], key=lambda x: x[4])
+            cand = max(by_cell[key], key=lambda x: x.confidence)
             selected_local.append(cand)
             occupied_keys.add(key)
             if len(selected_local) >= target:
@@ -657,7 +672,7 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
         used = set(id(p) for p in selected_local)
         for v in by_cell.values():
             rem.extend(v)
-        rem.sort(key=lambda x: -x[4])
+        rem.sort(key=lambda x: -x.confidence)
         for p in rem:
             if id(p) in used:
                 continue
@@ -671,9 +686,9 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
         coverage = _compute_coverage(matched_pairs, overlap)
         return matched_pairs, coverage
 
-    anchors = [p for p in matched_pairs if p[5].startswith("anchor:")]
-    auto = [p for p in matched_pairs if not p[5].startswith("anchor:")]
-    auto.sort(key=lambda x: -x[4])
+    anchors = [p for p in matched_pairs if p.is_anchor]
+    auto = [p for p in matched_pairs if not p.is_anchor]
+    auto.sort(key=lambda x: -x.confidence)
 
     remaining_target = target_count - len(anchors)
     rejected_auto = []
@@ -732,10 +747,10 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
     if len(selected) < remaining_target:
         selected_set = set(id(p) for p in selected)
         backfill_pool = shoreline_auto + inland_auto + other_auto
-        backfill_pool.sort(key=lambda x: -x[4])
+        backfill_pool.sort(key=lambda x: -x.confidence)
         for p in backfill_pool:
             min_conf = 0.58 if p in shoreline_auto else 0.67 if p in inland_auto else 0.82
-            if p[4] < min_conf:
+            if p.confidence < min_conf:
                 continue
             if id(p) in selected_set:
                 continue
@@ -770,9 +785,9 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
     all_cells = {(r, c) for r in range(grid_rows) for c in range(grid_cols)}
     empty_cells = sorted(all_cells - occ)
     if empty_cells:
-        candidates_relaxed = [p for p in auto if id(p) not in selected_set and p[4] >= 0.50]
+        candidates_relaxed = [p for p in auto if id(p) not in selected_set and p.confidence >= 0.50]
         if rejected_auto:
-            candidates_relaxed.extend([p for p in rejected_auto if p[4] >= 0.55])
+            candidates_relaxed.extend([p for p in rejected_auto if p.confidence >= 0.55])
 
         rescue_added = 0
         for key in empty_cells:
@@ -780,7 +795,7 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
                          if _grid_key(p, o_left, o_bottom, cell_w, cell_h, grid_cols, grid_rows) == key]
             if not cell_pool:
                 continue
-            cell_pool.sort(key=lambda x: -x[4])
+            cell_pool.sort(key=lambda x: -x.confidence)
             # Try strongest first; require local-consistency agreement with
             # already trusted points.
             for cand in cell_pool[:5]:
@@ -811,16 +826,16 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
                     edge_keys.add((r, c))
         occupied_edge = set()
         for p in anchors + selected:
-            gc = min(grid_cols - 1, max(0, int((p[0] - o_left) / cell_w)))
-            gr = min(grid_rows - 1, max(0, int((p[1] - o_bottom) / cell_h)))
+            gc = min(grid_cols - 1, max(0, int((p.ref_x - o_left) / cell_w)))
+            gr = min(grid_rows - 1, max(0, int((p.ref_y - o_bottom) / cell_h)))
             if (gr, gc) in edge_keys:
                 occupied_edge.add((gr, gc))
         empty_edge = edge_keys - occupied_edge
         if empty_edge:
             edge_candidates = {}
             for p in rejected_auto:
-                gc = min(grid_cols - 1, max(0, int((p[0] - o_left) / cell_w)))
-                gr = min(grid_rows - 1, max(0, int((p[1] - o_bottom) / cell_h)))
+                gc = min(grid_cols - 1, max(0, int((p.ref_x - o_left) / cell_w)))
+                gr = min(grid_rows - 1, max(0, int((p.ref_y - o_bottom) / cell_h)))
                 key = (gr, gc)
                 if key in empty_edge:
                     if key not in edge_candidates:
@@ -828,7 +843,7 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
                     edge_candidates[key].append(p)
             backfilled = 0
             for key in sorted(edge_candidates.keys()):
-                best = max(edge_candidates[key], key=lambda x: x[4])
+                best = max(edge_candidates[key], key=lambda x: x.confidence)
                 if id(best) not in selected_set:
                     selected.append(best)
                     selected_set.add(id(best))
@@ -853,8 +868,8 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
     # Ensure we still hit target count if smoothness pruning was aggressive.
     if len(selected) < remaining_target:
         selected_set = set(id(p) for p in selected)
-        refill = [p for p in (shoreline_auto + inland_auto) if id(p) not in selected_set and p[4] >= 0.70]
-        refill.sort(key=lambda x: -x[4])
+        refill = [p for p in (shoreline_auto + inland_auto) if id(p) not in selected_set and p.confidence >= 0.70]
+        refill.sort(key=lambda x: -x.confidence)
         for p in refill:
             selected.append(p)
             selected_set.add(id(p))
@@ -866,20 +881,20 @@ def select_best_gcps(matched_pairs, overlap, target_count=25,
     return result, coverage
 
 
-def iterative_outlier_removal(matched_pairs, neural_res, use_sift_refinement,
-                              used_neural):
+def iterative_outlier_removal(matched_pairs: list[MatchPair], neural_res, use_sift_refinement,
+                              used_neural) -> tuple[list[MatchPair], np.ndarray, list[float]]:
     """Iteratively remove GCP outliers using spatial-aware thresholds.
 
     Returns (cleaned_matched_pairs, M_geo, geo_residuals).
     """
-    offset_geo_pts = np.array([(p[2], p[3]) for p in matched_pairs])
-    ref_geo_pts = np.array([(p[0], p[1]) for p in matched_pairs])
+    offset_geo_pts = np.array([p.off_coords() for p in matched_pairs])
+    ref_geo_pts = np.array([p.ref_coords() for p in matched_pairs])
     corr_weights = np.array([
-        p[4] * (5.0 if p[5].startswith("anchor:") else 1.0)
+        p.confidence * (5.0 if p.is_anchor else 1.0)
         for p in matched_pairs
     ])
 
-    n_anchors_in_fit = sum(1 for p in matched_pairs if p[5].startswith("anchor:"))
+    n_anchors_in_fit = sum(1 for p in matched_pairs if p.is_anchor)
     if n_anchors_in_fit > 0:
         print(f"  Anchor weight boost: {n_anchors_in_fit} anchors at 5x weight")
 
@@ -890,7 +905,7 @@ def iterative_outlier_removal(matched_pairs, neural_res, use_sift_refinement,
     max_iter = min(20, len(matched_pairs) // 3)
     residual_floor = (max(5.0 * neural_res, 10.0)
                       if (use_sift_refinement or used_neural) else 500.0)
-    all_eastings = np.array([matched_pairs[i][2] for i in range(len(matched_pairs))])
+    all_eastings = np.array([matched_pairs[i].off_x for i in range(len(matched_pairs))])
 
     for iteration in range(max_iter):
         active_idx = np.where(active_mask)[0]
@@ -925,26 +940,26 @@ def iterative_outlier_removal(matched_pairs, neural_res, use_sift_refinement,
         # inadequacy (e.g., non-linear distortion to islands) rather than
         # a wrong match.  The TPS can handle them.
         worst_pair = matched_pairs[worst_idx]
-        is_anchor = worst_pair[5].startswith("anchor:")
+        is_anchor = worst_pair.is_anchor
         anchor_floor = max(5.0 * residual_floor, 75.0) if is_anchor else 0
         point_threshold = max(3.0 * regional_medians[worst_idx],
                               residual_floor, anchor_floor)
         if worst_res > point_threshold:
             active_mask[worst_idx] = False
             active_pairs = [matched_pairs[i] for i in np.where(active_mask)[0]]
-            active_offset = np.array([(p[2], p[3]) for p in active_pairs])
-            active_ref = np.array([(p[0], p[1]) for p in active_pairs])
-            active_weights = np.array([p[4] for p in active_pairs])
+            active_offset = np.array([p.off_coords() for p in active_pairs])
+            active_ref = np.array([p.ref_coords() for p in active_pairs])
+            active_weights = np.array([p.confidence for p in active_pairs])
             M_geo, _ = fit_affine_from_gcps(active_offset, active_ref,
                                             weights=active_weights)
             geo_residuals = []
             for i in range(len(matched_pairs)):
-                ogx, ogy = matched_pairs[i][2], matched_pairs[i][3]
-                rgx, rgy = matched_pairs[i][0], matched_pairs[i][1]
+                ogx, ogy = matched_pairs[i].off_x, matched_pairs[i].off_y
+                rgx, rgy = matched_pairs[i].ref_x, matched_pairs[i].ref_y
                 pred_x = M_geo[0, 0] * ogx + M_geo[0, 1] * ogy + M_geo[0, 2]
                 pred_y = M_geo[1, 0] * ogx + M_geo[1, 1] * ogy + M_geo[1, 2]
                 geo_residuals.append(np.sqrt((pred_x - rgx) ** 2 + (pred_y - rgy) ** 2))
-            gcp_label = matched_pairs[worst_idx][5]
+            gcp_label = matched_pairs[worst_idx].name
             print(f"  Removed GCP {gcp_label} with {worst_res:.0f}m residual")
         else:
             break
@@ -954,10 +969,10 @@ def iterative_outlier_removal(matched_pairs, neural_res, use_sift_refinement,
         matched_pairs = [matched_pairs[i] for i in active_idx]
         geo_residuals = [geo_residuals[i] for i in active_idx]
 
-        offset_geo_pts = np.array([(p[2], p[3]) for p in matched_pairs])
-        ref_geo_pts = np.array([(p[0], p[1]) for p in matched_pairs])
+        offset_geo_pts = np.array([p.off_coords() for p in matched_pairs])
+        ref_geo_pts = np.array([p.ref_coords() for p in matched_pairs])
         corr_weights = np.array([
-            p[4] * (5.0 if p[5].startswith("anchor:") else 1.0)
+            p.confidence * (5.0 if p.is_anchor else 1.0)
             for p in matched_pairs
         ])
         M_geo, geo_residuals = fit_affine_from_gcps(
@@ -966,7 +981,8 @@ def iterative_outlier_removal(matched_pairs, neural_res, use_sift_refinement,
     return matched_pairs, M_geo, geo_residuals
 
 
-def detect_and_correct_reference_offset(original_pairs, filtered_pairs, M_geo,
+def detect_and_correct_reference_offset(original_pairs: list[MatchPair],
+                                         filtered_pairs: list[MatchPair], M_geo,
                                          neural_res, use_sift_refinement,
                                          used_neural):
     """Detect and correct systematic reference image offset using anchor ground truth.
@@ -980,12 +996,12 @@ def detect_and_correct_reference_offset(original_pairs, filtered_pairs, M_geo,
 
     Returns (matched_pairs, M_geo, geo_residuals, was_corrected).
     """
-    original_anchors = [p for p in original_pairs if p[5].startswith("anchor:")]
+    original_anchors = [p for p in original_pairs if p.is_anchor]
     if len(original_anchors) < 3:
         return filtered_pairs, M_geo, None, False
 
-    filtered_names = set(p[5] for p in filtered_pairs)
-    removed_anchors = [p for p in original_anchors if p[5] not in filtered_names]
+    filtered_names = set(p.name for p in filtered_pairs)
+    removed_anchors = [p for p in original_anchors if p.name not in filtered_names]
 
     removal_fraction = len(removed_anchors) / len(original_anchors)
     if removal_fraction < 0.6:
@@ -999,8 +1015,8 @@ def detect_and_correct_reference_offset(original_pairs, filtered_pairs, M_geo,
     anchor_positions = []
     shifts = []
     for anchor in original_anchors:
-        anchor_ref_gx, anchor_ref_gy = anchor[0], anchor[1]   # ground truth
-        anchor_off_gx, anchor_off_gy = anchor[2], anchor[3]   # offset position
+        anchor_ref_gx, anchor_ref_gy = anchor.ref_x, anchor.ref_y   # ground truth
+        anchor_off_gx, anchor_off_gy = anchor.off_x, anchor.off_y   # offset position
 
         pred_ref_gx = (M_geo[0, 0] * anchor_off_gx
                        + M_geo[0, 1] * anchor_off_gy + M_geo[0, 2])
@@ -1012,7 +1028,7 @@ def detect_and_correct_reference_offset(original_pairs, filtered_pairs, M_geo,
         anchor_positions.append((anchor_off_gx, anchor_off_gy))
         shifts.append((shift_e, shift_n))
 
-        aname = anchor[5].replace("anchor:", "")
+        aname = anchor.name.replace("anchor:", "")
         print(f"    {aname}: dE={shift_e:+.1f}m, dN={shift_n:+.1f}m")
 
     shifts_e = np.array([s[0] for s in shifts])
@@ -1050,7 +1066,7 @@ def detect_and_correct_reference_offset(original_pairs, filtered_pairs, M_geo,
     inlier_mask = np.array(test_residuals) < residual_threshold
     n_rejected_anchors = int(np.sum(~inlier_mask))
     if n_rejected_anchors > 0:
-        rejected_names = [original_anchors[i][5].replace("anchor:", "")
+        rejected_names = [original_anchors[i].name.replace("anchor:", "")
                           for i in range(len(original_anchors)) if not inlier_mask[i]]
         print(f"    Rejected {n_rejected_anchors} anchor outlier(s) "
               f"({', '.join(rejected_names)}) before fitting correction "
@@ -1084,18 +1100,21 @@ def detect_and_correct_reference_offset(original_pairs, filtered_pairs, M_geo,
     # Start from original_pairs so removed anchors are re-included.
     corrected_pairs = []
     for p in original_pairs:
-        if p[5].startswith("anchor:"):
+        if p.is_anchor:
             corrected_pairs.append(p)
         else:
-            off_gx, off_gy = p[2], p[3]
+            off_gx, off_gy = p.off_x, p.off_y
             local_shift_e = (M_corr[0, 0] * off_gx + M_corr[0, 1] * off_gy
                              + M_corr[0, 2])
             local_shift_n = (M_corr[1, 0] * off_gx + M_corr[1, 1] * off_gy
                              + M_corr[1, 2])
-            corrected_pairs.append((
-                p[0] + local_shift_e,
-                p[1] + local_shift_n,
-                p[2], p[3], p[4], p[5],
+            corrected_pairs.append(MatchPair(
+                ref_x=p.ref_x + local_shift_e,
+                ref_y=p.ref_y + local_shift_n,
+                off_x=p.off_x, off_y=p.off_y,
+                confidence=p.confidence, name=p.name,
+                precision=p.precision, source=p.source,
+                hypothesis_id=p.hypothesis_id,
             ))
 
     print(f"    Applied spatially varying correction to {len(corrected_pairs)} GCPs, "

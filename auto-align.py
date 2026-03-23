@@ -27,10 +27,6 @@ os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import argparse
 
-from align.block_processing import run_block_manifest
-from align.pipeline import run
-from align.strip_processing import run_strip_manifest
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -162,7 +158,27 @@ def main():
         "--tps-fallback", action="store_true", default=False,
         help="Run TPS fallback warp for comparison (default: off)"
     )
+    parser.add_argument(
+        "--profile", type=str, default=None,
+        help="Camera profile name (e.g. kh9, kh4). Auto-detected from filename if omitted."
+    )
     args = parser.parse_args()
+
+    # Activate profile BEFORE importing pipeline modules so that
+    # module-level `from .constants import X` bindings get the right values.
+    from align.params import set_profile
+    if args.profile:
+        set_profile(args.profile)
+    elif args.input:
+        from align.params import detect_camera
+        detected = detect_camera(args.input)
+        if detected:
+            print(f"Auto-detected camera profile: {detected}")
+            set_profile(detected)
+
+    # Lazy imports — must come AFTER set_profile() call above
+    from align.manifest import run_block_manifest, run_strip_manifest
+    from align.pipeline import run
 
     if args.block_manifest:
         run_block_manifest(args.block_manifest, run)

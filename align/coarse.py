@@ -1,5 +1,7 @@
 """Coarse offset detection via semantic-weighted template matching."""
 
+import os
+
 import cv2
 import numpy as np
 
@@ -7,9 +9,75 @@ from .geo import read_overlap_region
 from .image import class_weight_map, make_land_mask, stable_feature_mask, to_u8
 
 
+def _save_coarse_diagnostic(template, search, result_map, max_loc, max_val,
+                            base_r, base_c, tr0, tc0, res, dx_m, dy_m,
+                            diagnostics_dir, label):
+    """Save coarse offset diagnostic: template, search region, correlation heatmap."""
+    # Normalize images to uint8 for display
+    def _to_vis(arr):
+        if arr.max() == 0:
+            return np.zeros_like(arr, dtype=np.uint8)
+        return (arr / max(arr.max(), 1e-6) * 255).clip(0, 255).astype(np.uint8)
+
+    tmpl_vis = _to_vis(template.astype(np.float32))
+    search_vis = _to_vis(search.astype(np.float32))
+
+    # Resize template to match search height for side-by-side
+    th, tw = tmpl_vis.shape
+    sh, sw = search_vis.shape
+    scale = sh / th if th > 0 else 1.0
+    tmpl_resized = cv2.resize(tmpl_vis, (max(1, int(tw * scale)), sh))
+    trw = tmpl_resized.shape[1]
+
+    # Correlation heatmap
+    corr_norm = ((result_map - result_map.min()) /
+                 max(result_map.max() - result_map.min(), 1e-6) * 255).astype(np.uint8)
+    corr_color = cv2.applyColorMap(corr_norm, cv2.COLORMAP_JET)
+    corr_resized = cv2.resize(corr_color, (sw, sh))
+
+    # Canvas: template | search | correlation heatmap
+    canvas_w = trw + sw + sw
+    canvas = np.zeros((sh, canvas_w, 3), dtype=np.uint8)
+    canvas[:, :trw] = cv2.cvtColor(tmpl_resized, cv2.COLOR_GRAY2BGR)
+    canvas[:, trw:trw + sw] = cv2.cvtColor(search_vis, cv2.COLOR_GRAY2BGR)
+    canvas[:, trw + sw:] = corr_resized
+
+    # Draw crosshair at best match on search region
+    match_x = max_loc[0]
+    match_y = max_loc[1]
+    cx = trw + match_x + tw // 2
+    cy = match_y + th // 2
+    cv2.drawMarker(canvas, (cx, cy), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
+
+    # Draw match rectangle on search
+    cv2.rectangle(canvas,
+                  (trw + match_x, match_y),
+                  (trw + match_x + tw, match_y + th),
+                  (0, 255, 0), 1)
+
+    # Labels
+    cv2.putText(canvas, "template", (4, 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "search", (trw + 4, 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "correlation", (trw + sw + 4, 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # Offset text
+    text = f"dx={dx_m:.1f}m dy={dy_m:.1f}m corr={max_val:.3f} res={res:.0f}m"
+    cv2.putText(canvas, text, (4, sh - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
+
+    os.makedirs(diagnostics_dir, exist_ok=True)
+    out_path = os.path.join(diagnostics_dir, f"coarse_{label}.jpg")
+    cv2.imwrite(out_path, canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    print(f"  Saved diagnostic: {os.path.basename(out_path)}")
+
+
 def detect_offset_at_resolution(src_offset, src_ref, overlap, work_crs, res,
                                 template_radius_m=6000, coarse_offset=None,
-                                search_margin_m=None, mask_mode="coastal_obia"):
+                                search_margin_m=None, mask_mode="coastal_obia",
+                                diagnostics_dir=None):
     """Detect the offset between two images at a given resolution using
     template matching on binary land masks.
 
@@ -103,6 +171,7 @@ def detect_offset_at_resolution(src_offset, src_ref, overlap, work_crs, res,
             _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
     if max_val < 0.3:
+        print(f"  [coarse] NCC too low: max_val={max_val:.4f} (threshold=0.3)")
         return None, None, 0
 
     # Sub-pixel refinement via parabolic interpolation
@@ -128,8 +197,11 @@ def detect_offset_at_resolution(src_offset, src_ref, overlap, work_crs, res,
     dx_m = (actual_c - tc0) * res
     dy_m = (actual_r - tr0) * res
 
-    # NMI cross-check disabled: too slow (~300s) and never agrees with NCC
-    # for this cross-temporal satellite imagery case.
+    if diagnostics_dir is not None:
+        label = f"{res:.0f}m" + ("_refined" if coarse_offset else "_coarse")
+        _save_coarse_diagnostic(template, search, result, max_loc, max_val,
+                                base_r, base_c, tr0, tc0, res, dx_m, dy_m,
+                                diagnostics_dir, label)
 
     return dx_m, dy_m, max_val
 

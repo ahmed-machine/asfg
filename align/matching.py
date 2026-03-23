@@ -7,15 +7,25 @@ import rasterio.transform
 
 import torch
 
-from .constants import (LAND_MASK_FRAC_MIN, RANSAC_REPROJ_THRESHOLD,
-                        ROMA_NUM_CORRESP, ROMA_SIZE, ROMA_TILE_OVERLAP, ROMA_TILE_SIZE)
+from . import constants as _C
 from .geo import get_torch_device
-from .image import clahe_normalize, class_weight_map, make_land_mask, stable_feature_mask
+from .image import clahe_normalize, wallis_match, build_semantic_masks
+from .types import MatchPair
+
+
+def _weight_map_from_bundle(bundle):
+    """Compute class weight map from a pre-built MaskBundle (avoids redundant build_semantic_masks call)."""
+    weights = np.zeros_like(bundle.land, dtype=np.float32)
+    weights += 1.25 * bundle.stable
+    weights += 0.75 * bundle.shoreline
+    weights += 0.35 * bundle.dark_farmland
+    weights -= 0.80 * bundle.shallow_water
+    return np.clip(weights, 0.0, 1.5)
 
 
 def match_with_roma(arr_ref, arr_off_shifted, ref_transform, off_transform,
                     shift_px_x, shift_py_y, neural_res=4.0,
-                    min_valid_frac=LAND_MASK_FRAC_MIN, skip_ransac=False, model_cache=None,
+                    min_valid_frac=_C.LAND_MASK_FRAC_MIN, skip_ransac=False, model_cache=None,
                     batch_size=8, max_matches=5000, max_tiles=300,
                     existing_anchors=None,
                     src_offset=None, work_crs=None, mask_mode="coastal_obia"):
@@ -34,7 +44,7 @@ def match_with_roma(arr_ref, arr_off_shifted, ref_transform, off_transform,
 
 def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transform, off_transform,
                         shift_px_x, shift_py_y, neural_res=4.0,
-                        min_valid_frac=LAND_MASK_FRAC_MIN, skip_ransac=False,
+                        min_valid_frac=_C.LAND_MASK_FRAC_MIN, skip_ransac=False,
                         batch_size=8, max_matches=5000, max_tiles=300,
                         existing_anchors=None,
                         src_offset=None, work_crs=None, mask_mode="coastal_obia"):
@@ -42,14 +52,33 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
     device = get_torch_device()
     h, w = arr_ref.shape
 
+    from .params import get_params
+    norm_p = get_params().normalization
+    if norm_p.wallis_matching:
+        arr_off_shifted = wallis_match(arr_off_shifted, arr_ref)
     ref_u8 = clahe_normalize(arr_ref)
     off_u8 = clahe_normalize(arr_off_shifted)
-    land_mask = (make_land_mask(arr_ref, mode=mask_mode) > 0)
-    stable_mask = (stable_feature_mask(arr_ref, mode=mask_mode) > 0)
-    weight_map = class_weight_map(arr_ref, mode=mask_mode)
+    # Heuristic-only land mask for tile filtering + stability reweight:
+    # decoupled from demotion rules D/E which shrink the mask and kill
+    # tile coverage (220 → 45 tiles with coastal_obia).
+    land_mask = (build_semantic_masks(arr_ref, mode="heuristic").land > 0)
+    off_land_mask = (build_semantic_masks(arr_off_shifted, mode="heuristic").land > 0)
+    # Full semantic bundle still used for stable_mask / weight_map (tile scoring).
+    ref_bundle = build_semantic_masks(arr_ref, mode=mask_mode)
+    stable_mask = (ref_bundle.stable > 0)
+    weight_map = _weight_map_from_bundle(ref_bundle)
+    del ref_bundle
     grad_x = cv2.Sobel(ref_u8, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(ref_u8, cv2.CV_32F, 0, 1, ksize=3)
-    grad_mag = np.sqrt(grad_x * grad_x + grad_y * grad_y)
+    np.multiply(grad_x, grad_x, out=grad_x)
+    np.multiply(grad_y, grad_y, out=grad_y)
+    grad_x += grad_y
+    del grad_y
+    np.sqrt(grad_x, out=grad_x)
+    grad_mag = grad_x
+
+    ref_valid = (arr_ref > 0)
+    off_valid = (arr_off_shifted > 0)
 
     scene_valid = arr_ref > 0
     scene_land_frac = float(np.mean((stable_mask | land_mask) & scene_valid)) if np.any(scene_valid) else 0.0
@@ -60,8 +89,8 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
         max_matches = max(max_matches, 8500)
         max_tiles = max(max_tiles, 520)
 
-    tile_size = ROMA_TILE_SIZE
-    overlap_px = ROMA_TILE_OVERLAP
+    tile_size = _C.ROMA_TILE_SIZE
+    overlap_px = _C.ROMA_TILE_OVERLAP
     step = tile_size - overlap_px
 
     all_matches = []
@@ -76,9 +105,14 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
             try:
                 # Build per-element preds dict for v2's sample()
                 preds_i = {k: v[i:i+1] if v is not None else None for k, v in preds.items()}
-                m, c, _, _ = model.sample(preds_i, num_corresp=ROMA_NUM_CORRESP)
+                m, c, prec_fwd, _ = model.sample(preds_i, num_corresp=_C.ROMA_NUM_CORRESP)
                 m = m.cpu().numpy()
                 c = c.cpu().numpy()
+                # Per-match precision: trace of 2x2 precision matrix
+                if prec_fwd is not None:
+                    prec_trace = (prec_fwd[:, 0, 0] + prec_fwd[:, 1, 1]).cpu().numpy()
+                else:
+                    prec_trace = np.ones(len(m), dtype=np.float32)
             except Exception as e:
                 print(f"    RoMa sample error: {e}")
                 continue
@@ -87,6 +121,7 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
             mask = c > 0.55
             m = m[mask]
             c = c[mask]
+            prec_trace = prec_trace[mask]
 
             # RoMa output is normalized [-1, 1]. Project to tile pixel space.
             cur_h, cur_w = it['ref'].shape
@@ -99,14 +134,28 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
                 global_off_col = it['c0'] + kp1[k][0]
                 global_off_row = it['r0'] + kp1[k][1]
 
+                # Fix 1: reject matches where either endpoint is in zero-data
+                ref_r = int(round(global_ref_row))
+                ref_c = int(round(global_ref_col))
+                off_r = int(round(global_off_row))
+                off_c = int(round(global_off_col))
+                if not (0 <= ref_r < h and 0 <= ref_c < w and ref_valid[ref_r, ref_c]):
+                    continue
+                if not (0 <= off_r < h and 0 <= off_c < w and off_valid[off_r, off_c]):
+                    continue
+
                 ref_gx, ref_gy = rasterio.transform.xy(
                     ref_transform, float(global_ref_row), float(global_ref_col))
                 off_gx, off_gy = rasterio.transform.xy(
                     off_transform, float(global_off_row) + shift_py_y,
                     float(global_off_col) + shift_px_x)
 
-                all_matches.append((ref_gx, ref_gy, off_gx, off_gy,
-                                    float(c[k]), f"roma_{it['tile_idx']}_{k}"))
+                all_matches.append(MatchPair(
+                    ref_x=ref_gx, ref_y=ref_gy,
+                    off_x=off_gx, off_y=off_gy,
+                    confidence=float(c[k]),
+                    name=f"roma_{it['tile_idx']}_{k}",
+                    precision=float(prec_trace[k])))
 
     def _run_batch(batch_data):
         """Run model inference on a batch, returning correspondences or None on OOM."""
@@ -115,7 +164,7 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
             ref_crop, off_crop = it['ref'], it['off']
             rc_rgb = cv2.cvtColor(ref_crop, cv2.COLOR_GRAY2RGB)
             oc_rgb = cv2.cvtColor(off_crop, cv2.COLOR_GRAY2RGB)
-            roma_size = ROMA_SIZE
+            roma_size = _C.ROMA_SIZE
             rc_rgb = cv2.resize(rc_rgb, (roma_size, roma_size), interpolation=cv2.INTER_AREA)
             oc_rgb = cv2.resize(oc_rgb, (roma_size, roma_size), interpolation=cv2.INTER_AREA)
             rt = torch.from_numpy(rc_rgb).permute(2, 0, 1).float() / 255.0
@@ -157,7 +206,12 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
     if existing_anchors:
         from rasterio.transform import rowcol
         for anc in existing_anchors:
-            if isinstance(anc, (list, tuple)) and len(anc) >= 6 and str(anc[5]).startswith("anchor:"):
+            if isinstance(anc, MatchPair) and anc.is_anchor:
+                try:
+                    row, col = rowcol(ref_transform, anc.ref_x, anc.ref_y)
+                    anchor_px.append((int(col), int(row)))
+                except Exception: pass
+            elif isinstance(anc, (list, tuple)) and len(anc) >= 6 and str(anc[5]).startswith("anchor:"):
                 try:
                     row, col = rowcol(ref_transform, anc[0], anc[1])
                     anchor_px.append((int(col), int(row)))
@@ -176,13 +230,17 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
                 tile_idx += 1; continue
             is_anc = any(c0 <= ac <= c0 + tile_size and r0 <= ar <= r0 + tile_size for ac, ar in anchor_px)
             land_frac = float(np.mean(land_mask[r0:r1, c0:c1]))
+            off_land_frac_tile = float(np.mean(off_land_mask[r0:r1, c0:c1]))
+            joint_land = min(land_frac, off_land_frac_tile)
+            if joint_land < _C.TILE_JOINT_LAND_MIN:
+                tile_idx += 1; continue
             stable_frac = float(np.mean(stable_mask[r0:r1, c0:c1]))
             weight_frac = float(np.mean(weight_map[r0:r1, c0:c1]))
             tex = float(np.percentile(grad_mag[r0:r1, c0:c1], 75))
             tex_n = float(np.clip(tex / 64.0, 0.0, 1.0))
             anc_bonus = 1.0 if is_anc else 0.0
-            score = (1.6 * weight_frac) + (1.0 * stable_frac) + (0.8 * tex_n) + (0.5 * anc_bonus) + (0.3 * land_frac)
-            tile_candidates.append((-score, float(rng.random()), r0, c0, tile_idx, land_frac))
+            score = (1.6 * weight_frac) + (1.0 * stable_frac) + (0.8 * tex_n) + (0.5 * anc_bonus) + (0.3 * joint_land)
+            tile_candidates.append((-score, float(rng.random()), r0, c0, tile_idx, joint_land))
             tile_idx += 1
 
     tile_candidates.sort(key=lambda x: (x[0], x[1]))
@@ -223,24 +281,78 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
         if len(batch_inputs) >= batch_size:
             _process_batch(batch_inputs)
             batch_inputs = []
-            if hasattr(torch, 'mps') and torch.backends.mps.is_available(): torch.mps.empty_cache()
             if len(all_matches) >= max_matches or i + 1 >= max_tiles: break
     if batch_inputs: _process_batch(batch_inputs)
 
-    # De-duplicate and RANSAC
+    # De-duplicate (spatial hash grid) and RANSAC
     if len(all_matches) > 1:
-        all_matches.sort(key=lambda x: -x[4])
+        all_matches.sort(key=lambda m: -m.confidence)
+        occupied = set()
         kept = []
         for m in all_matches:
-            if not any(np.sqrt((m[0]-k[0])**2 + (m[1]-k[1])**2) < 50 for k in kept):
+            bx, by = int(m.ref_x / 50), int(m.ref_y / 50)
+            if not any((bx + di, by + dj) in occupied for di in (-1, 0, 1) for dj in (-1, 0, 1)):
                 kept.append(m)
+                occupied.add((bx, by))
         all_matches = kept
 
+    # Grid-cell match quotas for spatial diversity
+    if len(all_matches) > 100:
+        cell_buckets = {}
+        for m in all_matches:
+            cx, cy = int(m.ref_x / _C.MATCH_QUOTA_GRID_M), int(m.ref_y / _C.MATCH_QUOTA_GRID_M)
+            cell_buckets.setdefault((cx, cy), []).append(m)
+        quota_kept = []
+        n_capped = 0
+        for cell_matches in cell_buckets.values():
+            cell_matches.sort(key=lambda m: -m.confidence)
+            if len(cell_matches) > _C.MATCH_QUOTA_PER_CELL:
+                n_capped += 1
+            quota_kept.extend(cell_matches[:_C.MATCH_QUOTA_PER_CELL])
+        if n_capped > 0:
+            print(f"    Grid quota: {len(all_matches)} -> {len(quota_kept)} ({n_capped} cells capped)")
+        all_matches = quota_kept
+
     if not skip_ransac and len(all_matches) >= 6:
-        src_pts = np.array([(m[0], m[1]) for m in all_matches], dtype=np.float32).reshape(-1, 1, 2)
-        dst_pts = np.array([(m[2], m[3]) for m in all_matches], dtype=np.float32).reshape(-1, 1, 2)
-        _, inliers = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=max(RANSAC_REPROJ_THRESHOLD * neural_res, 15.0))
+        src_pts = np.array([m.ref_coords() for m in all_matches], dtype=np.float32).reshape(-1, 1, 2)
+        dst_pts = np.array([m.off_coords() for m in all_matches], dtype=np.float32).reshape(-1, 1, 2)
+        _, inliers = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC,
+                                           ransacReprojThreshold=max(_C.RANSAC_REPROJ_THRESHOLD * neural_res, 15.0))
         if inliers is not None:
             all_matches = [m for m, keep in zip(all_matches, inliers.ravel().astype(bool)) if keep]
+
+    # Stability reweighting (post-RANSAC): down-weight survivors where
+    # one or both endpoints fall on water/unstable ground.
+    if len(all_matches) > 0:
+        reweighted = []
+        n_one_land = 0
+        n_neither_land = 0
+        for m in all_matches:
+            ref_row, ref_col = rasterio.transform.rowcol(ref_transform, m.ref_x, m.ref_y)
+            off_row, off_col = rasterio.transform.rowcol(off_transform, m.off_x, m.off_y)
+            off_row_local = int(off_row) - int(shift_py_y)
+            off_col_local = int(off_col) - int(shift_px_x)
+
+            ref_ok = (0 <= int(ref_row) < h and 0 <= int(ref_col) < w
+                      and land_mask[int(ref_row), int(ref_col)])
+            off_ok = (0 <= off_row_local < h and 0 <= off_col_local < w
+                      and off_land_mask[off_row_local, off_col_local])
+
+            if ref_ok and off_ok:
+                q = m.confidence
+            elif ref_ok or off_ok:
+                q = m.confidence * 0.6
+                n_one_land += 1
+            else:
+                q = m.confidence * 0.25
+                n_neither_land += 1
+
+            reweighted.append(m.with_confidence(q))
+
+        if n_one_land > 0 or n_neither_land > 0:
+            n_pen = n_one_land + n_neither_land
+            print(f"    Stability reweight: penalized {n_pen}/{len(all_matches)} "
+                  f"(one-land={n_one_land}, neither-land={n_neither_land})")
+        all_matches = reweighted
 
     return all_matches

@@ -9,5 +9,10 @@ session-*.md
 test_results.py
 test_type.py
 output/
-data/
+data/*
+!data/profiles/
+!data/all/
+!data/available/
+!data/bahrain_anchor_gcps.json
+!data/local_paths.yaml.example
 diagnostics/

@@ -15,7 +15,7 @@ import os
 import sys
 import tempfile
 
-from declass.stitch import stitch_frames
+from preprocess.stitch import stitch_frames
 
 
 def main():

@@ -19,7 +19,7 @@ from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 import torch
 
-from .constants import RANSAC_REPROJ_THRESHOLD
+from . import constants as _C
 from .geo import get_torch_device, read_overlap_region
 from .image import shift_array, make_land_mask, clahe_normalize, sobel_gradient
 
@@ -35,8 +35,57 @@ ScaleResult = namedtuple("ScaleResult", ["scale_x", "scale_y", "rotation", "meth
 # ---------------------------------------------------------------------------
 
 
+def _save_eloftr_diagnostic(ref_u8, off_u8, kpts0, kpts1, inlier_mask,
+                            scale_x, scale_y, rotation_deg, n_inliers,
+                            diagnostics_dir, label="global"):
+    """Save ELoFTR match visualization: side-by-side with inlier/outlier matches."""
+    h, w = ref_u8.shape
+    canvas = np.zeros((h, w * 2, 3), dtype=np.uint8)
+    canvas[:, :w] = cv2.cvtColor(ref_u8, cv2.COLOR_GRAY2BGR)
+    canvas[:, w:] = cv2.cvtColor(off_u8, cv2.COLOR_GRAY2BGR)
+    cv2.line(canvas, (w, 0), (w, h - 1), (80, 80, 80), 1)
+
+    # Draw matches: green=inlier, red=outlier
+    for i in range(len(kpts0)):
+        pt0 = (int(kpts0[i, 0]), int(kpts0[i, 1]))
+        pt1 = (int(kpts1[i, 0]) + w, int(kpts1[i, 1]))
+        if inlier_mask[i]:
+            color = (0, 200, 0)
+        else:
+            color = (0, 0, 180)
+        cv2.line(canvas, pt0, pt1, color, 1, cv2.LINE_AA)
+        cv2.circle(canvas, pt0, 3, color, -1)
+        cv2.circle(canvas, pt1, 3, color, -1)
+
+    # Legend and stats
+    texts = [
+        f"inliers: {n_inliers}/{len(kpts0)}",
+        f"sx={scale_x:.4f} sy={scale_y:.4f}",
+        f"rot={rotation_deg:.3f} deg",
+    ]
+    y0 = 16
+    for t in texts:
+        cv2.putText(canvas, t, (4, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
+        y0 += 16
+
+    # Labels
+    cv2.putText(canvas, "reference", (4, h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "offset (shifted)", (w + 4, h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+
+    os.makedirs(diagnostics_dir, exist_ok=True)
+    out_path = os.path.join(diagnostics_dir, f"eloftr_scale_{label}.jpg")
+    cv2.imwrite(out_path, canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    print(f"      Saved diagnostic: {os.path.basename(out_path)}")
+
+
 def _solve_scale_affine(kpts0, kpts1):
-    """Estimate affine transform from keypoints and extract scale/rotation."""
+    """Estimate affine transform from keypoints and extract scale/rotation.
+
+    Returns (scale_x, scale_y, rotation_deg, n_inliers, inlier_mask) or None.
+    """
     if len(kpts0) < 8:
         return None
 
@@ -46,7 +95,7 @@ def _solve_scale_affine(kpts0, kpts1):
     # RANSAC
     try:
         M, inliers = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC,
-                                           ransacReprojThreshold=RANSAC_REPROJ_THRESHOLD)
+                                           ransacReprojThreshold=_C.RANSAC_REPROJ_THRESHOLD)
     except Exception:
         return None
 
@@ -62,8 +111,9 @@ def _solve_scale_affine(kpts0, kpts1):
     scale_x = np.sqrt(a ** 2 + c ** 2)
     scale_y = np.sqrt(b ** 2 + d ** 2)
     rotation_deg = np.degrees(np.arctan2(c, a))
+    inlier_mask = inliers.ravel().astype(bool)
 
-    return scale_x, scale_y, rotation_deg, n_inliers
+    return scale_x, scale_y, rotation_deg, n_inliers, inlier_mask
 
 
 def _get_matcher_crops(ref_img, off_img):
@@ -194,7 +244,7 @@ def _run_eloftr_batch(crops, model, device, batch_size=4):
                 
     return results
 
-def detect_eloftr_scale(ref_img, offset_img, model=None):
+def detect_eloftr_scale(ref_img, offset_img, model=None, diagnostics_dir=None):
     """ELoFTR dense matching + RANSAC affine (tiled over 3x3 grid).
 
     Returns (scale_x, scale_y, rotation_deg, n_inliers) or None.
@@ -226,7 +276,7 @@ def detect_eloftr_scale(ref_img, offset_img, model=None):
         kp0, kp1, conf = res
         if kp0 is None or len(kp0) == 0:
             continue
-        mask = conf > 0.5
+        mask = conf > 0.2
         if mask.sum() < 3:
             continue
         crop = crops[i]
@@ -247,9 +297,14 @@ def detect_eloftr_scale(ref_img, offset_img, model=None):
         print("      ELoFTR scale: affine estimation failed")
         return None
 
-    scale_x, scale_y, rotation_deg, n_inliers = result
+    scale_x, scale_y, rotation_deg, n_inliers, inlier_mask = result
     print(f"      ELoFTR scale: {n_inliers} inliers from {len(kpts0)} matches, "
           f"scale_x={scale_x:.4f}, scale_y={scale_y:.4f}")
+
+    if diagnostics_dir is not None:
+        _save_eloftr_diagnostic(ref_u8, off_u8, kpts0, kpts1, inlier_mask,
+                                scale_x, scale_y, rotation_deg, n_inliers,
+                                diagnostics_dir)
 
     return scale_x, scale_y, rotation_deg, n_inliers
 
@@ -368,7 +423,8 @@ def _to_scale_result_ncc(result, method):
 
 
 def detect_scale_rotation(src_offset, src_ref, overlap, work_crs,
-                          coarse_dx, coarse_dy, expected_scale, model_cache=None):
+                          coarse_dx, coarse_dy, expected_scale, model_cache=None,
+                          diagnostics_dir=None):
     """Orchestrate scale/rotation detection: ELoFTR first, NCC grids as fallback.
 
     Returns ScaleResult (scale_x, scale_y, rotation, method_name).
@@ -390,7 +446,8 @@ def detect_scale_rotation(src_offset, src_ref, overlap, work_crs,
     print("    Method: ELoFTR...")
     try:
         eloftr_model = model_cache.eloftr if model_cache else None
-        result = detect_eloftr_scale(arr_ref, arr_off_shifted, model=eloftr_model)
+        result = detect_eloftr_scale(arr_ref, arr_off_shifted, model=eloftr_model,
+                                        diagnostics_dir=diagnostics_dir)
         if _gate_neural(result):
             sr = _to_scale_result_4(result, "eloftr")
             avg = (sr.scale_x + sr.scale_y) / 2
@@ -444,13 +501,17 @@ def detect_scale_rotation(src_offset, src_ref, overlap, work_crs,
 
 def detect_local_scales(src_offset, src_ref, overlap, work_crs,
                         coarse_dx, coarse_dy, grid_cols=3, grid_rows=3,
+                        detection_res=None, min_valid_frac=None,
                         model_cache=None):
     """Detect scale and rotation per-patch across the overlap region using ELoFTR.
 
     Returns list of dicts with keys: cx, cy, scale_x, scale_y, rotation,
     n_inliers, row, col, status.  Returns None if fewer than 3 patches succeed.
     """
-    detection_res = 5.0
+    if detection_res is None:
+        detection_res = _C.SCALE_DETECTION_RES
+    if min_valid_frac is None:
+        min_valid_frac = _C.SCALE_MIN_VALID_FRAC
 
     arr_ref, ref_transform = read_overlap_region(
         src_ref, overlap, work_crs, detection_res)
@@ -499,7 +560,7 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
 
             label = f"    Patch [{gr},{gc}] ({x1 - x0}x{y1 - y0}px)"
 
-            if min_valid < 0.30:
+            if min_valid < min_valid_frac:
                 print(f"{label}: skipped (valid={min_valid:.0%})")
                 patch_results.append({
                     'row': gr, 'col': gc, 'cx': patch_cx, 'cy': patch_cy,
@@ -554,13 +615,13 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
                 kp0, kp1, conf = res
                 if kp0 is None or len(kp0) == 0: continue
                 
-                mask = conf > 0.5
+                mask = conf > 0.2
                 if mask.sum() < 3:
                     continue
-                
+
                 # Crops are relative to patch (which is at x0,y0 in overlap)
                 # Reconstruct patch-local coords for RANSAC
-                
+
                 c0_c, r0_c = all_crops[i]['c0'], all_crops[i]['r0']
                 kp0_local = kp0[mask] + np.array([c0_c, r0_c])
                 kp1_local = kp1[mask] + np.array([c0_c, r0_c])
@@ -577,7 +638,7 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
                 
                 res_affine = _solve_scale_affine(kpts0, kpts1)
                 if res_affine:
-                    sx, sy, rot, n_inliers = res_affine
+                    sx, sy, rot, n_inliers, _inlier_mask = res_affine
                     avg_s = (sx + sy) / 2
                     
                     if not (0.75 < avg_s < 1.30) or n_inliers < 8:
@@ -684,11 +745,8 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
 
 
 # ---------------------------------------------------------------------------
-# Affine fitting — canonical implementation lives in align.affine;
-# re-exported here for backwards compatibility with existing imports.
+# Affine fitting lives in align.affine — import directly from there.
 # ---------------------------------------------------------------------------
-
-from .affine import fit_affine_from_gcps, compute_affine_residuals, ransac_affine  # noqa: F401,E402
 
 
 # ---------------------------------------------------------------------------

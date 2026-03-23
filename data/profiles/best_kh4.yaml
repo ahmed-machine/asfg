@@ -1,0 +1,17 @@
+inherits: _base
+meta:
+  name: best_kh4
+  description: Auto-tuned best params for kh4
+  cameras:
+  - KH-4
+  - KH-4A
+  - KH-4B
+matching:
+  roma_size: 784
+  roma_num_corresp: 400
+  land_mask_frac_min: 0.2
+grid_optim:
+  w_data: 1.2
+  w_chamfer: 0.2
+normalization:
+  clahe_clip_limit: 2.0

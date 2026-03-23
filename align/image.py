@@ -51,12 +51,42 @@ def to_u8_percentile(arr, lo_pct=1, hi_pct=99):
     return np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
 
 
-def clahe_normalize(img, clip_limit=3.0, grid=(8, 8)):
+def to_u8_percentile_joint(arr1, arr2, lo_pct=1, hi_pct=99):
+    """Normalize two arrays jointly using shared percentile bounds."""
+    valid = np.concatenate([arr1[arr1 > 0], arr2[arr2 > 0]])
+    if len(valid) == 0:
+        return np.zeros_like(arr1, dtype=np.uint8), np.zeros_like(arr2, dtype=np.uint8)
+    lo, hi = np.percentile(valid, [lo_pct, hi_pct])
+    if hi <= lo:
+        return np.zeros_like(arr1, dtype=np.uint8), np.zeros_like(arr2, dtype=np.uint8)
+    def _apply(arr):
+        return np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
+    return _apply(arr1), _apply(arr2)
+
+
+def wallis_match(source, reference):
+    """Match source mean/std to reference on valid (>0) pixels."""
+    s_valid = source > 0
+    r_valid = reference > 0
+    if not s_valid.any() or not r_valid.any():
+        return source
+    s_mean, s_std = source[s_valid].mean(), max(source[s_valid].std(), 1e-6)
+    r_mean, r_std = reference[r_valid].mean(), max(reference[r_valid].std(), 1e-6)
+    out = source.copy()
+    out[s_valid] = (source[s_valid] - s_mean) / s_std * r_std + r_mean
+    return out
+
+
+def clahe_normalize(img, clip_limit=None, grid=(8, 8)):
     """Apply CLAHE contrast enhancement to a uint8 image.
 
     If *img* is not uint8, converts via :func:`to_u8` first.
-    Returns a uint8 image.
+    Returns a uint8 image.  *clip_limit* defaults to
+    ``constants.CLAHE_CLIP_LIMIT`` (profile-tunable).
     """
+    if clip_limit is None:
+        from .constants import CLAHE_CLIP_LIMIT
+        clip_limit = CLAHE_CLIP_LIMIT
     if img.dtype != np.uint8:
         img = to_u8(img)
     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid)

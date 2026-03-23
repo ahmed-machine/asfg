@@ -25,6 +25,21 @@ def _adaptive_res(bounds, requested_res, max_pixels=4096):
     return max(float(requested_res), width_m / max_pixels, height_m / max_pixels)
 
 
+def _read_raw_resized(src, bounds, target_res):
+    """Read a non-georeferenced image and resize to match expected bounds/res.
+
+    For raw scans with no CRS, reads band 1 and resizes to the pixel
+    dimensions implied by the prior bounds and target resolution.
+    """
+    left, bottom, right, top = bounds
+    width = max(1, int(round((right - left) / target_res)))
+    height = max(1, int(round((top - bottom) / target_res)))
+    raw = src.read(1).astype(np.float32)
+    if raw.shape[0] != height or raw.shape[1] != width:
+        raw = cv2.resize(raw, (width, height), interpolation=cv2.INTER_AREA)
+    return raw
+
+
 def _read_bounds(src, bounds, target_crs, target_res):
     left, bottom, right, top = bounds
     width = max(1, int(round((right - left) / target_res)))
@@ -117,8 +132,22 @@ def localize_to_reference(src_offset, src_ref, work_crs, priors=None, coarse_res
     ref_arr, _ = _read_bounds(src_ref, search_bounds, work_crs, ref_res)
 
     target_bounds = dataset_bounds_in_crs(src_offset, work_crs)
+    if target_bounds is None:
+        # Image has no CRS — fall back to metadata prior bounds
+        for prior in priors:
+            target_bounds = _prior_bounds_in_work_crs(prior, work_crs)
+            if target_bounds is not None:
+                break
+    if target_bounds is None:
+        return []
     target_res = max(ref_res, _adaptive_res(target_bounds, coarse_res, max_pixels=1024))
-    target_arr, _ = _read_bounds(src_offset, target_bounds, work_crs, target_res)
+    if src_offset.crs is not None:
+        target_arr, _ = _read_bounds(src_offset, target_bounds, work_crs, target_res)
+    else:
+        # Raw scan — read pixels directly and resize to expected dimensions.
+        # The prior bounds are approximate (~10 mile accuracy per USGS docs),
+        # which is fine for coarse localization template matching.
+        target_arr = _read_raw_resized(src_offset, target_bounds, target_res)
 
     if min(target_arr.shape[:2]) < 32 or min(ref_arr.shape[:2]) < 32:
         return []

@@ -1,0 +1,18 @@
+inherits: _base
+
+meta:
+  name: kh4
+  description: KH-4 Corona (1962-1972), higher film grain
+  cameras: [KH-4, KH-4A, KH-4B]
+
+matching:
+  roma_size: 784
+  roma_num_corresp: 400
+  land_mask_frac_min: 0.20
+
+grid_optim:
+  w_data: 1.2
+  w_chamfer: 0.20
+
+normalization:
+  clahe_clip_limit: 2.0

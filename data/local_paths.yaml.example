@@ -1,0 +1,9 @@
+# Machine-specific paths — copy to data/local_paths.yaml and edit.
+# Supports ~ for home directory.
+
+targets:
+  bahrain_1977: "/path/to/data/D3C1213-200346A003.tif"
+
+references:
+  kh9_dzb1212: "/path/to/data/1976-KH9-DZB1212.warped.tif"
+  kh4_ds1022: "/path/to/data/1965-DS1022-1024DA.warped.tif"

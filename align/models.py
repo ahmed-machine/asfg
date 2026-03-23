@@ -94,6 +94,20 @@ class ELoFTRWrapper:
                 "m_bids": torch.zeros((0,), dtype=torch.long, device=dev),
             }
 
+    def extract_backbone_features(self, img_gray: torch.Tensor) -> torch.Tensor:
+        """Extract stride-8 backbone features from a grayscale image.
+
+        Args:
+            img_gray: (B, 1, H, W) tensor, float32, range [0, 1].
+
+        Returns:
+            (B, 256, H//8, W//8) tensor of coarse backbone features.
+        """
+        with torch.no_grad():
+            features = self.model.efficientloftr.backbone(img_gray)
+            # features[2] is the coarse feature map: 256ch @ stride 8
+            return features[2]
+
     def eval(self):
         self.model.eval()
         return self
@@ -135,6 +149,9 @@ class ModelCache:
                 "zju-community/matchanything_eloftr"
             )
             hf_model.eval().to(self.device)
+            # Satellite-tune: lower coarse matching threshold for cross-temporal imagery
+            # Default 0.2 is too strict — many valid matches land in 0.1-0.2 range
+            hf_model.config.coarse_matching_threshold = 0.1
             self._eloftr = ELoFTRWrapper(hf_model, self.device)
             print(f"  [ModelCache] MatchAnything-ELoFTR ready")
         return self._eloftr

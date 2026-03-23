@@ -23,6 +23,8 @@ import cv2
 import numpy as np
 from scipy.spatial import Delaunay, ConvexHull
 
+from .types import MatchPair
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -134,10 +136,10 @@ def filter_by_tin_tarr(matched_pairs, boundary_pairs, threshold=1.5):
     n_internal = len(matched_pairs)
 
     # Build coordinate arrays: ref_pts and off_pts in the same units
-    ref_internal = np.array([(p[0], p[1]) for p in matched_pairs], dtype=np.float64)
-    off_internal = np.array([(p[2], p[3]) for p in matched_pairs], dtype=np.float64)
-    ref_boundary = np.array([(p[0], p[1]) for p in boundary_pairs], dtype=np.float64)
-    off_boundary = np.array([(p[2], p[3]) for p in boundary_pairs], dtype=np.float64)
+    ref_internal = np.array([(p.ref_x, p.ref_y) for p in matched_pairs], dtype=np.float64)
+    off_internal = np.array([(p.off_x, p.off_y) for p in matched_pairs], dtype=np.float64)
+    ref_boundary = np.array([(p.ref_x, p.ref_y) for p in boundary_pairs], dtype=np.float64)
+    off_boundary = np.array([(p.off_x, p.off_y) for p in boundary_pairs], dtype=np.float64)
 
     ref_pts = np.concatenate([ref_internal, ref_boundary], axis=0)
     off_pts = np.concatenate([off_internal, off_boundary], axis=0)
@@ -347,8 +349,8 @@ def optimize_fpps_accuracy(matched_pairs, boundary_pairs, arr_ref, arr_off,
     n_internal = len(matched_pairs)
     
     # Combine internal and boundary points
-    ref_geo = np.array([(p[0], p[1]) for p in matched_pairs] + [(p[0], p[1]) for p in boundary_pairs], dtype=np.float64)
-    off_geo = np.array([(p[2], p[3]) for p in matched_pairs] + [(p[2], p[3]) for p in boundary_pairs], dtype=np.float64)
+    ref_geo = np.array([(p.ref_x, p.ref_y) for p in matched_pairs] + [(p.ref_x, p.ref_y) for p in boundary_pairs], dtype=np.float64)
+    off_geo = np.array([(p.off_x, p.off_y) for p in matched_pairs] + [(p.off_x, p.off_y) for p in boundary_pairs], dtype=np.float64)
 
     # Pre-convert all geo coordinates to pixel coordinates for the provided arrays
     # arr_ref and arr_off are overlap arrays
@@ -385,7 +387,7 @@ def optimize_fpps_accuracy(matched_pairs, boundary_pairs, arr_ref, arr_off,
     max_inland_remove = int(0.30 * n_inland_init)
 
     protected = set(i for i, p in enumerate(matched_pairs)
-                    if len(p) >= 6 and str(p[5]).startswith("anchor:"))
+                    if p.is_anchor)
     shore_removed = 0
     inland_removed = 0
 

@@ -19,7 +19,7 @@ import os
 import sys
 
 from align.metadata_priors import parse_bbox_xml
-from declass.georef import georef_with_bbox
+from preprocess.georef import georef_with_bbox
 
 # Default image → XML file mapping (legacy Bahrain dataset)
 IMAGES = {

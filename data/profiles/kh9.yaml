@@ -1,0 +1,6 @@
+inherits: _base
+
+meta:
+  name: kh9
+  description: KH-9 Hexagon (1971-1984), mapping camera
+  cameras: [KH-9]

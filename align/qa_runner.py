@@ -8,7 +8,7 @@ from typing import Iterable
 import numpy as np
 
 from .qa import evaluate_alignment_quality_paths
-from .types import MatchPair, QaReport, match_pairs_from_legacy, match_pairs_to_legacy
+from .types import MatchPair, QaReport, match_pairs_from_legacy
 
 
 def split_holdout_pairs(matched_pairs: Iterable[MatchPair | tuple], holdout_fraction: float = 0.2,
@@ -18,12 +18,12 @@ def split_holdout_pairs(matched_pairs: Iterable[MatchPair | tuple], holdout_frac
     pairs = match_pairs_from_legacy(matched_pairs)
     auto_idx = [idx for idx, pair in enumerate(pairs) if not pair.is_anchor]
     if len(auto_idx) < max(min_holdout + 6, 12):
-        return match_pairs_to_legacy(pairs), []
+        return pairs, []
 
     holdout_n = max(min_holdout, int(round(len(auto_idx) * holdout_fraction)))
     holdout_n = min(holdout_n, max(0, len(auto_idx) - 6))
     if holdout_n <= 0:
-        return match_pairs_to_legacy(pairs), []
+        return pairs, []
 
     rng = np.random.default_rng(seed)
     shuffled = np.array(auto_idx, dtype=np.int32)
@@ -31,7 +31,7 @@ def split_holdout_pairs(matched_pairs: Iterable[MatchPair | tuple], holdout_frac
     holdout_idx = set(int(idx) for idx in shuffled[:holdout_n])
     train = [pair for idx, pair in enumerate(pairs) if idx not in holdout_idx]
     holdout = [pair for idx, pair in enumerate(pairs) if idx in holdout_idx]
-    return match_pairs_to_legacy(train), match_pairs_to_legacy(holdout)
+    return train, holdout
 
 
 def compute_holdout_affine_metrics(M_geo, holdout_pairs: Iterable[MatchPair | tuple]):
@@ -64,6 +64,8 @@ def _confidence_from_metrics(image_metrics, holdout_metrics, coverage, cv_mean_m
     components = []
 
     image_score = float(image_metrics.get("score", 300.0)) if image_metrics else 300.0
+    if not np.isfinite(image_score):
+        image_score = 300.0
     components.append(np.clip(1.0 - (image_score / 200.0), 0.0, 1.0))
 
     if holdout_metrics:
@@ -79,6 +81,8 @@ def _confidence_from_metrics(image_metrics, holdout_metrics, coverage, cv_mean_m
 
 def _total_score(image_metrics, holdout_metrics, coverage, cv_mean_m):
     score = float(image_metrics.get("score", 500.0)) if image_metrics else 500.0
+    if not np.isfinite(score):
+        score = 500.0
     if holdout_metrics:
         score += 0.60 * float(holdout_metrics.get("mean_m", 0.0))
         score += 0.25 * float(holdout_metrics.get("p90_m", 0.0))
@@ -92,16 +96,18 @@ def _total_score(image_metrics, holdout_metrics, coverage, cv_mean_m):
 def build_candidate_report(candidate_name: str, output_path: str, reference_path: str,
                            overlap, work_crs, *, holdout_pairs=None, M_geo=None,
                            coverage: float = 0.0, cv_mean_m: float | None = None,
-                           hypothesis_id: str = "", eval_res: float = 4.0) -> QaReport:
+                           hypothesis_id: str = "", eval_res: float = 4.0,
+                           image_metrics=None) -> QaReport:
     """Compute an independent QA report for a candidate output."""
 
-    image_metrics = evaluate_alignment_quality_paths(
-        output_path,
-        reference_path,
-        overlap,
-        work_crs,
-        eval_res=eval_res,
-    ) or {}
+    if image_metrics is None:
+        image_metrics = evaluate_alignment_quality_paths(
+            output_path,
+            reference_path,
+            overlap,
+            work_crs,
+            eval_res=eval_res,
+        ) or {}
     holdout_metrics = compute_holdout_affine_metrics(M_geo, holdout_pairs or [])
     total = _total_score(image_metrics, holdout_metrics, coverage, cv_mean_m)
     confidence = _confidence_from_metrics(image_metrics, holdout_metrics, coverage, cv_mean_m)

@@ -19,15 +19,13 @@ import re
 import subprocess
 import sys
 
-from declass.catalog import parse_csvs, group_into_strips, filter_scenes
-from declass.camera import identify_camera
-from declass.usgs import download_scenes, fetch_corners_batch
-from declass.extract import extract_archive, list_frames
-from declass.stitch import stitch_frames, compute_subset_corners, detect_subframe_seams, split_at_seams
-from declass.georef import georef_with_corners
-from declass.mosaic import build_all_mosaics, build_mosaic
-from declass.reference import fetch_sentinel2_reference
-from declass.orientation import swap_corners_180, rotate_corners_cw90, rotate_corners_ccw90, detect_orientation, verify_orientation_against_reference
+from preprocess.catalog import parse_csvs, group_into_strips, filter_scenes, identify_camera
+from preprocess.usgs import download_scenes, fetch_corners_batch, extract_archive, list_frames
+from preprocess.stitch import stitch_frames, compute_subset_corners, detect_subframe_seams, split_at_seams
+from preprocess.georef import georef_with_corners
+from preprocess.mosaic import build_all_mosaics, build_mosaic
+from preprocess.georef import fetch_sentinel2_reference
+from preprocess.orientation import swap_corners_180, rotate_corners_cw90, rotate_corners_ccw90, detect_orientation, verify_orientation_against_reference
 
 
 def load_progress(output_dir: str) -> dict:

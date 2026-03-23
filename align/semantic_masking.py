@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import cv2
@@ -177,7 +178,7 @@ class CoastalObiaMaskProvider:
     name = "coastal_obia"
     max_dim = 2400
 
-    def build_masks(self, arr) -> MaskBundle:
+    def build_masks(self, arr, _debug_dir: str | None = None) -> MaskBundle:
         arr = np.asarray(arr, dtype=np.float32)
         if arr.ndim != 2:
             raise ValueError("CoastalObiaMaskProvider expects a 2D array")
@@ -189,6 +190,9 @@ class CoastalObiaMaskProvider:
         # Step 1: run heuristic at ORIGINAL resolution
         heuristic = HeuristicMaskProvider().build_masks(arr)
 
+        if _debug_dir:
+            self._dump_heuristic(heuristic, arr, _debug_dir)
+
         # Step 2: compute demotion mask (possibly at reduced resolution)
         height, width = arr.shape
         ds_scale = min(1.0, self.max_dim / max(height, width))
@@ -199,7 +203,7 @@ class CoastalObiaMaskProvider:
             land_small = cv2.resize(
                 heuristic.land, (new_w, new_h), interpolation=cv2.INTER_NEAREST,
             ) > 0.5
-            demote_small = self._compute_demotion(arr_small, land_small, scale=ds_scale)
+            demote_small = self._compute_demotion(arr_small, land_small, scale=ds_scale, _debug_dir=_debug_dir)
             if demote_small is None:
                 return heuristic
             # Upsample demotion mask back to original resolution
@@ -209,14 +213,20 @@ class CoastalObiaMaskProvider:
             ) > 0
         else:
             land = heuristic.land > 0.5
-            demoted = self._compute_demotion(arr, land, scale=1.0)
+            demoted = self._compute_demotion(arr, land, scale=1.0, _debug_dir=_debug_dir)
             if demoted is None:
                 return heuristic
 
         # Step 3: apply demotions to the full-res heuristic
-        return self._apply_demotion(heuristic, demoted, arr)
+        result = self._apply_demotion(heuristic, demoted, arr)
 
-    def _compute_demotion(self, arr: np.ndarray, land: np.ndarray, scale: float = 1.0):
+        if _debug_dir:
+            self._dump_final_overlay(result, arr, _debug_dir)
+
+        return result
+
+    def _compute_demotion(self, arr: np.ndarray, land: np.ndarray, scale: float = 1.0,
+                           _debug_dir: str | None = None):
         """Compute a boolean demotion mask. Returns None if fallback needed.
 
         Parameters
@@ -226,6 +236,7 @@ class CoastalObiaMaskProvider:
         scale : downscale factor applied to reach *arr* (1.0 = full resolution).
             Used to adapt kernel sizes, distance thresholds, and felzenszwalb
             parameters so behaviour is consistent regardless of resolution.
+        _debug_dir : if set, dump intermediate arrays as images.
         """
         valid = arr > 0
         u8 = to_u8(arr)
@@ -282,6 +293,9 @@ class CoastalObiaMaskProvider:
             | ((grad_norm < wl_grad_low) & (std_norm < wl_std_low) & (brightness < 0.55))
         ) & valid
 
+        if _debug_dir:
+            self._dump_waterlike(arr, waterlike, grad_norm, std_norm, brightness, land, _debug_dir)
+
         border = np.zeros_like(valid, dtype=bool)
         border[0, :] = True
         border[-1, :] = True
@@ -305,6 +319,9 @@ class CoastalObiaMaskProvider:
         # All pixel-distance thresholds are expressed in "full-res equivalent
         # pixels" so they stay constant regardless of the downscale factor.
         dist_to_sea = ndi.distance_transform_edt(~sea_connected)
+
+        if _debug_dir:
+            self._dump_sea_distance(arr, sea_connected, dist_to_sea, land, _debug_dir)
 
         # Scale distance thresholds: at full res we use 20px for inland_land;
         # at half res the same ground distance is 10px, etc.
@@ -381,6 +398,9 @@ class CoastalObiaMaskProvider:
         # Minimum segment size scales quadratically
         min_seg_px = max(2, int(round(4 * scale * scale)))
 
+        # Collect per-segment stats for debug dump
+        _seg_stats = [] if _debug_dir else None
+
         for seg_id in segment_ids:
             seg = (segments == seg_id) & valid
             if int(np.count_nonzero(seg)) < min_seg_px:
@@ -400,14 +420,14 @@ class CoastalObiaMaskProvider:
             # Rule A: touches sea margin, weak support, low gradient -> shoal
             demote_a = (
                 sea_touch >= 0.15
-                and supported <= 0.15
+                and supported <= 0.25
                 and mean_grad <= 0.35
                 and mean_std <= 0.20
             )
             # Rule B: mostly near-sea, unsupported, low texture
             demote_b = (
                 near_sea_frac >= 0.50
-                and supported <= 0.10
+                and supported <= 0.20
                 and mean_dist <= (20.0 * scale)
                 and mean_grad <= 0.45
             )
@@ -423,14 +443,54 @@ class CoastalObiaMaskProvider:
             demote_d = (
                 sea_touch >= 0.18
                 and near_sea_frac >= 0.60
-                and p90_dist <= max(6.0, 16.0 * scale)
+                and p90_dist <= max(6.0, 20.0 * scale)
                 and mean_grad <= 0.16
-                and mean_std <= 0.12
-                and mean_brightness >= 0.42
+                and mean_std <= 0.18
+                and mean_brightness >= 0.50
+            )
+            # Rule E: bright, ultra-smooth near-sea segments — shoal/shallow water
+            # that may appear "supported" due to proximity to mainland
+            demote_e = (
+                near_sea_frac >= 0.50
+                and mean_grad <= 0.10
+                and mean_std <= 0.10
+                and mean_brightness >= 0.55
             )
 
-            if demote_a or demote_b or demote_c or demote_d:
+            any_demoted = demote_a or demote_b or demote_c or demote_d or demote_e
+            if any_demoted:
                 demoted[seg] = True
+
+            if _seg_stats is not None:
+                # Compute segment centroid for location
+                seg_rows, seg_cols = np.where(seg)
+                centroid_r = float(np.mean(seg_rows))
+                centroid_c = float(np.mean(seg_cols))
+                rules = []
+                if demote_a: rules.append("A")
+                if demote_b: rules.append("B")
+                if demote_c: rules.append("C")
+                if demote_d: rules.append("D")
+                if demote_e: rules.append("E")
+                _seg_stats.append(dict(
+                    seg_id=int(seg_id),
+                    area=int(np.count_nonzero(seg)),
+                    centroid_r=centroid_r, centroid_c=centroid_c,
+                    quadrant=("NW" if centroid_r < arr.shape[0] / 2 and centroid_c < arr.shape[1] / 2 else
+                              "NE" if centroid_r < arr.shape[0] / 2 else
+                              "SW" if centroid_c < arr.shape[1] / 2 else "SE"),
+                    sea_touch=sea_touch, supported=supported,
+                    near_sea_frac=near_sea_frac, mean_dist=mean_dist,
+                    p90_dist=p90_dist,
+                    mean_grad=mean_grad, mean_std=mean_std,
+                    mean_brightness=mean_brightness,
+                    demoted=any_demoted,
+                    rules=",".join(rules) if rules else "-",
+                ))
+
+        if _debug_dir and _seg_stats is not None:
+            self._dump_segments_and_stats(
+                arr, segments, coastal_band, land, demoted, _seg_stats, _debug_dir)
 
         # Pixel-level cleanup for attached coastal ribbons that remain because
         # their segment still has enough inland support.  We look for narrow
@@ -472,6 +532,161 @@ class CoastalObiaMaskProvider:
                 demoted[cc] = True
 
         return demoted
+
+    # ------------------------------------------------------------------
+    # Diagnostic dump helpers (only called when _debug_dir is set)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _dump_heuristic(heuristic: MaskBundle, arr: np.ndarray, debug_dir: str):
+        os.makedirs(debug_dir, exist_ok=True)
+        u8 = to_u8(arr)
+        # Land mask overlay: green = land, blue = shallow_water
+        vis = cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+        land = heuristic.land > 0.5
+        shal = heuristic.shallow_water > 0.5
+        vis[land, 1] = np.clip(vis[land, 1].astype(int) + 100, 0, 255).astype(np.uint8)
+        vis[shal, 0] = np.clip(vis[shal, 0].astype(int) + 120, 0, 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(debug_dir, "01_heuristic_land.png"), vis)
+        print(f"  [mask_debug] saved 01_heuristic_land.png")
+
+    @staticmethod
+    def _dump_waterlike(arr, waterlike, grad_norm, std_norm, brightness, land, debug_dir):
+        os.makedirs(debug_dir, exist_ok=True)
+        u8 = to_u8(arr)
+        # Waterlike overlay: red = waterlike, green = land
+        vis = cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+        vis[waterlike, 2] = np.clip(vis[waterlike, 2].astype(int) + 120, 0, 255).astype(np.uint8)
+        vis[land, 1] = np.clip(vis[land, 1].astype(int) + 80, 0, 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(debug_dir, "02_waterlike.png"), vis)
+        # Also save gradient and std heatmaps
+        grad_vis = (np.clip(grad_norm, 0, 1) * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(debug_dir, "02b_grad_norm.png"),
+                    cv2.applyColorMap(grad_vis, cv2.COLORMAP_VIRIDIS))
+        std_vis = (np.clip(std_norm, 0, 1) * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(debug_dir, "02c_std_norm.png"),
+                    cv2.applyColorMap(std_vis, cv2.COLORMAP_VIRIDIS))
+        brt_vis = (np.clip(brightness, 0, 1) * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(debug_dir, "02d_brightness.png"),
+                    cv2.applyColorMap(brt_vis, cv2.COLORMAP_VIRIDIS))
+        print(f"  [mask_debug] saved 02_waterlike.png + gradient/std/brightness heatmaps")
+
+    @staticmethod
+    def _dump_sea_distance(arr, sea_connected, dist_to_sea, land, debug_dir):
+        os.makedirs(debug_dir, exist_ok=True)
+        u8 = to_u8(arr)
+        # Sea connected overlay
+        vis = cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+        vis[sea_connected, 0] = np.clip(vis[sea_connected, 0].astype(int) + 120, 0, 255).astype(np.uint8)
+        vis[land, 1] = np.clip(vis[land, 1].astype(int) + 80, 0, 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(debug_dir, "03_sea_connected.png"), vis)
+        # Distance heatmap (clamp to 60px for vis)
+        dist_clamp = np.clip(dist_to_sea, 0, 60)
+        dist_norm = (dist_clamp / 60.0 * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(debug_dir, "03b_dist_to_sea.png"),
+                    cv2.applyColorMap(dist_norm, cv2.COLORMAP_JET))
+        print(f"  [mask_debug] saved 03_sea_connected.png + dist_to_sea heatmap")
+
+    @staticmethod
+    def _dump_segments_and_stats(arr, segments, coastal_band, land, demoted, seg_stats, debug_dir):
+        os.makedirs(debug_dir, exist_ok=True)
+        u8 = to_u8(arr)
+        h, w = arr.shape
+        # Colored segment map (only coastal-band land segments)
+        seg_vis = cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+        coastal_land = coastal_band & land
+        if np.any(coastal_land):
+            seg_ids = np.unique(segments[coastal_land])
+            rng = np.random.RandomState(42)
+            colors = rng.randint(60, 255, size=(int(seg_ids.max()) + 1, 3))
+            for sid in seg_ids:
+                mask = (segments == sid) & coastal_land
+                c = colors[sid % len(colors)]
+                seg_vis[mask] = c
+        # Mark demoted segments with red X
+        for stat in seg_stats:
+            if stat["demoted"]:
+                cr, cc = int(stat["centroid_r"]), int(stat["centroid_c"])
+                cv2.drawMarker(seg_vis, (cc, cr), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 8, 2)
+        cv2.imwrite(os.path.join(debug_dir, "04_segments.png"), seg_vis)
+
+        # Labeled segment map — large segments (≥150px) only, to stay readable
+        seg_labeled = seg_vis.copy()
+        for stat in sorted(seg_stats, key=lambda x: x["area"]):
+            if stat["area"] < 150:
+                continue
+            cr, cc = int(stat["centroid_r"]), int(stat["centroid_c"])
+            sid = stat["seg_id"]
+            is_demoted = stat["demoted"]
+            color = (0, 0, 255) if is_demoted else (255, 255, 255)
+            scale_f = 0.4 if stat["area"] < 500 else (0.5 if stat["area"] < 2000 else 0.6)
+            thickness = 1
+            cv2.putText(seg_labeled, str(sid), (cc + 3, cr - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale_f, (0, 0, 0), thickness + 2)
+            cv2.putText(seg_labeled, str(sid), (cc + 3, cr - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale_f, color, thickness)
+            if is_demoted:
+                cv2.drawMarker(seg_labeled, (cc, cr), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 10, 2)
+        cv2.imwrite(os.path.join(debug_dir, "04b_segments_labeled.png"), seg_labeled)
+        # Quadrant crops of the labeled image
+        for qname, r_sl, c_sl in [
+            ("nw", slice(0, h // 2), slice(0, w // 2)),
+            ("ne", slice(0, h // 2), slice(w // 2, w)),
+            ("sw", slice(h // 2, h), slice(0, w // 2)),
+            ("se", slice(h // 2, h), slice(w // 2, w)),
+        ]:
+            cv2.imwrite(os.path.join(debug_dir, f"04c_segments_{qname}.png"),
+                        seg_labeled[r_sl, c_sl])
+
+        # Print NW-quadrant stats table and all-segment summary
+        print(f"\n  [mask_debug] === Segment Stats ({len(seg_stats)} land segments in coastal band) ===")
+        print(f"  {'seg_id':>6} {'area':>5} {'quad':>3} {'sea_touch':>9} {'supported':>9} "
+              f"{'near_sea':>8} {'mean_dist':>9} {'p90_dist':>8} "
+              f"{'mean_grad':>9} {'mean_std':>8} {'mean_brt':>8} {'rules':>6}")
+        nw_stats = [s for s in seg_stats if s["quadrant"] == "NW"]
+        other_stats = [s for s in seg_stats if s["quadrant"] != "NW"]
+        for label, stats_list in [("NW QUADRANT", nw_stats), ("OTHER", other_stats)]:
+            if not stats_list:
+                continue
+            print(f"  --- {label} ({len(stats_list)} segments) ---")
+            for s in sorted(stats_list, key=lambda x: -x["area"]):
+                print(f"  {s['seg_id']:>6} {s['area']:>5} {s['quadrant']:>3} "
+                      f"{s['sea_touch']:>9.3f} {s['supported']:>9.3f} "
+                      f"{s['near_sea_frac']:>8.3f} {s['mean_dist']:>9.2f} {s['p90_dist']:>8.2f} "
+                      f"{s['mean_grad']:>9.3f} {s['mean_std']:>8.3f} {s['mean_brightness']:>8.3f} "
+                      f"{s['rules']:>6}")
+
+        # Also write stats to CSV
+        import csv
+        csv_path = os.path.join(debug_dir, "segment_stats.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "seg_id", "area", "quadrant", "centroid_r", "centroid_c",
+                "sea_touch", "supported", "near_sea_frac", "mean_dist", "p90_dist",
+                "mean_grad", "mean_std", "mean_brightness", "demoted", "rules",
+            ])
+            writer.writeheader()
+            for s in seg_stats:
+                writer.writerow(s)
+        print(f"  [mask_debug] saved 04_segments.png + segment_stats.csv")
+
+    @staticmethod
+    def _dump_final_overlay(bundle: MaskBundle, arr: np.ndarray, debug_dir: str):
+        os.makedirs(debug_dir, exist_ok=True)
+        u8 = to_u8(arr)
+        vis = cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+        land = bundle.land > 0.5
+        shal = bundle.shallow_water > 0.5
+        shore = bundle.shoreline > 0.5
+        # green = land, blue = shallow_water, red = shoreline
+        vis[land, 1] = np.clip(vis[land, 1].astype(int) + 100, 0, 255).astype(np.uint8)
+        vis[shal, 0] = np.clip(vis[shal, 0].astype(int) + 120, 0, 255).astype(np.uint8)
+        vis[shore, 2] = np.clip(vis[shore, 2].astype(int) + 100, 0, 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(debug_dir, "05_final_mask.png"), vis)
+        # Also save the raw binary land mask
+        cv2.imwrite(os.path.join(debug_dir, "05b_final_land_binary.png"),
+                    (land.astype(np.uint8) * 255))
+        print(f"  [mask_debug] saved 05_final_mask.png + 05b_final_land_binary.png")
 
     @staticmethod
     def _apply_demotion(heuristic: MaskBundle, demoted: np.ndarray, arr: np.ndarray) -> MaskBundle:

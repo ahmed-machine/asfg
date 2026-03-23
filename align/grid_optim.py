@@ -16,6 +16,7 @@ Key design decisions
 
 import hashlib
 import math
+import os
 import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -27,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.interpolate import RBFInterpolator
 
-from .constants import EARLY_STOP_THRESHOLD, EARLY_STOP_WINDOW
+from . import constants as _C
 
 # ---------------------------------------------------------------------------
 # DINOv3 model singleton (satellite-pretrained, ViT-L/16, 300M params)
@@ -110,16 +111,13 @@ def _compress_features(
     Output: (out_channels, H', W') float16 on CPU, where max(H', W') <= spatial_max
     """
     C, H, W = feat.shape
-    proj = _get_projection_matrix(C, out_channels).to(device=device, dtype=feat.dtype)
+    # Run compression on CPU — output is CPU float16 anyway, and MPS OOMs
+    # on large feature maps (e.g. 77k×35k target images produce ~11B elements).
+    feat = feat.cpu()
+    proj = _get_projection_matrix(C, out_channels).to(dtype=feat.dtype)
     # (C, H, W) -> (H*W, C) @ (C, out_channels) -> (H*W, out_channels) -> (out_channels, H, W)
     flat = feat.permute(1, 2, 0).reshape(-1, C)  # (H*W, C)
-    # MPS cannot handle matmuls with >INT_MAX elements; chunk rows to stay under limit
-    max_rows = max(1, (2**31 - 1) // max(C, out_channels))
-    if flat.shape[0] > max_rows:
-        chunks = [flat[i:i + max_rows] @ proj for i in range(0, flat.shape[0], max_rows)]
-        compressed = torch.cat(chunks, dim=0).reshape(H, W, out_channels).permute(2, 0, 1)
-    else:
-        compressed = (flat @ proj).reshape(H, W, out_channels).permute(2, 0, 1)  # (out_channels, H, W)
+    compressed = (flat @ proj).reshape(H, W, out_channels).permute(2, 0, 1)  # (out_channels, H, W)
     # Aspect-preserving spatial downsample: fit within spatial_max on longest side
     scale = min(1.0, spatial_max / max(H, W))
     spatial_size = (max(1, round(H * scale)), max(1, round(W * scale)))
@@ -322,7 +320,7 @@ def memory_efficient_chamfer(
         # coastline change), not misalignment — capping their gradient
         # prevents reclamation zones from distorting the overall warp.
         all_mins = torch.where(all_mins <= max_dist_m, all_mins,
-                               max_dist_m + (all_mins - max_dist_m) * 0.1)
+                               max_dist_m + (all_mins - max_dist_m) * 0.3)
         return all_mins.mean()
 
     return 0.5 * (directed(pts1, pts2) + directed(pts2, pts1))
@@ -413,8 +411,7 @@ def extract_dino_multiscale(
                     if ph > 0 or pw > 0:
                         crop = np.pad(crop, ((0, ph), (0, pw), (0, 0)), mode='reflect')
 
-                    t = torch.from_numpy(crop).float().div_(255.0).permute(2, 0, 1)
-                    t = (t - mean.cpu()) / std.cpu()
+                    t = torch.from_numpy(crop).permute(2, 0, 1)  # uint8, normalize on GPU
                     batch_tiles.append(t)
                     batch_coords.append((y // patch_h, x // patch_h))
 
@@ -423,7 +420,10 @@ def extract_dino_multiscale(
                         if tile_idx % 50 < len(batch_tiles) or is_last:
                             print(f"  [DINOv3-MS] tile {tile_idx}/{total_tiles}", flush=True)
 
-                        batch = torch.stack(batch_tiles).to(device=device, dtype=model_dtype)
+                        batch = torch.stack(batch_tiles).to(device=device, dtype=torch.float32)
+                        batch.div_(255.0)
+                        batch = (batch - mean) / std
+                        batch = batch.to(dtype=model_dtype)
                         out = model.forward_features(batch)  # (B, prefix+N, feat_dim)
 
                         # Final layer: strip CLS + register prefix tokens
@@ -453,20 +453,25 @@ def extract_dino_multiscale(
     stitched_mid = stitched_mid[:, :out_H, :out_W] / weight[:, :out_H, :out_W].clamp(min=1e-6)
 
     # Compress: random projection 1024→64 channels + aspect-preserving spatial downsample
-    from .constants import FEAT_SPATIAL_MAX
-    stitched_final = _compress_features(stitched_final, device, spatial_max=FEAT_SPATIAL_MAX)
-    stitched_mid = _compress_features(stitched_mid, device, spatial_max=FEAT_SPATIAL_MAX)
+    stitched_final = _compress_features(stitched_final, device, spatial_max=_C.FEAT_SPATIAL_MAX)
+    stitched_mid = _compress_features(stitched_mid, device, spatial_max=_C.FEAT_SPATIAL_MAX)
 
     return stitched_final, stitched_mid
 
 
-_FEAT_CACHE_VERSION = "v3"  # bump if extraction logic or model weights change
+_FEAT_CACHE_VERSION = "v4"  # bump if extraction logic or model weights change
 
 
-def _feat_cache_key(img_arr: np.ndarray, tile_size: int, stride: int) -> str:
+def _feat_cache_key(img_arr: np.ndarray, tile_size: int, stride: int,
+                    identity: Optional[str] = None) -> str:
     h = hashlib.sha256()
-    h.update(img_arr.tobytes())
-    h.update(f"dinov3_sat493m_{tile_size}_{stride}_{_FEAT_CACHE_VERSION}".encode())
+    if identity is not None:
+        # Fast path: use caller-provided identity (file path + shape) instead
+        # of hashing the full pixel array, which can be multi-GB.
+        h.update(identity.encode())
+    else:
+        h.update(img_arr.tobytes())
+    h.update(f"dinov3_{tile_size}_{stride}_{_FEAT_CACHE_VERSION}".encode())
     return h.hexdigest()[:24]
 
 
@@ -475,16 +480,21 @@ def extract_dino_multiscale_cached(
     tile_size: int = 1024,
     stride: int = 768,
     cache_tag: str = "",
+    identity: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Cached wrapper around extract_dino_multiscale().
 
     Cache key is derived from the image content hash + extraction params,
     so any change to the input image or params triggers a cache miss.
+
+    If *identity* is provided (e.g. file path + shape string), it is used
+    instead of hashing the full pixel array — much faster for large images
+    whose identity is already known to be stable.
     """
     cache_dir = Path.home() / ".cache" / "declass-process" / "dino_features"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_key = _feat_cache_key(img_arr, tile_size, stride)
+    cache_key = _feat_cache_key(img_arr, tile_size, stride, identity=identity)
     cache_path = cache_dir / f"{cache_tag}_{cache_key}.pt"
 
     if cache_path.exists():
@@ -723,15 +733,25 @@ def _compute_gcp_weights(
     source_pts: np.ndarray,
     src_shape: Tuple[int, int],
     n_real_gcps: Optional[int] = None,
+    match_weights: Optional[np.ndarray] = None,
 ) -> torch.Tensor:
     """Compute per-GCP confidence weights.
 
-    Real GCPs get weight 1.0.  Virtual boundary GCPs (indices >= n_real_gcps)
-    get distance-dependent weight: 0 near real GCPs (where they'd fight real
-    data), ramping up to 0.15 in truly data-sparse regions.
+    Real GCPs get weight 1.0 (or precision-based weight from RoMa if available).
+    Virtual boundary GCPs (indices >= n_real_gcps) get distance-dependent weight:
+    0 near real GCPs (where they'd fight real data), ramping up to 0.15 in
+    truly data-sparse regions.
     """
     n_total = tgt_pts_n.shape[0]
     weights = torch.ones(n_total, device=tgt_pts_n.device)
+
+    # Apply per-match precision weights from RoMa to real GCPs
+    if match_weights is not None and n_real_gcps is not None:
+        n_mw = min(len(match_weights), n_real_gcps)
+        weights[:n_mw] = torch.from_numpy(
+            match_weights[:n_mw].astype(np.float32)
+        ).to(tgt_pts_n.device)
+
     if n_real_gcps is not None and n_real_gcps < n_total:
         real_pts = tgt_pts_n[:n_real_gcps].cpu().numpy()
         virtual_pts = tgt_pts_n[n_real_gcps:].cpu().numpy()
@@ -744,6 +764,71 @@ def _compute_gcp_weights(
         ramp = np.clip((dists - 0.1) / 0.2, 0.0, 1.0).astype(np.float32)
         weights[n_real_gcps:] = torch.from_numpy(ramp * 0.10 + 0.05).to(tgt_pts_n.device)
     return weights
+
+
+def _save_iteration_diagnostic(
+    warper: 'GridWarper',
+    source_img: np.ndarray,
+    target_img: np.ndarray,
+    tgt_shape: Tuple[int, int],
+    level_name: str,
+    iteration: int,
+    losses: dict,
+    diag_dir: str,
+):
+    """Save a diagnostic image showing the current warp state.
+
+    Produces a side-by-side: warped source vs target, with GCP residuals
+    and loss values overlaid.
+    """
+    import cv2
+    H_t, W_t = tgt_shape
+
+    # Render at reduced resolution for speed while preserving aspect ratio.
+    diag_max = 512
+    diag_scale = min(1.0, diag_max / max(H_t, W_t))
+    diag_h = max(1, int(round(H_t * diag_scale)))
+    diag_w = max(1, int(round(W_t * diag_scale)))
+
+    with torch.no_grad():
+        dense_grid = warper.get_dense_grid((diag_h, diag_w))  # (1, H, W, 2)
+
+    # Warp source image
+    src_t = torch.from_numpy(source_img).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+    warped = F.grid_sample(src_t, dense_grid, mode='bilinear',
+                           padding_mode='zeros', align_corners=True)
+    warped_np = (warped.squeeze(0).permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+
+    # Resize target to same diagnostic size
+    tgt_resized = cv2.resize(target_img, (diag_w, diag_h))
+
+    # Side-by-side canvas
+    canvas = np.zeros((diag_h, diag_w * 2, 3), dtype=np.uint8)
+    canvas[:, :diag_w] = warped_np
+    canvas[:, diag_w:] = tgt_resized
+
+    # Separator line
+    cv2.line(canvas, (diag_w, 0), (diag_w, diag_h - 1), (80, 80, 80), 1)
+
+    # Overlay loss text
+    y0 = 16
+    for key, val in losses.items():
+        text = f"{key}={val:.2f}"
+        cv2.putText(canvas, text, (4, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1, cv2.LINE_AA)
+        y0 += 14
+
+    # Labels
+    cv2.putText(canvas, "warped src", (4, diag_h - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "target", (diag_w + 4, diag_h - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+
+    grid_dir = os.path.join(diag_dir, "grid_iterations")
+    os.makedirs(grid_dir, exist_ok=True)
+    level_tag = level_name.replace(" ", "_").replace("×", "x")
+    out_path = os.path.join(grid_dir, f"grid_{level_tag}_iter{iteration:04d}.jpg")
+    cv2.imwrite(out_path, canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
 
 def _run_single_level(
@@ -775,6 +860,11 @@ def _run_single_level(
     w_feat_mid: float = 0.0,
     huber_delta: float = 10.0,
     gcp_density_map: Optional[torch.Tensor] = None,
+    source_img: Optional[np.ndarray] = None,
+    target_img: Optional[np.ndarray] = None,
+    diagnostics_dir: Optional[str] = None,
+    feat_px_per_token: float = 16.0,
+    feat_stable_mask: Optional[torch.Tensor] = None,
 ) -> GridWarper:
     """Run a single level of grid optimisation (inner loop extracted from optimize_grid)."""
     device = warper.residual.device
@@ -785,8 +875,9 @@ def _run_single_level(
     scale_y_m = (H_s / 2.0) * output_res_m
     coast_scale_x_m = scale_x_m
     coast_scale_y_m = scale_y_m
-    feat_px_per_token = 16.0  # DINOv3 patch size
-    feat_scale_m = feat_px_per_token * output_res_m
+    from .params import get_params as _get_level_params
+    _level_prof = _get_level_params().grid_optim
+    feat_scale_m = feat_px_per_token * output_res_m * _level_prof.feat_scale_factor
 
     optimizer = torch.optim.Adam(warper.parameters(), lr=lr)
     # Cosine annealing with warm restarts every 100 iters to escape plateaus
@@ -797,7 +888,7 @@ def _run_single_level(
     cached_feat_mid_val = torch.tensor(0.0, device=device)
 
     WARMUP_ITERS = min(30, iters // 4)
-    FEAT_CAD = 5
+    FEAT_CAD = _level_prof.feat_cadence
 
     # Early stopping: track loss history
     loss_history = []
@@ -841,7 +932,10 @@ def _run_single_level(
             chamfer_loss = torch.tensor(0.0, device=device)
 
         # 3. Feature loss (spatial gradient correlation)
-        if (i % FEAT_CAD) == 0:
+        if w_feat == 0 and w_feat_mid == 0:
+            feat_loss = torch.tensor(0.0, device=device)
+            feat_mid_loss = torch.tensor(0.0, device=device)
+        elif (i % FEAT_CAD) == 0:
             dense_grid = warper.get_dense_grid(target_feat_size)
             warped_src_feat = F.grid_sample(
                 src_feat, dense_grid, mode='bilinear',
@@ -854,7 +948,17 @@ def _run_single_level(
             dy_t = tgt_feat_norm_const[:, :, 1:, :] - tgt_feat_norm_const[:, :, :-1, :]
             cos_dx = F.cosine_similarity(dx_w, dx_t, dim=1)
             cos_dy = F.cosine_similarity(dy_w, dy_t, dim=1)
-            feat_loss = (2.0 - cos_dx.mean() - cos_dy.mean()) * feat_scale_m
+            # Mask out reclamation/changed areas from feature loss
+            if feat_stable_mask is not None:
+                # dx uses columns [:-1], dy uses rows [:-1] — shrink mask accordingly
+                mask_dx = feat_stable_mask[None, :, 1:] & feat_stable_mask[None, :, :-1]
+                mask_dy = feat_stable_mask[None, 1:, :] & feat_stable_mask[None, :-1, :]
+                n_dx = mask_dx.sum().clamp(min=1)
+                n_dy = mask_dy.sum().clamp(min=1)
+                feat_loss = (2.0 - (cos_dx * mask_dx).sum() / n_dx
+                             - (cos_dy * mask_dy).sum() / n_dy) * feat_scale_m
+            else:
+                feat_loss = (2.0 - cos_dx.mean() - cos_dy.mean()) * feat_scale_m
             cached_feat_val = feat_loss.detach()
 
             # Mid-layer (same gradient approach)
@@ -903,8 +1007,13 @@ def _run_single_level(
         with torch.no_grad():
             warper.residual.clamp_(-max_residual_norm, max_residual_norm)
 
-        # Track loss for early stopping
-        loss_val = total.item()
+        # Track loss for early stopping (exclude feat and chamfer — both are
+        # near-constant across iters, inflate denominator and trigger premature
+        # early stop.  Chamfer is 8× data loss at L2 and barely moves.)
+        convergence_loss = (w_data * data_loss +
+                            eff_w_arap * arap_loss + eff_w_laplacian * laplacian_loss +
+                            w_disp * res_m).item()
+        loss_val = convergence_loss
         loss_history.append(loss_val)
 
         if i == 0:
@@ -931,21 +1040,45 @@ def _run_single_level(
                 flush=True
             )
 
+        # Save diagnostic image at iter 1, every 50 iters, and final iter
+        if diagnostics_dir is not None and source_img is not None and target_img is not None:
+            is_diag_iter = (i == 0 or (i + 1) % 50 == 0)
+            if is_diag_iter:
+                _save_iteration_diagnostic(
+                    warper, source_img, target_img, tgt_shape,
+                    level_name, i + 1,
+                    {"data": w_data * data_loss.item(),
+                     "cham": w_chamfer * chamfer_loss.item(),
+                     "feat": w_feat * feat_loss.item(),
+                     "total": total.item()},
+                    diagnostics_dir,
+                )
+
         # Early stopping: check if loss has plateaued
-        if i >= WARMUP_ITERS + EARLY_STOP_WINDOW:
-            old_loss = loss_history[-(EARLY_STOP_WINDOW + 1)]
+        if i >= WARMUP_ITERS + _C.EARLY_STOP_WINDOW:
+            old_loss = loss_history[-(_C.EARLY_STOP_WINDOW + 1)]
             improvement = (old_loss - loss_val) / (abs(old_loss) + 1e-8)
-            if improvement < EARLY_STOP_THRESHOLD:
+            if improvement < _C.EARLY_STOP_THRESHOLD:
                 final_iter = i + 1
                 print(
                     f"  [{level_name}] Early stop at iter {final_iter}/{iters} "
-                    f"(<{EARLY_STOP_THRESHOLD*100:.1f}% improvement over {EARLY_STOP_WINDOW} iters)",
+                    f"(<{_C.EARLY_STOP_THRESHOLD*100:.1f}% improvement over {_C.EARLY_STOP_WINDOW} iters)",
                     flush=True
                 )
                 break
 
     if final_iter == iters:
         print(f"  [{level_name}] Completed all {iters} iters (no early stop)", flush=True)
+
+    # Save final-iteration diagnostic (if not already saved by the 50-iter cadence)
+    if diagnostics_dir is not None and source_img is not None and target_img is not None:
+        if final_iter % 50 != 0:
+            _save_iteration_diagnostic(
+                warper, source_img, target_img, tgt_shape,
+                level_name, final_iter,
+                {"total": loss_val},
+                diagnostics_dir,
+            )
 
     return warper
 
@@ -963,7 +1096,7 @@ def optimize_grid_hierarchical(
     levels: Optional[List[Tuple[int, int]]] = None,
     lr: float = 0.002,
     w_data: float = 1.0,
-    w_chamfer: float = 0.3,
+    w_chamfer: float = 0.30,
     w_feat: float = 0.0,
     reclamation_mask_tgt: Optional[np.ndarray] = None,
     w_arap: float = 0.5,
@@ -971,6 +1104,14 @@ def optimize_grid_hierarchical(
     w_disp: float = 0.05,
     max_residual_norm: float = 0.03,
     n_real_gcps: Optional[int] = None,
+    match_weights: Optional[np.ndarray] = None,
+    target_identity: Optional[str] = None,
+    source_identity: Optional[str] = None,
+    diagnostics_dir: Optional[str] = None,
+    profiler=None,
+    src_feat_precomputed: Optional[torch.Tensor] = None,
+    tgt_feat_precomputed: Optional[torch.Tensor] = None,
+    feat_px_per_token_override: Optional[float] = None,
 ) -> 'GridWarper':
     """Hierarchical coarse-to-fine grid optimisation.
 
@@ -980,6 +1121,9 @@ def optimize_grid_hierarchical(
     on top of the coarser solution.  Regularisation weights decrease at finer
     levels since smoothness is already ensured by the coarser levels.
     """
+    from .profiler import _NullProfiler
+    _p = profiler or _NullProfiler()
+
     if levels is None:
         levels = [(8, 300), (24, 300), (64, 500)]
 
@@ -1055,30 +1199,133 @@ def optimize_grid_hierarchical(
     tgt_coast_n = downsample_pts(tgt_coast_n)
 
     # -----------------------------------------------------------------------
-    # Multi-scale DINOv3 features (skipped when w_feat == 0)
+    # Coverage-gap feature mask (computed before DINOv3 extraction)
     # -----------------------------------------------------------------------
+    def _compute_feat_active_mask(
+        tgt_pts_n: torch.Tensor,
+        feat_size: Tuple[int, int],
+        target_img: np.ndarray,
+        reclamation_mask: Optional[np.ndarray],
+        radius_norm: float = None,
+        device: torch.device = torch.device('cpu'),
+        coverage_gate: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """Build a mask restricting feature loss to low-coverage land pixels.
+
+        When *coverage_gate* is False, skip the GCP-distance check and
+        return a mask that is just land & ~reclamation (for anchor-free mode).
+
+        Returns (H_feat, W_feat) bool tensor, or None if <5% active.
+        """
+        if radius_norm is None:
+            radius_norm = _C.FEAT_COVERAGE_RADIUS_NORM
+        fH, fW = feat_size
+        if fH < 2 or fW < 2:
+            return None
+
+        # 1. Land mask (cheap Otsu on grayscale channel)
+        gray = target_img[:, :, 0] if target_img.ndim == 3 else target_img
+        _, land_bin = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        land_small = cv2.resize(land_bin, (fW, fH), interpolation=cv2.INTER_LINEAR)
+        land_mask = torch.from_numpy((land_small > 127).astype(np.float32)).to(device) > 0.5
+
+        # 2. Reclamation exclusion
+        if reclamation_mask is not None:
+            recl_small = cv2.resize(
+                reclamation_mask.astype(np.float32), (fW, fH),
+                interpolation=cv2.INTER_LINEAR)
+            recl_excl = torch.from_numpy(recl_small).to(device) > 0.5
+        else:
+            recl_excl = torch.zeros(fH, fW, dtype=torch.bool, device=device)
+
+        if coverage_gate:
+            # 3. Coverage gap: min distance from each feature pixel to any GCP
+            y_g = torch.linspace(-1, 1, fH, device=device)
+            x_g = torch.linspace(-1, 1, fW, device=device)
+            yy, xx = torch.meshgrid(y_g, x_g, indexing='ij')
+            grid_pts = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1)
+
+            if tgt_pts_n.shape[0] > 0:
+                gcp_xy = tgt_pts_n[:, :2].to(device)
+                dists = torch.cdist(grid_pts, gcp_xy)
+                min_dist = dists.min(dim=1).values.reshape(fH, fW)
+            else:
+                min_dist = torch.full((fH, fW), 999.0, device=device)
+
+            low_coverage = min_dist > radius_norm
+            active = low_coverage & land_mask & ~recl_excl
+        else:
+            # No coverage gate — feat loss active on all land outside reclamation
+            active = land_mask & ~recl_excl
+
+        if active.float().mean().item() < 0.05:
+            return None
+        return active
+
+    # -----------------------------------------------------------------------
+    # Feature maps for spatial gradient correlation loss
+    # -----------------------------------------------------------------------
+    # Pre-compute expected feature size so we can check coverage gaps
+    # before the expensive DINOv3 extraction.
+    feat_stable_mask = None
     if w_feat > 0:
-        print("  [DINOv3-MS] Extracting multi-scale features for source image...", flush=True)
-        src_feat_final, src_feat_mid = extract_dino_multiscale_cached(
-            source_img, cache_tag="source"
-        )
-        print("  [DINOv3-MS] Extracting multi-scale features for target image...", flush=True)
-        tgt_feat_final, tgt_feat_mid = extract_dino_multiscale_cached(
-            target_img, cache_tag="target"
-        )
+        # Pre-compute feat_size to check coverage gaps before extraction
+        img_H, img_W = target_img.shape[:2]
+        raw_fH = math.ceil(img_H / 16)
+        raw_fW = math.ceil(img_W / 16)
+        f_scale = min(1.0, _C.FEAT_SPATIAL_MAX / max(raw_fH, raw_fW))
+        predicted_feat_size = (max(1, round(raw_fH * f_scale)),
+                               max(1, round(raw_fW * f_scale)))
 
-        src_feat = src_feat_final.to(device, dtype=torch.float32).unsqueeze(0)
-        tgt_feat = tgt_feat_final.to(device, dtype=torch.float32).unsqueeze(0)
-        src_feat_mid_t = src_feat_mid.to(device, dtype=torch.float32).unsqueeze(0)
-        tgt_feat_mid_t = tgt_feat_mid.to(device, dtype=torch.float32).unsqueeze(0)
+        from .params import get_params as _get_feat_params
+        _feat_prof = _get_feat_params().grid_optim
+        feat_stable_mask = _compute_feat_active_mask(
+            tgt_pts_n, predicted_feat_size, target_img,
+            reclamation_mask_tgt, device=device,
+            coverage_gate=_feat_prof.feat_coverage_gate)
 
-        tgt_feat_norm_const = F.normalize(tgt_feat, p=2, dim=1)
-        tgt_feat_mid_norm = F.normalize(tgt_feat_mid_t, p=2, dim=1)
-        target_feat_size = (tgt_feat.shape[2], tgt_feat.shape[3])
+        if feat_stable_mask is not None:
+            pct = feat_stable_mask.float().mean().item()
+            print(f"  [Features] Coverage-gap land mask: {pct:.0%} active", flush=True)
 
-        del src_feat_final, src_feat_mid, tgt_feat_final, tgt_feat_mid
+            print("  [DINOv3-MS] Extracting multi-scale features for source image...", flush=True)
+            src_feat_final, src_feat_mid = extract_dino_multiscale_cached(
+                source_img, cache_tag="source", identity=source_identity
+            )
+            print("  [DINOv3-MS] Extracting multi-scale features for target image...", flush=True)
+            tgt_feat_final, tgt_feat_mid = extract_dino_multiscale_cached(
+                target_img, cache_tag="target", identity=target_identity
+            )
+
+            src_feat = src_feat_final.to(device, dtype=torch.float32).unsqueeze(0)
+            tgt_feat = tgt_feat_final.to(device, dtype=torch.float32).unsqueeze(0)
+            src_feat_mid_t = src_feat_mid.to(device, dtype=torch.float32).unsqueeze(0)
+            tgt_feat_mid_t = tgt_feat_mid.to(device, dtype=torch.float32).unsqueeze(0)
+
+            tgt_feat_norm_const = F.normalize(tgt_feat, p=2, dim=1)
+            tgt_feat_mid_norm = F.normalize(tgt_feat_mid_t, p=2, dim=1)
+            target_feat_size = (tgt_feat.shape[2], tgt_feat.shape[3])
+
+            # Resize mask if actual feat_size differs from predicted
+            if target_feat_size != predicted_feat_size:
+                mask_t = feat_stable_mask.float().unsqueeze(0).unsqueeze(0)
+                mask_rs = F.interpolate(mask_t, size=target_feat_size,
+                                        mode='nearest')
+                feat_stable_mask = mask_rs.squeeze() > 0.5
+
+            del src_feat_final, src_feat_mid, tgt_feat_final, tgt_feat_mid
+        else:
+            print("  [Features] No significant coverage gaps — feat loss disabled", flush=True)
+            w_feat = 0.0
+            src_feat = torch.zeros(1, 1, 1, 1, device=device)
+            tgt_feat = torch.zeros(1, 1, 1, 1, device=device)
+            src_feat_mid_t = torch.zeros(1, 1, 1, 1, device=device)
+            tgt_feat_mid_t = torch.zeros(1, 1, 1, 1, device=device)
+            tgt_feat_norm_const = torch.zeros(1, 1, 1, 1, device=device)
+            tgt_feat_mid_norm = torch.zeros(1, 1, 1, 1, device=device)
+            target_feat_size = (1, 1)
     else:
-        print("  [DINOv3-MS] Skipped (w_feat=0)", flush=True)
+        print("  [Features] Skipped (w_feat=0)", flush=True)
         src_feat = torch.zeros(1, 1, 1, 1, device=device)
         tgt_feat = torch.zeros(1, 1, 1, 1, device=device)
         src_feat_mid_t = torch.zeros(1, 1, 1, 1, device=device)
@@ -1091,7 +1338,8 @@ def optimize_grid_hierarchical(
     # GCP confidence weights (Improvement 5)
     # -----------------------------------------------------------------------
     gcp_weights = _compute_gcp_weights(tgt_pts_n, source_pts, src_shape,
-                                       n_real_gcps=n_real_gcps)
+                                       n_real_gcps=n_real_gcps,
+                                       match_weights=match_weights)
 
     # -----------------------------------------------------------------------
     # GCP density map for adaptive ARAP (computed at finest grid)
@@ -1146,105 +1394,129 @@ def optimize_grid_hierarchical(
     for level_idx, (gs, level_iters) in enumerate(levels):
         grid_sz = (gs, gs)
         level_name = f"L{level_idx} {gs}×{gs}"
-        print(f"\n  === Hierarchical level {level_idx}: {gs}×{gs} grid, "
-              f"{level_iters} iters ===", flush=True)
+        section_name = f"L{level_idx}_{gs}x{gs}"
+        with _p.section(section_name):
+            print(f"\n  === Hierarchical level {level_idx}: {gs}×{gs} grid, "
+                  f"{level_iters} iters ===", flush=True)
 
-        warper = GridWarper(grid_size=grid_sz).to(device)
+            warper = GridWarper(grid_size=grid_sz).to(device)
 
-        if prev_displacement is not None:
-            # Upsample previous total displacement to current grid size
-            upsampled = F.interpolate(
-                prev_displacement, size=grid_sz, mode='bilinear', align_corners=True
+            if prev_displacement is not None:
+                # Upsample previous total displacement to current grid size
+                upsampled = F.interpolate(
+                    prev_displacement, size=grid_sz, mode='bilinear', align_corners=True
+                )
+                warper.set_affine_baseline(upsampled)
+            elif affine_baseline is not None:
+                # First level: use affine baseline (resample to this grid size)
+                baseline_at_gs = F.interpolate(
+                    affine_baseline, size=grid_sz, mode='bilinear', align_corners=True
+                )
+                warper.set_affine_baseline(baseline_at_gs)
+
+            # Per-level scaling from profile (falls back to last entry for
+            # levels beyond the array length).
+            from .params import get_params as _get_params
+            _prof = _get_params().grid_optim
+
+            def _lvl_scale(arr, idx, fallback_formula=None):
+                if idx < len(arr):
+                    return arr[idx]
+                return arr[-1] if arr else (fallback_formula or 1.0)
+
+            # Regularisation increases at finer levels — chamfer noise from
+            # coastline changes (reclamation) dominates at fine grids.
+            reg_scale = _lvl_scale(_prof.level_reg_scale, level_idx)
+            level_w_arap = w_arap * reg_scale
+            level_w_laplacian = w_laplacian * reg_scale
+
+            # Finer levels: trust GCPs more, penalise displacement less.
+            data_scale = _lvl_scale(_prof.level_w_data_scale, level_idx)
+            disp_scale = _lvl_scale(_prof.level_w_disp_scale, level_idx)
+            level_w_data = w_data * data_scale
+            level_w_disp = w_disp * disp_scale
+
+            # Finer levels get tighter Huber delta (GCPs act as harder constraints)
+            level_huber = max(3.0, 10.0 / (1.0 + level_idx))
+
+            # Multi-scale mid-layer feature weight
+            if level_idx < 1:
+                level_w_feat_mid = 0.0
+            else:
+                level_w_feat_mid = (_prof.feat_mid_ratio * w_feat
+                                    * min(1.0, level_idx / max(1, len(levels) - 1)))
+
+            # Chamfer weight decreases at finer levels.
+            chamfer_scale = _lvl_scale(_prof.level_chamfer_scale, level_idx)
+            level_w_chamfer = w_chamfer * chamfer_scale
+
+            # Adaptive clamp: finer levels allow larger local corrections
+            level_max_residual = max_residual_norm * (1.0 + 0.5 * level_idx)
+
+            # DINOv3 feature loss: per-level scaling from profile
+            feat_scale_val = _lvl_scale(_prof.level_w_feat_scale, level_idx)
+            level_w_feat = w_feat * feat_scale_val
+
+            # Uniform ARAP: don't reduce regularization where GCPs are dense.
+            # Adaptive ARAP (0.3-0.8) causes grid instability and jagged features.
+            # v17 (uniform) got accepted=true with score 70.1, while v18 (0.3)
+            # produced north=-88m and regression.
+            level_density = None
+
+            warper = _run_single_level(
+                warper=warper,
+                grid_size=grid_sz,
+                tgt_pts_n=tgt_pts_n,
+                src_pts_n=src_pts_n,
+                src_coast_n=src_coast_n,
+                tgt_coast_n=tgt_coast_n,
+                src_feat=src_feat,
+                tgt_feat_norm_const=tgt_feat_norm_const,
+                target_feat_size=target_feat_size,
+                src_shape=src_shape,
+                tgt_shape=tgt_shape,
+                output_res_m=output_res_m,
+                iters=level_iters,
+                lr=lr,
+                w_data=level_w_data,
+                w_chamfer=level_w_chamfer,
+                w_feat=level_w_feat,
+                w_arap=level_w_arap,
+                w_laplacian=level_w_laplacian,
+                w_disp=level_w_disp,
+                max_residual_norm=level_max_residual,
+                level_name=level_name,
+                gcp_weights=gcp_weights,
+                feat_mid=src_feat_mid_t,
+                tgt_feat_mid_norm=tgt_feat_mid_norm,
+                w_feat_mid=level_w_feat_mid,
+                huber_delta=level_huber,
+                gcp_density_map=level_density,
+                source_img=source_img if diagnostics_dir else None,
+                target_img=target_img if diagnostics_dir else None,
+                diagnostics_dir=diagnostics_dir,
+                feat_px_per_token=feat_px_per_token_override if feat_px_per_token_override else 16.0,
+                feat_stable_mask=feat_stable_mask,
             )
-            warper.set_affine_baseline(upsampled)
-        elif affine_baseline is not None:
-            # First level: use affine baseline (resample to this grid size)
-            baseline_at_gs = F.interpolate(
-                affine_baseline, size=grid_sz, mode='bilinear', align_corners=True
-            )
-            warper.set_affine_baseline(baseline_at_gs)
 
-        # Increase regularisation at finer levels — chamfer noise from coastline
-        # changes (reclamation) dominates at fine grids, so stronger ARAP keeps
-        # the solution smooth between GCPs (similar to TPS behavior).
-        reg_scale = 1.0 + 0.15 * level_idx
-        level_w_arap = w_arap * reg_scale
-        level_w_laplacian = w_laplacian * reg_scale
-        # Finer levels: trust GCPs more, penalise displacement less.
-        # Coarse levels establish smooth global alignment; fine levels
-        # tighten local corrections near GCPs.
-        level_w_disp = w_disp / (1.0 + 0.5 * level_idx)
-        level_w_data = w_data * (1.0 + 0.5 * level_idx)
-
-        # Finer levels get tighter Huber delta (GCPs act as harder constraints)
-        level_huber = max(3.0, 10.0 / (1.0 + level_idx))
-
-        # Multi-scale feature weight: higher at finer levels
-        level_w_feat_mid = 0.3 * w_feat * min(1.0, level_idx / max(1, len(levels) - 1))
-
-        # Chamfer weight decreases at finer levels — more coast points naturally
-        # increase chamfer magnitude, and coastline errors (reclamation) dominate
-        # at fine resolution. Keep chamfer strongest at coarse (global alignment).
-        level_w_chamfer = w_chamfer / (1.0 + 0.5 * level_idx)
-
-        # Adaptive clamp: finer levels allow larger local corrections
-        level_max_residual = max_residual_norm * (1.0 + 0.5 * level_idx)
-
-        # Uniform ARAP: don't reduce regularization where GCPs are dense.
-        # Adaptive ARAP (0.3-0.8) causes grid instability and jagged features.
-        # v17 (uniform) got accepted=true with score 70.1, while v18 (0.3)
-        # produced north=-88m and regression.
-        level_density = None
-
-        warper = _run_single_level(
-            warper=warper,
-            grid_size=grid_sz,
-            tgt_pts_n=tgt_pts_n,
-            src_pts_n=src_pts_n,
-            src_coast_n=src_coast_n,
-            tgt_coast_n=tgt_coast_n,
-            src_feat=src_feat,
-            tgt_feat_norm_const=tgt_feat_norm_const,
-            target_feat_size=target_feat_size,
-            src_shape=src_shape,
-            tgt_shape=tgt_shape,
-            output_res_m=output_res_m,
-            iters=level_iters,
-            lr=lr,
-            w_data=level_w_data,
-            w_chamfer=level_w_chamfer,
-            w_feat=w_feat,
-            w_arap=level_w_arap,
-            w_laplacian=level_w_laplacian,
-            w_disp=level_w_disp,
-            max_residual_norm=level_max_residual,
-            level_name=level_name,
-            gcp_weights=gcp_weights,
-            feat_mid=src_feat_mid_t,
-            tgt_feat_mid_norm=tgt_feat_mid_norm,
-            w_feat_mid=level_w_feat_mid,
-            huber_delta=level_huber,
-            gcp_density_map=level_density,
-        )
-
-        # Store total displacement for next level's initialisation
-        with torch.no_grad():
-            prev_displacement = warper.displacements.detach().clone()
-
-        # Fold check at each level
-        fold_frac = check_folds(warper, (H_t, W_t))
-        if fold_frac > 0.01:
-            print(
-                f"  [{level_name}] WARNING: {fold_frac*100:.1f}% folds — "
-                f"reverting to previous level", flush=True
-            )
+            # Store total displacement for next level's initialisation
             with torch.no_grad():
-                warper.residual.zero_()
-            prev_displacement = warper.displacements.detach().clone()
-        elif fold_frac > 0:
-            print(f"  [{level_name}] Fold check: {fold_frac*100:.2f}% (ok)", flush=True)
-        else:
-            print(f"  [{level_name}] Fold check: clean", flush=True)
+                prev_displacement = warper.displacements.detach().clone()
+
+            # Fold check at each level
+            fold_frac = check_folds(warper, (H_t, W_t))
+            if fold_frac > 0.01:
+                print(
+                    f"  [{level_name}] WARNING: {fold_frac*100:.1f}% folds — "
+                    f"reverting to previous level", flush=True
+                )
+                with torch.no_grad():
+                    warper.residual.zero_()
+                prev_displacement = warper.displacements.detach().clone()
+            elif fold_frac > 0:
+                print(f"  [{level_name}] Fold check: {fold_frac*100:.2f}% (ok)", flush=True)
+            else:
+                print(f"  [{level_name}] Fold check: clean", flush=True)
 
     # Final fold detection
     fold_frac = check_folds(warper, (H_t, W_t))

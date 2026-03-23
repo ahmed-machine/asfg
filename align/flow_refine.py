@@ -1,14 +1,13 @@
-"""Dense optical flow post-refinement using RAFT or DIS.
+"""Dense optical flow post-refinement: DIS primary, SEA-RAFT uncertainty supplement.
 
 After grid-based warping brings images within ~50-100m, dense optical flow
 gives pixel-level displacement corrections.  Forward-backward consistency
 checks reject unreliable flow in changed areas (water, clouds, new buildings).
 
-RAFT (torchvision) is preferred over DIS for cross-temporal satellite imagery:
-- Learned features handle radiometric/semantic differences between eras
-- Better accuracy on large displacements and texture-poor regions
-- Forward-backward consistency still used for reliability masking
-- Falls back to DIS if RAFT unavailable (no GPU, import failure, etc.)
+DIS (OpenCV) is the primary flow engine — fast, robust, no GPU required.
+SEA-RAFT provides supplementary per-pixel uncertainty estimates to reject
+self-consistent but unreliable flow in textureless regions.
+Falls back gracefully if SEA-RAFT is unavailable (no GPU, import failure, etc.).
 """
 
 import gc
@@ -20,71 +19,184 @@ import rasterio.transform
 import torch
 from rasterio.warp import reproject, Resampling
 
-from .constants import MAX_FLOW_BIAS_M as _DEFAULT_MAX_BIAS_M
+from . import constants as _C
 from .image import chunked_remap, to_u8_percentile
 
 # ---------------------------------------------------------------------------
-# RAFT (torchvision) — preferred flow estimator
+# SEA-RAFT (uncertainty supplement) → DIS (primary flow engine)
 # ---------------------------------------------------------------------------
 _RAFT_MODEL = None
 _RAFT_DEVICE = None
 _RAFT_AVAILABLE = None  # None = not yet checked
+_RAFT_IS_SEA = False     # True if model has MoL uncertainty (SEA-RAFT)
+
+
+class _SEARAFTWrapper:
+    """Wraps SEA-RAFT to match torchvision RAFT's call convention.
+
+    torchvision RAFT: model(img1, img2) -> list[Tensor(B,2,H,W)]
+      input: [0, 1] float
+    SEA-RAFT: model(img1, img2, iters=N, test_mode=True) -> dict
+      input: [0, 255] float (internally normalises to [-1,1])
+
+    Uncertainty output (mixture of Laplace, from SEA-RAFT paper):
+      info tensor is (B, 4, H, W):
+        channels [0:2] = mixing weights (alpha)
+        channels [2:4] = raw log-scale params (beta)
+      Heatmap = (log_b * softmax(weight)).sum(dim=1) — higher = more uncertain.
+    """
+
+    # SEA-RAFT(L) = M model with 12 iterations (paper recommendation for accuracy).
+    # Training uses 4 iters; 12 at inference gives best accuracy.
+    # Still faster than torchvision RAFT at comparable iteration counts.
+    _ITERS = 20
+    # Uncertainty clamping from official config (var_min=0, var_max=10)
+    _VAR_MAX = 10
+    _VAR_MIN = 0
+
+    def __init__(self, model):
+        self.model = model
+
+    def __call__(self, img1, img2):
+        # torchvision RAFT gets [0,1] input; SEA-RAFT expects [0,255]
+        out = self.model(img1 * 255.0, img2 * 255.0,
+                         iters=self._ITERS, test_mode=True)
+        return out['flow']  # list of (B, 2, H, W) predictions
+
+    def forward_with_uncertainty(self, img1, img2):
+        """Return (flow, uncertainty) where uncertainty is per-pixel scalar.
+
+        Uncertainty heatmap follows the official SEA-RAFT demo.py formula.
+        Higher values = more uncertain = less reliable flow.
+        """
+        out = self.model(img1 * 255.0, img2 * 255.0,
+                         iters=self._ITERS, test_mode=True)
+        flow = out['flow'][-1]       # (B, 2, H, W)
+        info = out['info'][-1]       # (B, 4, H, W)
+        # Compute uncertainty heatmap (from SEA-RAFT demo.py:70-77)
+        raw_b = info[:, 2:]
+        log_b = torch.zeros_like(raw_b)
+        weight = info[:, :2].softmax(dim=1)
+        log_b[:, 0] = torch.clamp(raw_b[:, 0], min=0, max=self._VAR_MAX)
+        log_b[:, 1] = torch.clamp(raw_b[:, 1], min=self._VAR_MIN, max=0)
+        uncertainty = (log_b * weight).sum(dim=1, keepdim=True)  # (B, 1, H, W)
+        return flow, uncertainty
+
+    def eval(self):
+        self.model.eval()
+        return self
+
+    def to(self, device):
+        self.model.to(device)
+        return self
+
+    def parameters(self):
+        return self.model.parameters()
+
+
+_SEA_RAFT_WEIGHT_FILE = "Tartan-C-T-TSKH432x960-M.pth"
+_SEA_RAFT_GDRIVE_ID = "1YLovlvUW94vciWvTyLf-p3uWscbOQRWW"  # Model Zoo folder
+
+
+def _download_sea_raft_weights() -> str:
+    """Get SEA-RAFT-Medium weights, downloading if needed.
+
+    Check order: local cache → huggingface_hub download → Google Drive.
+    """
+    import os
+
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "declass-process")
+    os.makedirs(cache_dir, exist_ok=True)
+    ckpt_path = os.path.join(cache_dir, "sea_raft_medium.pth")
+    if os.path.exists(ckpt_path):
+        return ckpt_path
+
+    # Try huggingface_hub (Yarimasune/SEA-RAFT mirrors the official weights)
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_path = hf_hub_download("Yarimasune/SEA-RAFT", _SEA_RAFT_WEIGHT_FILE)
+        # Symlink into our cache so future loads skip the HF lookup
+        os.symlink(hf_path, ckpt_path)
+        print(f"  [SEA-RAFT] Weights from HuggingFace cache", flush=True)
+        return ckpt_path
+    except Exception as e:
+        print(f"  [SEA-RAFT] HuggingFace download failed ({e}), trying Google Drive", flush=True)
+
+    # Fallback: Google Drive (official princeton-vl Model Zoo)
+    import urllib.request
+    url = (f"https://drive.google.com/uc?export=download"
+           f"&id={_SEA_RAFT_GDRIVE_ID}&confirm=t")
+    tmp_path = ckpt_path + ".tmp"
+    print(f"  [SEA-RAFT] Downloading weights from Google Drive...", flush=True)
+    urllib.request.urlretrieve(url, tmp_path)
+    os.replace(tmp_path, ckpt_path)
+    print(f"  [SEA-RAFT] Download complete ({os.path.getsize(ckpt_path) / 1e6:.1f} MB)", flush=True)
+    return ckpt_path
 
 
 def _get_raft_model():
-    """Load RAFT model singleton. Returns (model, device) or (None, None).
+    """Load SEA-RAFT singleton. Returns (model, device) or (None, None).
 
+    SEA-RAFT provides per-pixel uncertainty for supplementing DIS flow.
     Tries CUDA first, then MPS, skips CPU (too slow for production images).
     On MPS, does a small forward pass to verify operator support.
     """
-    global _RAFT_MODEL, _RAFT_DEVICE, _RAFT_AVAILABLE
+    global _RAFT_MODEL, _RAFT_DEVICE, _RAFT_AVAILABLE, _RAFT_IS_SEA
     if _RAFT_AVAILABLE is False:
         return None, None
     if _RAFT_MODEL is not None:
         return _RAFT_MODEL, _RAFT_DEVICE
+
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        print("  [Flow] Skipped (no GPU available, DIS fallback)", flush=True)
+        _RAFT_AVAILABLE = False
+        return None, None
+
+    gc.collect()
+    if device.type == 'mps':
+        torch.mps.empty_cache()
+    elif device.type == 'cuda':
+        torch.cuda.empty_cache()
+
     try:
-        from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+        from .sea_raft.raft import RAFT as SEARAFT
 
-        if torch.cuda.is_available():
-            device = torch.device('cuda')
-        elif torch.backends.mps.is_available():
-            device = torch.device('mps')
-        else:
-            print("  [RAFT] Skipped (no GPU available, DIS fallback)", flush=True)
-            _RAFT_AVAILABLE = False
-            return None, None
-
-        # Force garbage collection to free GPU memory from previous models
-        gc.collect()
-        if device.type == 'mps':
-            torch.mps.empty_cache()
-        elif device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-        print(f"  [RAFT] Loading RAFT-Large model on {device}...", flush=True)
-        model = raft_large(weights=Raft_Large_Weights.DEFAULT).to(device)
+        print(f"  [SEA-RAFT] Loading SEA-RAFT-M on {device}...", flush=True)
+        model = SEARAFT()  # uses built-in Medium defaults
+        ckpt_path = _download_sea_raft_weights()
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        # Strip "module." prefix if checkpoint was saved with DataParallel
+        if any(k.startswith("module.") for k in state_dict):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict, strict=False)
+        model = model.to(device)
         model.eval()
 
-        # Smoke test on MPS — some ops may not be supported
+        # Smoke test
         if device.type == 'mps':
             try:
                 dummy = torch.randn(1, 3, 128, 128, device=device)
                 with torch.no_grad():
-                    model(dummy, dummy)
-                print(f"  [RAFT] MPS smoke test passed", flush=True)
+                    model(dummy * 255, dummy * 255, iters=2, test_mode=True)
+                print(f"  [SEA-RAFT] MPS smoke test passed", flush=True)
             except Exception as e:
-                print(f"  [RAFT] MPS not supported ({e}), falling back to DIS", flush=True)
+                print(f"  [SEA-RAFT] MPS not supported ({e}), falling back to DIS", flush=True)
                 del model
-                _RAFT_AVAILABLE = False
-                return None, None
+                raise
 
-        _RAFT_MODEL = model
+        wrapped = _SEARAFTWrapper(model)
+        _RAFT_MODEL = wrapped
         _RAFT_DEVICE = device
         _RAFT_AVAILABLE = True
-        print(f"  [RAFT] Model ready on {device}", flush=True)
-        return model, device
+        _RAFT_IS_SEA = True
+        print(f"  [SEA-RAFT] Model ready on {device}", flush=True)
+        return wrapped, device
     except Exception as e:
-        print(f"  [RAFT] Not available ({e}), falling back to DIS", flush=True)
+        print(f"  [SEA-RAFT] Not available ({e}), falling back to DIS", flush=True)
         _RAFT_AVAILABLE = False
         return None, None
 
@@ -177,8 +289,8 @@ _RAFT_BATCH_SIZE = 4
 
 
 def _estimate_flow_raft(ref_gray: np.ndarray, warped_gray: np.ndarray,
-                        batch_size: int = _RAFT_BATCH_SIZE) -> np.ndarray:
-    """Compute dense optical flow using torchvision RAFT.
+                        batch_size: int | None = None) -> np.ndarray:
+    """Compute dense optical flow using best available RAFT model.
 
     Returns flow (H, W, 2) in pixels: flow[y, x] = (dx, dy).
     For large images, processes in overlapping tiles to manage GPU memory.
@@ -188,13 +300,19 @@ def _estimate_flow_raft(ref_gray: np.ndarray, warped_gray: np.ndarray,
     if model is None:
         return _estimate_flow_dis(ref_gray, warped_gray)
 
+    from . import constants as _C
+    tile_size = getattr(_C, 'SEA_RAFT_TILE_SIZE', _RAFT_TILE_SIZE)
+    overlap = _RAFT_TILE_OVERLAP
+    if batch_size is None:
+        batch_size = _RAFT_BATCH_SIZE
+
     h, w = ref_gray.shape[:2]
 
     if h < 128 or w < 128:
         return _estimate_flow_dis(ref_gray, warped_gray)
 
     # Small enough for a single forward pass
-    if h <= _RAFT_TILE_SIZE and w <= _RAFT_TILE_SIZE:
+    if h <= tile_size and w <= tile_size:
         try:
             return _raft_forward_single(model, device, ref_gray, warped_gray)
         except RuntimeError as e:
@@ -208,8 +326,6 @@ def _estimate_flow_raft(ref_gray: np.ndarray, warped_gray: np.ndarray,
             raise
 
     # Tile-based processing for large images
-    tile_size = _RAFT_TILE_SIZE
-    overlap = _RAFT_TILE_OVERLAP
     stride = tile_size - overlap
 
     flow_accum = np.zeros((h, w, 2), dtype=np.float64)
@@ -322,18 +438,101 @@ def _estimate_flow_dis(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndar
 
     Returns flow (H, W, 2) in pixels: flow[y, x] = (dx, dy).
     """
+    from . import constants as _C
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-    dis.setVariationalRefinementIterations(5)
+    dis.setVariationalRefinementIterations(getattr(_C, 'DIS_VARIATIONAL_ITERS', 5))
     flow = dis.calc(ref_gray, warped_gray, None)
     return flow
 
 
 def _estimate_flow(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray:
-    """Compute dense optical flow using best available method (RAFT > DIS)."""
-    model, _ = _get_raft_model()
-    if model is not None:
-        return _estimate_flow_raft(ref_gray, warped_gray)
+    """Compute dense optical flow using DIS (default — best for cross-temporal satellite)."""
     return _estimate_flow_dis(ref_gray, warped_gray)
+
+
+def _estimate_uncertainty_raft(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray | None:
+    """Estimate per-pixel flow uncertainty using SEA-RAFT.
+
+    Returns uncertainty heatmap (H, W) where higher = less reliable,
+    or None if SEA-RAFT is not the active model.
+
+    For large images (> 1024x1024), uses tiled inference with cosine blending
+    (same pattern as _estimate_flow_raft). Tiles are processed sequentially
+    (batch_size=1) since uncertainty is supplementary — speed not critical.
+    """
+    if not _RAFT_IS_SEA:
+        return None
+    model, device = _get_raft_model()
+    if model is None or not hasattr(model, 'forward_with_uncertainty'):
+        return None
+
+    h, w = ref_gray.shape[:2]
+    if h < 128 or w < 128:
+        return None
+
+    from . import constants as _C
+    tile_size = getattr(_C, 'SEA_RAFT_TILE_SIZE', _RAFT_TILE_SIZE)
+    overlap = _RAFT_TILE_OVERLAP
+
+    def _prepare(gray):
+        rgb = np.stack([gray, gray, gray], axis=0).astype(np.float32) / 255.0
+        return torch.from_numpy(rgb).unsqueeze(0).to(device)
+
+    def _uncertainty_single(ref_crop, warped_crop):
+        ch, cw = ref_crop.shape[:2]
+        pad_h = (8 - ch % 8) % 8
+        pad_w = (8 - cw % 8) % 8
+        if pad_h or pad_w:
+            ref_crop = np.pad(ref_crop, ((0, pad_h), (0, pad_w)), mode='reflect')
+            warped_crop = np.pad(warped_crop, ((0, pad_h), (0, pad_w)), mode='reflect')
+        with torch.no_grad():
+            _, unc = model.forward_with_uncertainty(
+                _prepare(ref_crop), _prepare(warped_crop))
+        unc_np = unc.squeeze().cpu().numpy()
+        return unc_np[:ch, :cw]
+
+    # Single pass for small images
+    if h <= tile_size and w <= tile_size:
+        try:
+            return _uncertainty_single(ref_gray, warped_gray)
+        except Exception:
+            return None
+
+    # Tiled inference for large images (same pattern as _estimate_flow_raft)
+    stride = tile_size - overlap
+    unc_accum = np.zeros((h, w), dtype=np.float64)
+    weight_accum = np.zeros((h, w), dtype=np.float64)
+
+    def _blend_1d(n, ovlp):
+        wt = np.ones(n, dtype=np.float64)
+        ramp = np.linspace(0, 1, ovlp)
+        wt[:ovlp] = ramp
+        wt[-ovlp:] = np.minimum(wt[-ovlp:], ramp[::-1])
+        return wt
+
+    tiles_y = max(1, (h - overlap + stride - 1) // stride)
+    tiles_x = max(1, (w - overlap + stride - 1) // stride)
+
+    try:
+        for ty in range(tiles_y):
+            for tx in range(tiles_x):
+                y0 = min(ty * stride, max(0, h - tile_size))
+                x0 = min(tx * stride, max(0, w - tile_size))
+                y1, x1 = min(y0 + tile_size, h), min(x0 + tile_size, w)
+                th, tw = y1 - y0, x1 - x0
+                tile_unc = _uncertainty_single(
+                    ref_gray[y0:y1, x0:x1], warped_gray[y0:y1, x0:x1])
+                wy = _blend_1d(th, min(overlap, th // 2))
+                wx = _blend_1d(tw, min(overlap, tw // 2))
+                tw2d = wy[:, None] * wx[None, :]
+                unc_accum[y0:y1, x0:x1] += tile_unc * tw2d
+                weight_accum[y0:y1, x0:x1] += tw2d
+    except Exception:
+        return None
+
+    mask = weight_accum > 0
+    unc_accum[mask] /= weight_accum[mask]
+    return unc_accum.astype(np.float32)
 
 
 def _forward_backward_mask(
@@ -342,13 +541,31 @@ def _forward_backward_mask(
     flow_fwd: np.ndarray,
     threshold_px: float = 3.0,
 ) -> np.ndarray:
-    """Compute forward-backward consistency mask.
+    """Compute forward-backward consistency mask, supplemented by SEA-RAFT uncertainty.
 
     Returns bool mask where True = reliable flow.
-    Uses the same flow estimator as the forward pass (RAFT or DIS).
+    When SEA-RAFT is active, pixels with high uncertainty are also marked unreliable
+    even if they pass the FB consistency check (catches self-consistent failures
+    in textureless regions).
     """
     _, _, err = _forward_backward_error(ref_gray, warped_gray, flow_fwd)
-    return err < threshold_px
+    fb_mask = err < threshold_px
+
+    # Supplement with SEA-RAFT uncertainty when available
+    uncertainty = _estimate_uncertainty_raft(ref_gray, warped_gray)
+    if uncertainty is not None:
+        # Adaptive threshold: median + 2*MAD (robust outlier detection)
+        med = np.median(uncertainty)
+        mad = np.median(np.abs(uncertainty - med))
+        unc_threshold = med + 2.0 * max(mad, 0.1)
+        unc_mask = uncertainty < unc_threshold
+        n_extra = int((fb_mask & ~unc_mask).sum())
+        if n_extra > 0:
+            print(f"    [SEA-RAFT] Uncertainty filter rejected {n_extra} additional pixels "
+                  f"(threshold={unc_threshold:.2f})", flush=True)
+        fb_mask = fb_mask & unc_mask
+
+    return fb_mask
 
 
 def _forward_backward_error(
@@ -385,6 +602,33 @@ def _forward_backward_error(
 # Shared flow post-processing helpers
 # ---------------------------------------------------------------------------
 
+def soft_zero_unreliable(
+    flow: np.ndarray,
+    reliable_mask: np.ndarray,
+    valid_mask: np.ndarray,
+    sigma: float = 12.0,
+) -> None:
+    """Replace unreliable flow with Gaussian-interpolated values from reliable regions.
+
+    Instead of hard-zeroing unreliable pixels (which creates tearing at the
+    boundary between corrected and uncorrected regions), this uses
+    Gaussian-weighted interpolation: pixels near reliable regions inherit a
+    smoothed version of their neighbours' flow; pixels far from any reliable
+    region decay toward zero.  Modifies *flow* in-place.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    combined = (reliable_mask & valid_mask).astype(np.float64)
+    weight = gaussian_filter(combined, sigma=sigma)
+
+    for c in range(2):
+        numerator = gaussian_filter(
+            flow[:, :, c].astype(np.float64) * combined, sigma=sigma)
+        flow[:, :, c] = (numerator / np.maximum(weight, 1e-8)).astype(np.float32)
+
+    flow[~valid_mask] = 0
+
+
 def clamp_flow_magnitude(flow: np.ndarray, max_m: float, res_m: float) -> np.ndarray:
     """Clamp flow vectors whose magnitude exceeds *max_m* metres.
 
@@ -406,7 +650,7 @@ def subtract_flow_bias(
     flow: np.ndarray,
     mask: np.ndarray,
     res_m: float,
-    max_bias_m: float = _DEFAULT_MAX_BIAS_M,
+    max_bias_m: float = None,
     label: str = "FlowRefine",
 ) -> None:
     """Subtract systematic median bias from *flow* using reliable *mask* pixels.
@@ -414,6 +658,8 @@ def subtract_flow_bias(
     Modifies *flow* in-place.  Only subtracts if per-axis bias exceeds 5 m,
     and caps the subtraction at *max_bias_m*.
     """
+    if max_bias_m is None:
+        max_bias_m = _C.MAX_FLOW_BIAS_M
     if not mask.any():
         return
     reliable_dx = flow[mask, 0]
@@ -434,116 +680,6 @@ def subtract_flow_bias(
             f" (capped to dx={capped_dx * res_m:+.1f}m, dy={capped_dy * res_m:+.1f}m)",
             flush=True,
         )
-
-
-def dense_flow_refinement(
-    ref_arr: np.ndarray,
-    warped_arr: np.ndarray,
-    map_x: np.ndarray,
-    map_y: np.ndarray,
-    output_res_m: float = 1.0,
-    work_res_m: float = 2.0,
-    max_correction_m: float = 50.0,
-    fb_threshold_px: float = 3.0,
-    median_kernel: int = 5,
-) -> tuple:
-    """Apply dense optical flow refinement to an existing remap field.
-
-    Parameters
-    ----------
-    ref_arr : (H, W) float32 reference image
-    warped_arr : (H, W) float32 already-warped source image
-    map_x, map_y : (H, W) float32 existing remap coordinates (source pixel coords)
-    output_res_m : pixel size of the output grid in metres
-    work_res_m : resolution for flow computation (lower = faster)
-    max_correction_m : clamp corrections beyond this (metres)
-    fb_threshold_px : forward-backward consistency threshold
-    median_kernel : median filter kernel for flow smoothing
-
-    Returns
-    -------
-    (map_x_refined, map_y_refined) : refined remap fields
-    """
-    h, w = ref_arr.shape[:2]
-
-    # Work at reduced resolution for speed
-    scale = output_res_m / work_res_m
-    if scale < 1.0:
-        work_h = max(64, int(h * scale))
-        work_w = max(64, int(w * scale))
-    else:
-        work_h, work_w = h, w
-        scale = 1.0
-
-    # Convert to uint8 for optical flow
-    ref_u8 = to_u8_percentile(ref_arr)
-    warped_u8 = to_u8_percentile(warped_arr)
-
-    if scale < 1.0:
-        ref_small = cv2.resize(ref_u8, (work_w, work_h), interpolation=cv2.INTER_AREA)
-        warped_small = cv2.resize(warped_u8, (work_w, work_h), interpolation=cv2.INTER_AREA)
-    else:
-        ref_small = ref_u8
-        warped_small = warped_u8
-
-    # Compute forward flow: ref → warped (tells us how to shift warped to match ref)
-    flow_fwd = _estimate_flow(ref_small, warped_small)
-
-    # Forward-backward consistency check
-    fb_mask = _forward_backward_mask(ref_small, warped_small, flow_fwd, fb_threshold_px)
-
-    # Median filter to smooth noise
-    if median_kernel > 1:
-        flow_fwd[:, :, 0] = cv2.medianBlur(flow_fwd[:, :, 0], median_kernel)
-        flow_fwd[:, :, 1] = cv2.medianBlur(flow_fwd[:, :, 1], median_kernel)
-
-    subtract_flow_bias(flow_fwd, fb_mask, work_res_m)
-
-    # Zero out unreliable flow
-    flow_fwd[~fb_mask] = 0
-
-    # Also zero where either image has no data
-    if scale < 1.0:
-        ref_valid = cv2.resize((ref_arr > 0).astype(np.uint8), (work_w, work_h),
-                               interpolation=cv2.INTER_NEAREST) > 0
-        warped_valid = cv2.resize((warped_arr > 0).astype(np.uint8), (work_w, work_h),
-                                  interpolation=cv2.INTER_NEAREST) > 0
-    else:
-        ref_valid = ref_arr > 0
-        warped_valid = warped_arr > 0
-    flow_fwd[~(ref_valid & warped_valid)] = 0
-
-    # Clamp corrections
-    flow_mag = clamp_flow_magnitude(flow_fwd, max_correction_m, work_res_m)
-
-    # Upsample flow to full resolution if needed
-    if scale < 1.0:
-        flow_full_x = cv2.resize(flow_fwd[:, :, 0], (w, h),
-                                  interpolation=cv2.INTER_LINEAR) / scale
-        flow_full_y = cv2.resize(flow_fwd[:, :, 1], (w, h),
-                                  interpolation=cv2.INTER_LINEAR) / scale
-    else:
-        flow_full_x = flow_fwd[:, :, 0]
-        flow_full_y = flow_fwd[:, :, 1]
-
-    # The flow tells us the shift from ref to warped. To correct the warped
-    # image, we adjust the source remap coordinates in the opposite direction.
-    # flow_fwd[y,x] = (dx, dy) means ref pixel (x,y) matches warped pixel (x+dx, y+dy).
-    # So the warped image needs to be shifted by -flow to align with ref.
-    # In remap space: adjust source coordinates by +flow (since we're pulling from source).
-    # But the scale differs: flow is in output pixels, map_x/map_y are in source pixels.
-    # The ratio is output_res_m / source_res_m ≈ 1 for same-resolution grids.
-    # Since the grid optimizer already matched resolutions, we apply flow directly.
-    map_x_refined = map_x + flow_full_x.astype(np.float32)
-    map_y_refined = map_y + flow_full_y.astype(np.float32)
-
-    reliable_pct = float(fb_mask.sum()) / max(1, fb_mask.size) * 100
-    mean_correction = float(np.mean(flow_mag[fb_mask])) * work_res_m if fb_mask.any() else 0.0
-    print(f"  [FlowRefine] {reliable_pct:.0f}% reliable pixels, "
-          f"mean correction {mean_correction:.1f}m, "
-          f"max correction {float(flow_mag.max()) * work_res_m:.1f}m", flush=True)
-
-    return map_x_refined, map_y_refined
 
 
 def apply_flow_refinement_to_file(
@@ -618,11 +754,9 @@ def apply_flow_refinement_to_file(
 
     subtract_flow_bias(flow_fwd, fb_mask, fr_work_res, label="FlowRefine-TPS")
 
-    flow_fwd[~fb_mask] = 0
-
-    # Zero where no data
     valid_mask_fr = (ref_arr_fr > 0) & (warped_arr_fr > 0)
-    flow_fwd[~valid_mask_fr] = 0
+    _soft_sigma = getattr(_C, 'FLOW_SOFT_SIGMA', 12.0)
+    soft_zero_unreliable(flow_fwd, fb_mask, valid_mask_fr, sigma=_soft_sigma)
 
     # Clamp corrections
     flow_mag = clamp_flow_magnitude(flow_fwd, max_correction_m, fr_work_res)
