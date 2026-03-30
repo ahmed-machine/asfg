@@ -12,6 +12,10 @@ from rasterio.warp import Resampling, reproject, transform, transform_bounds
 from . import constants as _C
 from .models import ModelCache, get_torch_device
 
+# Cached CRS singletons — avoids repeated parsing on every call.
+WGS84 = CRS.from_epsg(4326)
+WEB_MERCATOR = CRS.from_epsg(3857)
+
 
 def get_native_resolution_m(src, priors=None):
     """Compute the ground resolution of a rasterio dataset in meters.
@@ -101,8 +105,7 @@ def get_utm_crs_from_lonlat(lon, lat):
 def get_dataset_center_lonlat(src):
     """Return dataset center in EPSG:4326."""
 
-    wgs84 = CRS.from_epsg(4326)
-    left, bottom, right, top = transform_bounds(src.crs, wgs84, *src.bounds)
+    left, bottom, right, top = transform_bounds(src.crs, WGS84, *src.bounds)
     return (float((left + right) / 2.0), float((bottom + top) / 2.0))
 
 
@@ -189,9 +192,8 @@ def read_overlap_region(src, overlap_bounds, target_crs, target_res):
 
 def get_utm_crs(src_offset, src_ref):
     """Auto-detect the UTM CRS from the center of the overlap region."""
-    wgs84 = CRS.from_epsg(4326)
-    off_bounds = transform_bounds(src_offset.crs, wgs84, *src_offset.bounds)
-    ref_bounds = transform_bounds(src_ref.crs, wgs84, *src_ref.bounds)
+    off_bounds = transform_bounds(src_offset.crs, WGS84, *src_offset.bounds)
+    ref_bounds = transform_bounds(src_ref.crs, WGS84, *src_ref.bounds)
 
     left = max(off_bounds[0], ref_bounds[0])
     bottom = max(off_bounds[1], ref_bounds[1])
@@ -355,10 +357,28 @@ def generate_boundary_gcps(gcps, M_geo, img_width, img_height, spacing_px=500):
         return gx, gy
 
     edge_points = []
+    # Top edge
     for x in range(0, img_width, spacing_px): edge_points.append((float(x), 0.0))
+    if edge_points[-1][0] < img_width - 1:
+        edge_points.append((float(img_width - 1), 0.0))
+    # Bottom edge
+    bottom_start = len(edge_points)
     for x in range(0, img_width, spacing_px): edge_points.append((float(x), float(img_height - 1)))
+    if edge_points[-1][0] < img_width - 1:
+        edge_points.append((float(img_width - 1), float(img_height - 1)))
+    # Left edge
     for y in range(spacing_px, img_height - spacing_px, spacing_px): edge_points.append((0.0, float(y)))
+    if len(edge_points) > 0:
+        left_ys = [p[1] for p in edge_points if p[0] == 0.0]
+        if left_ys and max(left_ys) < img_height - 1 - spacing_px:
+            edge_points.append((0.0, float(img_height - 1)))
+    # Right edge
     for y in range(spacing_px, img_height - spacing_px, spacing_px): edge_points.append((float(img_width - 1), float(y)))
+    if len(edge_points) > 0:
+        right_ys = [p[1] for p in edge_points if p[0] == float(img_width - 1)]
+        if right_ys and max(right_ys) < img_height - 1 - spacing_px:
+            edge_points.append((float(img_width - 1), float(img_height - 1)))
+    # Ensure all four corners are included
     corners = [(0.0, 0.0), (float(img_width - 1), 0.0), (0.0, float(img_height - 1)), (float(img_width - 1), float(img_height - 1))]
     for c in corners:
         if c not in edge_points: edge_points.append(c)

@@ -249,11 +249,14 @@ def objective_grid_optim(trial, checkpoint_dir: str, args):
         state.matched_pairs = [m for m in state.matched_pairs if not m.is_anchor]
 
     feat_only = getattr(args, 'feat_only', False)
+    pixel_only = getattr(args, 'pixel_only', False)
+    lock_grid = feat_only or pixel_only
 
-    # --- Grid optim weights (fixed when --feat-only) ---
-    if feat_only:
-        from align.params import get_params as _gp
-        _bp = _gp().grid_optim
+    from align.params import get_params as _gp
+    _bp = _gp().grid_optim
+
+    # --- Grid optim weights (fixed when --feat-only or --pixel-only) ---
+    if lock_grid:
         w_data = _bp.w_data
         w_chamfer = _bp.w_chamfer
         w_arap = _bp.w_arap
@@ -287,13 +290,41 @@ def objective_grid_optim(trial, checkpoint_dir: str, args):
         l1_chamfer = trial.suggest_float("level1_chamfer_scale", 0.3, 1.0)
         l2_chamfer = trial.suggest_float("level2_chamfer_scale", 0.2, 0.8)
 
-    # --- DINOv3 feature loss params (always tuned when w_feat search is active) ---
-    w_feat = trial.suggest_float("w_feat", 0.001, 0.05, log=True)
-    feat_coverage_gate = trial.suggest_categorical("feat_coverage_gate", [True, False])
-    feat_scale_factor = trial.suggest_float("feat_scale_factor", 0.3, 2.0)
-    feat_mid_ratio = trial.suggest_float("feat_mid_ratio", 0.0, 0.5)
-    l1_feat = trial.suggest_float("level1_feat_scale", 0.5, 2.0)
-    l2_feat = trial.suggest_float("level2_feat_scale", 0.5, 3.0)
+    # --- DINOv3 feature loss params (skipped when --pixel-only) ---
+    if pixel_only:
+        w_feat = 0.0
+        feat_extract_res = _bp.feat_extract_res
+        feat_coverage_gate = _bp.feat_coverage_gate
+        feat_scale_factor = _bp.feat_scale_factor
+        feat_mid_ratio = _bp.feat_mid_ratio
+        feat_lncc_window = _bp.feat_lncc_window
+        l1_feat = _bp.level_w_feat_scale[1] if len(_bp.level_w_feat_scale) > 1 else 1.0
+        l2_feat = _bp.level_w_feat_scale[2] if len(_bp.level_w_feat_scale) > 2 else 1.0
+    else:
+        w_feat = trial.suggest_float("w_feat", 0.001, 0.05, log=True)
+        feat_extract_res = trial.suggest_float("feat_extract_res", 4.0, 12.0)
+        feat_coverage_gate = trial.suggest_categorical("feat_coverage_gate", [True, False])
+        feat_scale_factor = trial.suggest_float("feat_scale_factor", 0.3, 2.0)
+        feat_mid_ratio = trial.suggest_float("feat_mid_ratio", 0.0, 0.5)
+        feat_lncc_window = trial.suggest_int("feat_lncc_window", 5, 11, step=2)
+        l1_feat = trial.suggest_float("level1_feat_scale", 0.5, 2.0)
+        l2_feat = trial.suggest_float("level2_feat_scale", 0.5, 3.0)
+
+    # --- Pixel NCC params (swept when --pixel-only or full sweep) ---
+    if pixel_only or not feat_only:
+        w_pixel = trial.suggest_float("w_pixel", 1.0, 100.0, log=True)
+        pixel_ncc_res = trial.suggest_float("pixel_ncc_res", 2.0, 8.0)
+        pixel_ncc_window = trial.suggest_int("pixel_ncc_window", 5, 15, step=2)
+        pixel_ncc_cadence = trial.suggest_int("pixel_ncc_cadence", 1, 10)
+        l1_pixel = trial.suggest_float("level1_pixel_scale", 0.0, 1.0)
+        l2_pixel = trial.suggest_float("level2_pixel_scale", 0.5, 2.0)
+    else:
+        w_pixel = 0.0
+        pixel_ncc_res = _bp.pixel_ncc_res
+        pixel_ncc_window = _bp.pixel_ncc_window
+        pixel_ncc_cadence = _bp.pixel_ncc_cadence
+        l1_pixel = _bp.level_w_pixel_scale[1] if len(_bp.level_w_pixel_scale) > 1 else 0.5
+        l2_pixel = _bp.level_w_pixel_scale[2] if len(_bp.level_w_pixel_scale) > 2 else 1.0
 
     overrides = dict(
         grid_optim__w_data=w_data,
@@ -304,14 +335,21 @@ def objective_grid_optim(trial, checkpoint_dir: str, args):
         grid_optim__w_disp=w_disp,
         grid_optim__lr=lr,
         grid_optim__early_stop_threshold=early_stop,
+        grid_optim__feat_extract_res=feat_extract_res,
         grid_optim__feat_coverage_gate=feat_coverage_gate,
         grid_optim__feat_scale_factor=feat_scale_factor,
         grid_optim__feat_mid_ratio=feat_mid_ratio,
+        grid_optim__feat_lncc_window=feat_lncc_window,
         grid_optim__level_w_data_scale=[1.0, l1_data, l2_data],
         grid_optim__level_w_disp_scale=[1.0, l1_disp, l2_disp],
         grid_optim__level_reg_scale=[1.0, l1_reg, l2_reg],
         grid_optim__level_chamfer_scale=[1.0, l1_chamfer, l2_chamfer],
         grid_optim__level_w_feat_scale=[0.0, l1_feat, l2_feat],
+        grid_optim__w_pixel=w_pixel,
+        grid_optim__pixel_ncc_res=pixel_ncc_res,
+        grid_optim__pixel_ncc_window=pixel_ncc_window,
+        grid_optim__pixel_ncc_cadence=pixel_ncc_cadence,
+        grid_optim__level_w_pixel_scale=[0.0, l1_pixel, l2_pixel],
     )
 
     if args.fast_proxy:
@@ -417,8 +455,12 @@ def objective_flow(trial, checkpoint_dir: str, args):
         flow__median_kernel=median_k,
     )
 
+    grid_cache = os.path.join(checkpoint_dir, "grid_optim_cache.npz")
     with override(**overrides):
-        score = _run_warp_and_score(state, args, trial.number)
+        if os.path.exists(grid_cache):
+            score = _run_flow_and_score(state, args, trial.number, grid_cache)
+        else:
+            score = _run_warp_and_score(state, args, trial.number)
 
     return score
 
@@ -444,8 +486,12 @@ def objective_normalization(trial, checkpoint_dir: str, args):
         normalization__flow_percentile_hi=pct_hi,
     )
 
+    grid_cache = os.path.join(checkpoint_dir, "grid_optim_cache.npz")
     with override(**overrides):
-        score = _run_warp_and_score(state, args, trial.number)
+        if os.path.exists(grid_cache):
+            score = _run_flow_and_score(state, args, trial.number, grid_cache)
+        else:
+            score = _run_warp_and_score(state, args, trial.number)
 
     return score
 
@@ -507,35 +553,33 @@ def _run_coarse_and_score(state, args, trial_num: int) -> float:
 
             best_ncc = 0.0
             try:
-                src_off = rasterio.open(trial_state.current_input)
-                src_ref = rasterio.open(trial_state.reference_path)
-                for res in [_C.COARSE_RES, _C.REFINE_RES]:
-                    arr_off, _ = read_overlap_region(
-                        src_off, trial_state.overlap, trial_state.work_crs, res)
-                    arr_ref, _ = read_overlap_region(
-                        src_ref, trial_state.overlap, trial_state.work_crs, res)
-                    import cv2
-                    land_off = make_land_mask(arr_off)
-                    land_ref = make_land_mask(arr_ref)
-                    # Quick NCC on land masks
-                    if (land_ref.shape[0] > 20 and land_ref.shape[1] > 20 and
-                            land_off.shape[0] > land_ref.shape[0] and
-                            land_off.shape[1] > land_ref.shape[1]):
-                        # Use center crop as template
-                        h, w = land_ref.shape
-                        th = min(h // 2, int(_C.DEFAULT_TEMPLATE_RADIUS_M / res))
-                        tw = min(w // 2, int(_C.DEFAULT_TEMPLATE_RADIUS_M / res))
-                        cy, cx = h // 2, w // 2
-                        tpl = land_ref[max(0, cy-th):cy+th, max(0, cx-tw):cx+tw]
-                        if tpl.shape[0] >= 10 and tpl.shape[1] >= 10:
-                            result = cv2.matchTemplate(
-                                land_off.astype(np.float32),
-                                tpl.astype(np.float32),
-                                cv2.TM_CCOEFF_NORMED)
-                            _, max_val, _, _ = cv2.minMaxLoc(result)
-                            best_ncc = max(best_ncc, float(max_val))
-                src_off.close()
-                src_ref.close()
+                with rasterio.open(trial_state.current_input) as src_off, \
+                     rasterio.open(trial_state.reference_path) as src_ref:
+                    for res in [_C.COARSE_RES, _C.REFINE_RES]:
+                        arr_off, _ = read_overlap_region(
+                            src_off, trial_state.overlap, trial_state.work_crs, res)
+                        arr_ref, _ = read_overlap_region(
+                            src_ref, trial_state.overlap, trial_state.work_crs, res)
+                        import cv2
+                        land_off = make_land_mask(arr_off)
+                        land_ref = make_land_mask(arr_ref)
+                        # Quick NCC on land masks
+                        if (land_ref.shape[0] > 20 and land_ref.shape[1] > 20 and
+                                land_off.shape[0] > land_ref.shape[0] and
+                                land_off.shape[1] > land_ref.shape[1]):
+                            # Use center crop as template
+                            h, w = land_ref.shape
+                            th = min(h // 2, int(_C.DEFAULT_TEMPLATE_RADIUS_M / res))
+                            tw = min(w // 2, int(_C.DEFAULT_TEMPLATE_RADIUS_M / res))
+                            cy, cx = h // 2, w // 2
+                            tpl = land_ref[max(0, cy-th):cy+th, max(0, cx-tw):cx+tw]
+                            if tpl.shape[0] >= 10 and tpl.shape[1] >= 10:
+                                result = cv2.matchTemplate(
+                                    land_off.astype(np.float32),
+                                    tpl.astype(np.float32),
+                                    cv2.TM_CCOEFF_NORMED)
+                                _, max_val, _, _ = cv2.minMaxLoc(result)
+                                best_ncc = max(best_ncc, float(max_val))
             except Exception:
                 pass
 
@@ -620,6 +664,73 @@ def _run_warp_and_score(state, args, trial_num: int) -> float:
 
     try:
         trial_state = step_select_warp_and_apply(trial_state, profiler=_NullProfiler())
+        score = _clamp_score(_extract_score(trial_state, trial_dir))
+    except Exception as e:
+        print(f"  Trial {trial_num} FAILED: {e}")
+        traceback.print_exc()
+        score = 999.0
+    finally:
+        _cleanup_trial(trial_dir, keep_summary=True)
+        gc.collect()
+
+    return score
+
+
+def _run_flow_and_score(state, args, trial_num: int, grid_cache_path: str) -> float:
+    """Run flow+remap+QA from cached grid result (skips grid optim)."""
+    from align.warp import load_grid_optim_result, apply_warp_flow_and_remap
+    from align.qa import evaluate_alignment_quality_paths
+    from align.qa_runner import build_candidate_report, write_qa_report
+    from align.profiler import _NullProfiler
+
+    trial_state, trial_dir = _make_trial_state(state, args, trial_num)
+
+    try:
+        print(f"  [GridCache] Loading cached grid result...", flush=True)
+        grid_result = load_grid_optim_result(
+            grid_cache_path, input_path_override=trial_state.current_input)
+
+        apply_warp_flow_and_remap(
+            grid_result, trial_state.reference_path,
+            trial_state.output_path, profiler=_NullProfiler())
+
+        # Run QA (same as step_select_warp_and_apply)
+        qa_eval_res = max(2.0, min(6.0, max(state.offset_res_m, state.ref_res_m)))
+        qa_metrics = evaluate_alignment_quality_paths(
+            trial_state.output_path,
+            trial_state.reference_path,
+            trial_state.overlap,
+            trial_state.work_crs,
+            eval_res=qa_eval_res,
+            mask_mode=trial_state.mask_provider,
+        )
+        if qa_metrics is not None:
+            from align.pipeline import _qa_label
+            print(f"  Grid warp QA: {_qa_label(qa_metrics)}", flush=True)
+
+        report = build_candidate_report(
+            "grid",
+            trial_state.output_path,
+            trial_state.reference_path,
+            trial_state.overlap,
+            trial_state.work_crs,
+            holdout_pairs=trial_state.qa_holdout_pairs,
+            M_geo=trial_state.M_geo,
+            coverage=trial_state.gcp_coverage,
+            cv_mean_m=trial_state.cv_mean,
+            hypothesis_id=trial_state.chosen_hypothesis.hypothesis_id if trial_state.chosen_hypothesis else "",
+            eval_res=qa_eval_res,
+            image_metrics=qa_metrics,
+        )
+        print(f"  Grid independent QA: total={report.total_score:.0f}, "
+              f"confidence={report.confidence:.2f}, accepted={report.accepted}")
+
+        # Write QA report
+        qa_path = os.path.join(trial_dir, "aligned_qa.json")
+        write_qa_report(qa_path, [report], selected_candidate="grid")
+        print(f"  QA report written to: {qa_path}")
+
+        trial_state.qa_reports = [report]
         score = _clamp_score(_extract_score(trial_state, trial_dir))
     except Exception as e:
         print(f"  Trial {trial_num} FAILED: {e}")
@@ -909,6 +1020,10 @@ def main():
                         help="Remove anchor GCPs from checkpoint (tune w_feat as replacement)")
     parser.add_argument("--feat-only", action="store_true",
                         help="Fix grid params at profile values, only sweep feat params")
+    parser.add_argument("--pixel-only", action="store_true",
+                        help="Fix grid params at profile values, only sweep pixel NCC params")
+    parser.add_argument("--build-grid-cache", action="store_true",
+                        help="Build grid optim cache for fast flow/normalization tuning")
     args = parser.parse_args()
 
     # Resolve case config (may update args.profile as side effect)
@@ -949,6 +1064,43 @@ def main():
         print(f"ERROR: Cannot load checkpoint {required_checkpoint}: {e}")
         print("Try rebuilding with --build-checkpoint --force-rebuild")
         sys.exit(1)
+
+    # Build grid optim cache for flow/normalization tuning
+    if args.build_grid_cache and args.phase in ("flow", "normalization"):
+        grid_cache_path = os.path.join(checkpoint_dir, "grid_optim_cache.npz")
+        print(f"\nBuilding grid optim cache...")
+        from align.checkpoint import load_checkpoint as _lc
+        from align.warp import apply_warp_grid_only, save_grid_optim_result
+        from align.pipeline import OUTPUT_CRS_EPSG
+        from rasterio.crs import CRS
+
+        cache_state = _lc(required_checkpoint, checkpoint_dir)
+        _ensure_model_cache(cache_state)
+        output_crs = CRS.from_epsg(OUTPUT_CRS_EPSG)
+        all_gcps = list(cache_state.gcps) + list(cache_state.boundary_gcps)
+
+        # Close model_cache before grid optim to free GPU memory
+        if cache_state.model_cache is not None:
+            cache_state.model_cache.close()
+            cache_state.model_cache = None
+
+        grid_result = apply_warp_grid_only(
+            cache_state.current_input,
+            cache_state.reference_path,
+            all_gcps,
+            cache_state.work_crs,
+            output_bounds=cache_state.overlap,
+            output_res=cache_state.offset_res_m,
+            output_crs=output_crs,
+        )
+        save_grid_optim_result(grid_result, grid_cache_path)
+        del grid_result, cache_state
+        gc.collect()
+        print(f"Grid optim cache ready: {grid_cache_path}\n")
+
+        if args.n_trials == 0:
+            print("--n-trials=0, exiting after cache build.")
+            sys.exit(0)
 
     # Create Optuna study
     db_path = os.path.join(study_dir, f"tune_{case_label}.db")

@@ -185,8 +185,27 @@ class USGSClient:
         if self.api_key:
             req.add_header("X-Auth-Token", self.api_key)
 
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                resp = urllib.request.urlopen(req, timeout=300)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 500 and attempt < max_retries - 1:
+                    wait = 30 * (attempt + 1)
+                    print(f"\n  Server error (500), retrying in {wait}s "
+                          f"(attempt {attempt + 2}/{max_retries})...",
+                          end="", flush=True)
+                    import time as _time
+                    _time.sleep(wait)
+                    req = urllib.request.Request(url)
+                    if self.api_key:
+                        req.add_header("X-Auth-Token", self.api_key)
+                    continue
+                raise
+
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with resp:
                 total = int(resp.headers.get("Content-Length", 0)) or filesize
                 downloaded = 0
                 chunk_size = 1024 * 1024  # 1MB chunks

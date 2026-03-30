@@ -33,6 +33,7 @@ class CoarseParams:
     search_margin_m: float = 300.0
     coarse_res: float = 15.0
     refine_res: float = 5.0
+    min_ncc: float = 0.3
 
 
 @dataclass
@@ -61,7 +62,6 @@ class ValidationParams:
     anchor_inlier_threshold: int = 6
     cv_refit_threshold_m: float = 40.0
     tin_tarr_thresh: float = 1.5
-    skip_fpp: bool = False
     mad_sigma: float = 2.5
     mad_sigma_scaled: float = 3.5  # used when needs_scale_rotation=True
 
@@ -75,22 +75,15 @@ class GridOptimParams:
     lr: float = 0.002
     w_data: float = 1.0
     w_chamfer: float = 0.30
-    w_feat: float = 0.0
     w_arap: float = 0.5
     w_laplacian: float = 0.2
     w_disp: float = 0.05
     max_residual_norm: float = 0.03
-    # DINOv3 feature loss tuning
-    feat_coverage_gate: bool = True     # False = feat loss active everywhere (land+stable)
-    feat_cadence: int = 10              # Evaluate feat loss every N iterations
-    feat_scale_factor: float = 1.0      # Multiplier on feat_scale_m
-    feat_mid_ratio: float = 0.3         # Mid-layer feat weight as fraction of w_feat
     # Per-level multiplicative scales (indexed by level_idx)
     level_w_data_scale: List[float] = field(default_factory=lambda: [1.0, 1.5, 2.0])
-    level_w_disp_scale: List[float] = field(default_factory=lambda: [1.0, 0.667, 0.5])
-    level_reg_scale: List[float] = field(default_factory=lambda: [1.0, 1.15, 1.30])
+    level_w_disp_scale: List[float] = field(default_factory=lambda: [1.0, 0.8, 0.7])
+    level_reg_scale: List[float] = field(default_factory=lambda: [1.0, 1.30, 1.50])
     level_chamfer_scale: List[float] = field(default_factory=lambda: [1.0, 0.667, 0.5])
-    level_w_feat_scale: List[float] = field(default_factory=lambda: [0.0, 1.0, 1.0])
 
 
 @dataclass
@@ -103,8 +96,10 @@ class FlowParams:
     max_correction_coarse_m: float = 75.0
     max_correction_fine_m: float = 30.0
     max_correction_combined_m: float = 100.0
-    median_kernel: int = 5
-
+    median_kernel: int = 3
+    bilateral_d: int = 9
+    bilateral_sigma_color: float = 3.0
+    bilateral_sigma_space: float = 5.0
 
 @dataclass
 class NormalizationParams:
@@ -113,6 +108,26 @@ class NormalizationParams:
     flow_joint_percentile: bool = True
     flow_percentile_lo: int = 1
     flow_percentile_hi: int = 99
+
+
+@dataclass
+class QaParams:
+    """QA scoring weights and acceptance thresholds."""
+    # Score formula weights
+    grid_weight: float = 0.55
+    patch_weight: float = 0.25
+    stable_boundary_weight: float = 18.0
+    shore_boundary_weight: float = 12.0
+    # Acceptance thresholds
+    accept_image_score_max: float = 140.0
+    accept_holdout_median_max: float = 90.0
+    accept_cv_mean_max: float = 90.0
+    accept_coverage_min: float = 0.10
+    # Quality grade thresholds (A/B/C/D)
+    grade_a_score: float = 40.0
+    grade_a_holdout: float = 30.0
+    grade_b_score: float = 80.0
+    grade_b_holdout: float = 60.0
 
 
 @dataclass
@@ -137,6 +152,7 @@ class AlignParams:
     grid_optim: GridOptimParams = field(default_factory=GridOptimParams)
     flow: FlowParams = field(default_factory=FlowParams)
     normalization: NormalizationParams = field(default_factory=NormalizationParams)
+    qa: QaParams = field(default_factory=QaParams)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +228,7 @@ def _dict_to_params(d: dict) -> AlignParams:
         "grid_optim": (GridOptimParams, "grid_optim"),
         "flow": (FlowParams, "flow"),
         "normalization": (NormalizationParams, "normalization"),
+        "qa": (QaParams, "qa"),
     }
     for section_key, (cls, attr_name) in section_map.items():
         if section_key in d and isinstance(d[section_key], dict):
@@ -245,6 +262,7 @@ def set_profile(name: str) -> AlignParams:
     """Load a profile and set it as the active singleton.  Returns it."""
     global _active
     _active = load_profile(name)
+    _sync_constants(_active)
     return _active
 
 
@@ -366,7 +384,6 @@ def _sync_constants(params: AlignParams) -> None:
     g["ANCHOR_INLIER_THRESHOLD"] = params.validation.anchor_inlier_threshold
     g["CV_REFIT_THRESHOLD_M"] = params.validation.cv_refit_threshold_m
     g["TIN_TARR_THRESH"] = params.validation.tin_tarr_thresh
-    g["SKIP_FPP"] = params.validation.skip_fpp
     g["MAD_SIGMA"] = params.validation.mad_sigma
     g["MAD_SIGMA_SCALED"] = params.validation.mad_sigma_scaled
 
@@ -386,6 +403,9 @@ def _sync_constants(params: AlignParams) -> None:
     g["MAX_CORRECTION_FINE_M"] = params.flow.max_correction_fine_m
     g["MAX_CORRECTION_COMBINED_M"] = params.flow.max_correction_combined_m
     g["FLOW_MEDIAN_KERNEL"] = params.flow.median_kernel
+    g["FLOW_BILATERAL_D"] = params.flow.bilateral_d
+    g["FLOW_BILATERAL_SIGMA_COLOR"] = params.flow.bilateral_sigma_color
+    g["FLOW_BILATERAL_SIGMA_SPACE"] = params.flow.bilateral_sigma_space
 
     # Normalization
     g["CLAHE_CLIP_LIMIT"] = params.normalization.clahe_clip_limit

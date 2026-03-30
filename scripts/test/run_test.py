@@ -339,6 +339,58 @@ def parse_log(log_text):
     return result
 
 
+def _run_ground_truth_eval(output_path):
+    """Run ground-truth evaluation if a GT reference is configured.
+
+    Checks data/local_paths.yaml for a 'ground_truths' section. Returns
+    a dict of GT metrics or None if no GT is configured/available.
+    """
+    try:
+        gt_config_path = PROJECT_ROOT / "data" / "local_paths.yaml"
+        if not gt_config_path.exists():
+            return None
+
+        import yaml
+        with open(gt_config_path) as f:
+            paths_cfg = yaml.safe_load(f) or {}
+
+        ground_truths = paths_cfg.get("ground_truths", {})
+        if not ground_truths:
+            return None
+
+        # Use the first configured GT (typically the primary test case)
+        gt_name = next(iter(ground_truths))
+        gt_path_raw = ground_truths[gt_name]
+        gt_path = os.path.expanduser(gt_path_raw)
+        if not os.path.exists(gt_path):
+            print(f"  GT reference not found: {gt_path}")
+            return None
+
+        from scripts.test.eval_ground_truth import evaluate_ground_truth
+        print(f"\n=== Ground-truth evaluation ({gt_name}) ===")
+        result = evaluate_ground_truth(
+            str(output_path), gt_path, eval_res=8.0)
+
+        if "error" in result:
+            print(f"  GT eval error: {result['error']}")
+            return None
+
+        # Return compact summary for summary.json
+        return {
+            "gt_name": gt_name,
+            "oracle_median_m": result.get("oracle_median_m"),
+            "oracle_mean_m": result.get("oracle_mean_m"),
+            "oracle_p90_m": result.get("oracle_p90_m"),
+            "oracle_patch_count": result.get("oracle_patch_count"),
+            "grid_median_m": result.get("grid", {}).get("grid_median_m"),
+            "coastal_median_m": result.get("coastal", {}).get("median_m"),
+            "inland_median_m": result.get("inland", {}).get("median_m"),
+        }
+    except Exception as e:
+        print(f"  GT evaluation failed: {e}")
+        return None
+
+
 def build_summary(version, run_dir, log_text, exit_code, wall_clock_s, qa_path):
     """Build the summary.json structure from parsed log and qa.json."""
     parsed = parse_log(log_text)
@@ -392,6 +444,10 @@ def build_summary(version, run_dir, log_text, exit_code, wall_clock_s, qa_path):
             "stable_iou": round(im.get("stable_iou", 0), 3),
             "shore_iou": round(im.get("shore_iou", 0), 3),
             "grid_score": round(im.get("grid_score", 0), 1) if im.get("grid_score") is not None else None,
+            "grid_coverage": im.get("grid_coverage"),
+            "quality_grade": report.get("quality_grade", "?"),
+            "stable_boundary_m": round(im["stable_boundary_m"], 1) if im.get("stable_boundary_m") is not None else None,
+            "shore_boundary_m": round(im["shore_boundary_m"], 1) if im.get("shore_boundary_m") is not None else None,
         }
         if im.get("grid"):
             s["grid"] = {
@@ -598,6 +654,12 @@ def run_pipeline(version, timeout):
     if exit_code != 0 and stderr_text.strip():
         # Add last 500 chars of stderr as error context
         summary["errors"].append(stderr_text.strip()[-500:])
+
+    # Ground-truth evaluation (if output exists and GT is configured)
+    if exit_code == 0 and output_path.exists():
+        gt_metrics = _run_ground_truth_eval(output_path)
+        if gt_metrics:
+            summary["ground_truth"] = gt_metrics
 
     summary_path.write_text(json.dumps(summary, indent=2))
 

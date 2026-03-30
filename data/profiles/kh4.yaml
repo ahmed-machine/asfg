@@ -5,14 +5,28 @@ meta:
   description: KH-4 Corona (1962-1972), higher film grain
   cameras: [KH-4, KH-4A, KH-4B]
 
+coarse:
+  min_ncc: 0.08
+  search_margin_m: 5000           # KH-4 USGS corners can be 20km+ off; need wide refinement window
+
+scale_rotation:
+  min_valid_frac: 0.15
+
 matching:
   roma_size: 784
-  roma_num_corresp: 400
+  roma_num_corresp: 800
   land_mask_frac_min: 0.20
+  ransac_reproj_threshold: 8.0
 
 grid_optim:
   w_data: 1.2
   w_chamfer: 0.20
+  max_residual_norm: 0.008
 
 normalization:
   clahe_clip_limit: 2.0
+
+qa:
+  accept_image_score_max: 180.0
+  accept_holdout_median_max: 120.0
+  accept_cv_mean_max: 120.0

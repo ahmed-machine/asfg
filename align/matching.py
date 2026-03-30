@@ -61,10 +61,16 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
     # Heuristic-only land mask for tile filtering + stability reweight:
     # decoupled from demotion rules D/E which shrink the mask and kill
     # tile coverage (220 → 45 tiles with coastal_obia).
-    land_mask = (build_semantic_masks(arr_ref, mode="heuristic").land > 0)
+    ref_heuristic_bundle = build_semantic_masks(arr_ref, mode="heuristic")
+    land_mask = (ref_heuristic_bundle.land > 0)
     off_land_mask = (build_semantic_masks(arr_off_shifted, mode="heuristic").land > 0)
     # Full semantic bundle still used for stable_mask / weight_map (tile scoring).
-    ref_bundle = build_semantic_masks(arr_ref, mode=mask_mode)
+    # When mask_mode is already "heuristic", reuse the bundle we just built.
+    if mask_mode == "heuristic":
+        ref_bundle = ref_heuristic_bundle
+    else:
+        ref_bundle = build_semantic_masks(arr_ref, mode=mask_mode)
+    del ref_heuristic_bundle
     stable_mask = (ref_bundle.stable > 0)
     weight_map = _weight_map_from_bundle(ref_bundle)
     del ref_bundle
@@ -95,6 +101,8 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
 
     all_matches = []
     batch_inputs = []
+    _tile_fail_count = [0]  # mutable container for nested function access
+    _tile_total_count = [0]
 
     def _collect_matches(correspondences, items):
         # correspondences is a dict from v2's match()
@@ -102,6 +110,7 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
 
         for i in range(len(items)):
             it = items[i]
+            _tile_total_count[0] += 1
             try:
                 # Build per-element preds dict for v2's sample()
                 preds_i = {k: v[i:i+1] if v is not None else None for k, v in preds.items()}
@@ -114,6 +123,7 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
                 else:
                     prec_trace = np.ones(len(m), dtype=np.float32)
             except Exception as e:
+                _tile_fail_count[0] += 1
                 print(f"    RoMa sample error: {e}")
                 continue
 
@@ -283,6 +293,13 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
             batch_inputs = []
             if len(all_matches) >= max_matches or i + 1 >= max_tiles: break
     if batch_inputs: _process_batch(batch_inputs)
+
+    # Warn if a significant fraction of tiles failed during sampling
+    if _tile_total_count[0] > 0 and _tile_fail_count[0] > 0:
+        fail_pct = 100.0 * _tile_fail_count[0] / _tile_total_count[0]
+        if fail_pct > 10.0:
+            print(f"    WARNING: {_tile_fail_count[0]}/{_tile_total_count[0]} tiles "
+                  f"({fail_pct:.0f}%) failed during RoMa sampling")
 
     # De-duplicate (spatial hash grid) and RANSAC
     if len(all_matches) > 1:

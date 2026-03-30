@@ -433,21 +433,62 @@ def _estimate_flow_raft(ref_gray: np.ndarray, warped_gray: np.ndarray,
     return flow_accum.astype(np.float32)
 
 
-def _estimate_flow_dis(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray:
+def _census_transform(gray: np.ndarray, kernel: int = 5) -> np.ndarray:
+    """Census transform: encode local structure as bit pattern, return as uint8.
+
+    Each pixel is compared to its neighbors in a kernel x kernel window.
+    The result encodes relative ordering (brighter/darker), making it invariant
+    to monotonic intensity changes — ideal for cross-temporal satellite imagery
+    where film stock, development, and scanning differ between eras.
+
+    Returns a uint8 image where each pixel encodes the census signature.
+    """
+    h, w = gray.shape
+    half = kernel // 2
+    # Use a subset of comparisons to fit in uint8 (8 neighbors)
+    offsets = [(-half, -half), (-half, 0), (-half, half),
+               (0, -half),                 (0, half),
+               (half, -half),  (half, 0),  (half, half)]
+    result = np.zeros((h, w), dtype=np.uint8)
+    padded = cv2.copyMakeBorder(gray, half, half, half, half, cv2.BORDER_REFLECT101)
+    center = padded[half:half+h, half:half+w].astype(np.int16)
+    for i, (dy, dx) in enumerate(offsets):
+        neighbor = padded[half+dy:half+dy+h, half+dx:half+dx+w].astype(np.int16)
+        result |= ((neighbor > center).astype(np.uint8) << i)
+    return result
+
+
+def _estimate_flow_dis(
+    ref_gray: np.ndarray,
+    warped_gray: np.ndarray,
+    initial_flow: np.ndarray | None = None,
+    use_census: bool = True,
+) -> np.ndarray:
     """Compute dense optical flow using OpenCV DIS (fast, no GPU needed).
+
+    If *use_census* is True, applies census transform preprocessing to both
+    images before DIS — provides robustness to nonlinear radiometric differences
+    between different satellite eras/sensors (Hafner et al., SSVM 2013).
 
     Returns flow (H, W, 2) in pixels: flow[y, x] = (dx, dy).
     """
     from . import constants as _C
+    if use_census:
+        ref_gray = _census_transform(ref_gray)
+        warped_gray = _census_transform(warped_gray)
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
     dis.setVariationalRefinementIterations(getattr(_C, 'DIS_VARIATIONAL_ITERS', 5))
-    flow = dis.calc(ref_gray, warped_gray, None)
+    flow = dis.calc(ref_gray, warped_gray, initial_flow)
     return flow
 
 
-def _estimate_flow(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray:
+def _estimate_flow(
+    ref_gray: np.ndarray,
+    warped_gray: np.ndarray,
+    initial_flow: np.ndarray | None = None,
+) -> np.ndarray:
     """Compute dense optical flow using DIS (default — best for cross-temporal satellite)."""
-    return _estimate_flow_dis(ref_gray, warped_gray)
+    return _estimate_flow_dis(ref_gray, warped_gray, initial_flow=initial_flow)
 
 
 def _estimate_uncertainty_raft(ref_gray: np.ndarray, warped_gray: np.ndarray) -> np.ndarray | None:
@@ -607,6 +648,7 @@ def soft_zero_unreliable(
     reliable_mask: np.ndarray,
     valid_mask: np.ndarray,
     sigma: float = 12.0,
+    suppress_mask: np.ndarray | None = None,
 ) -> None:
     """Replace unreliable flow with Gaussian-interpolated values from reliable regions.
 
@@ -615,10 +657,17 @@ def soft_zero_unreliable(
     Gaussian-weighted interpolation: pixels near reliable regions inherit a
     smoothed version of their neighbours' flow; pixels far from any reliable
     region decay toward zero.  Modifies *flow* in-place.
+
+    *suppress_mask*, if given, identifies cross-temporal change areas (piers,
+    reclaimed land) where flow should be forced to zero — the Gaussian
+    interpolation will not bleed reliable flow into these pixels.
     """
     from scipy.ndimage import gaussian_filter
 
-    combined = (reliable_mask & valid_mask).astype(np.float64)
+    # Exclude suppressed pixels (cross-temporal changes) from valid data so
+    # the Gaussian naturally decays to zero near them — no hard edge.
+    effective_valid = valid_mask if suppress_mask is None else (valid_mask & ~suppress_mask)
+    combined = (reliable_mask & effective_valid).astype(np.float64)
     weight = gaussian_filter(combined, sigma=sigma)
 
     for c in range(2):
@@ -626,7 +675,7 @@ def soft_zero_unreliable(
             flow[:, :, c].astype(np.float64) * combined, sigma=sigma)
         flow[:, :, c] = (numerator / np.maximum(weight, 1e-8)).astype(np.float32)
 
-    flow[~valid_mask] = 0
+    flow[~effective_valid] = 0
 
 
 def clamp_flow_magnitude(flow: np.ndarray, max_m: float, res_m: float) -> np.ndarray:
@@ -690,7 +739,7 @@ def apply_flow_refinement_to_file(
     output_res_m: float,
     max_correction_m: float = 50.0,
     fb_threshold_px: float = 3.0,
-    median_kernel: int = 5,
+    median_kernel: int = 3,
 ) -> bool:
     """Apply dense flow refinement to an already-warped GeoTIFF file in-place.
 
@@ -752,11 +801,26 @@ def apply_flow_refinement_to_file(
         flow_fwd[:, :, 0] = cv2.medianBlur(flow_fwd[:, :, 0], median_kernel)
         flow_fwd[:, :, 1] = cv2.medianBlur(flow_fwd[:, :, 1], median_kernel)
 
+    _bd = getattr(_C, 'FLOW_BILATERAL_D', 9)
+    if _bd > 0:
+        from cv2 import ximgproc
+        _sigma_color = getattr(_C, 'FLOW_BILATERAL_SIGMA_COLOR', 3.0)
+        _sigma_space = getattr(_C, 'FLOW_BILATERAL_SIGMA_SPACE', 5.0)
+        _joint_f32_fr = ref_u8_fr.astype(np.float32) / 255.0
+        flow_fwd[:, :, 0] = ximgproc.jointBilateralFilter(
+            joint=_joint_f32_fr, src=flow_fwd[:, :, 0], d=_bd, sigmaColor=_sigma_color, sigmaSpace=_sigma_space)
+        flow_fwd[:, :, 1] = ximgproc.jointBilateralFilter(
+            joint=_joint_f32_fr, src=flow_fwd[:, :, 1], d=_bd, sigmaColor=_sigma_color, sigmaSpace=_sigma_space)
+
     subtract_flow_bias(flow_fwd, fb_mask, fr_work_res, label="FlowRefine-TPS")
 
     valid_mask_fr = (ref_arr_fr > 0) & (warped_arr_fr > 0)
     _soft_sigma = getattr(_C, 'FLOW_SOFT_SIGMA', 12.0)
-    soft_zero_unreliable(flow_fwd, fb_mask, valid_mask_fr, sigma=_soft_sigma)
+    _chg = np.abs(ref_u8_fr.astype(np.int16) - warped_u8_fr.astype(np.int16))
+    _chg_thr = max(np.percentile(_chg[valid_mask_fr], 80) if valid_mask_fr.any() else 50, 30)
+    suppress = (~fb_mask) & (_chg > _chg_thr) & valid_mask_fr
+    soft_zero_unreliable(flow_fwd, fb_mask, valid_mask_fr, sigma=_soft_sigma,
+                         suppress_mask=suppress)
 
     # Clamp corrections
     flow_mag = clamp_flow_magnitude(flow_fwd, max_correction_m, fr_work_res)

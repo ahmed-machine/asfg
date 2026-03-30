@@ -3,4 +3,5 @@ inherits: _base
 meta:
   name: kh7
   description: KH-7 GAMBIT (1963-1967), high resolution surveillance
-  cameras: [KH-7]
+  cameras:
+  - KH-7

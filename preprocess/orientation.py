@@ -307,12 +307,22 @@ def detect_orientation_against_reference(image_path, corners, reference_path,
     # These map unrotated pixel positions to geographic corners as if the
     # image were captured at orientation R.  For 90/270 the GCP mapping is
     # the INVERSE of the corner rotation applied after actual image rotation.
-    candidates = [
-        (0,   corners),
-        (180, swap_corners_180(corners)),
-        (90,  rotate_corners_ccw90(corners)),
-        (270, rotate_corners_cw90(corners)),
-    ]
+    #
+    # For panoramic cameras (KH-4), the strip is always landscape —
+    # only 0° and 180° are valid orientations.
+    is_panoramic = img_w > img_h * 2  # clearly landscape strip
+    if is_panoramic:
+        candidates = [
+            (0,   corners),
+            (180, swap_corners_180(corners)),
+        ]
+    else:
+        candidates = [
+            (0,   corners),
+            (180, swap_corners_180(corners)),
+            (90,  rotate_corners_ccw90(corners)),
+            (270, rotate_corners_cw90(corners)),
+        ]
 
     # Target resolution in degrees (~target_res meters / 111km)
     target_deg = target_res / 111000.0

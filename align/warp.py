@@ -1,8 +1,11 @@
 """Grid-based DINOv3 optimization warping."""
 
 import gc
+import json
 import os
 import traceback
+from dataclasses import dataclass, field
+from typing import Any
 
 import cv2
 import numpy as np
@@ -21,9 +24,101 @@ from .flow_refine import (
     clamp_flow_magnitude,
     soft_zero_unreliable,
 )
-from .grid_optim import optimize_grid_hierarchical
+from .grid_optim import optimize_grid_hierarchical, GridWarper
 from .image import make_land_mask, to_u8, to_u8_percentile, to_u8_percentile_joint, chunked_remap
 from .types import GCP
+
+
+@dataclass
+class GridOptimResult:
+    """Cached output of grid optimization, input to flow+remap."""
+    warper: Any  # GridWarper
+    input_path: str
+    src_data: np.ndarray
+    src_w: int
+    src_h: int
+    out_w: int
+    out_h: int
+    out_transform: Any  # Affine
+    output_bounds: tuple
+    output_res: float
+    work_crs: Any
+    needs_reproject: bool
+    output_crs: Any = None
+    diagnostics_dir: str | None = None
+
+
+def save_grid_optim_result(result: GridOptimResult, path: str) -> None:
+    """Save GridOptimResult to disk (warper tensors + metadata JSON)."""
+    warper = result.warper
+    ab = warper.affine_baseline.detach().cpu().numpy()
+    res = warper.residual.detach().cpu().numpy()
+    np.savez_compressed(path, affine_baseline=ab, residual=res)
+
+    meta = {
+        "input_path": result.input_path,
+        "src_w": result.src_w,
+        "src_h": result.src_h,
+        "out_w": result.out_w,
+        "out_h": result.out_h,
+        "out_transform": list(result.out_transform)[:6],
+        "output_bounds": list(result.output_bounds),
+        "output_res": result.output_res,
+        "work_crs": str(result.work_crs),
+        "needs_reproject": result.needs_reproject,
+        "output_crs": str(result.output_crs) if result.output_crs else None,
+        "diagnostics_dir": result.diagnostics_dir,
+        "grid_size": list(ab.shape[2:]),  # [H, W]
+    }
+    json_path = path.replace(".npz", ".json")
+    with open(json_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"  [GridCache] Saved to {path} ({os.path.getsize(path) / 1024:.0f} KB)")
+
+
+def load_grid_optim_result(path: str, input_path_override: str | None = None) -> GridOptimResult:
+    """Load GridOptimResult from disk, re-reading source image from disk."""
+    from rasterio.crs import CRS
+
+    json_path = path.replace(".npz", ".json")
+    with open(json_path) as f:
+        meta = json.load(f)
+
+    data = np.load(path)
+    ab = torch.from_numpy(data["affine_baseline"])
+    res_tensor = torch.from_numpy(data["residual"])
+    grid_size = tuple(meta["grid_size"])
+
+    warper = GridWarper(grid_size=grid_size)
+    warper.set_affine_baseline(ab)
+    with torch.no_grad():
+        warper.residual.copy_(res_tensor)
+
+    input_path = input_path_override or meta["input_path"]
+    with rasterio.open(input_path) as ds:
+        src_data = ds.read(1).astype(np.float32)
+        src_w, src_h = ds.width, ds.height
+
+    out_transform = Affine(*meta["out_transform"])
+    work_crs = CRS.from_user_input(meta["work_crs"])
+    output_crs = CRS.from_user_input(meta["output_crs"]) if meta["output_crs"] else None
+
+    return GridOptimResult(
+        warper=warper,
+        input_path=input_path,
+        src_data=src_data,
+        src_w=src_w,
+        src_h=src_h,
+        out_w=meta["out_w"],
+        out_h=meta["out_h"],
+        out_transform=out_transform,
+        output_bounds=tuple(meta["output_bounds"]),
+        output_res=meta["output_res"],
+        work_crs=work_crs,
+        needs_reproject=meta["needs_reproject"],
+        output_crs=output_crs,
+        diagnostics_dir=meta.get("diagnostics_dir"),
+    )
 
 
 def _reproject_to_grid(src_ds, grid_transform, grid_w, grid_h, work_crs):
@@ -351,10 +446,22 @@ def _compute_flow_corrections(warper, reference_path, src_data, src_w, src_h,
         flow_c = _estimate_flow(ref_u8_c, warped_u8_c)
         fb_mask_c = _forward_backward_mask(ref_u8_c, warped_u8_c, flow_c, _C.FB_CONSISTENCY_PX)
 
-        _mk = getattr(_C, 'FLOW_MEDIAN_KERNEL', 5)
+        _mk = getattr(_C, 'FLOW_MEDIAN_KERNEL', 3)
         _mk = _mk if _mk % 2 == 1 else _mk + 1  # must be odd
-        flow_c[:, :, 0] = cv2.medianBlur(flow_c[:, :, 0], _mk)
-        flow_c[:, :, 1] = cv2.medianBlur(flow_c[:, :, 1], _mk)
+        if _mk > 1:
+            flow_c[:, :, 0] = cv2.medianBlur(flow_c[:, :, 0], _mk)
+            flow_c[:, :, 1] = cv2.medianBlur(flow_c[:, :, 1], _mk)
+
+        _bd = getattr(_C, 'FLOW_BILATERAL_D', 9)
+        if _bd > 0:
+            from cv2 import ximgproc
+            _sigma_color = getattr(_C, 'FLOW_BILATERAL_SIGMA_COLOR', 3.0)
+            _sigma_space = getattr(_C, 'FLOW_BILATERAL_SIGMA_SPACE', 5.0)
+            _joint_f32 = ref_u8_c.astype(np.float32) / 255.0
+            flow_c[:, :, 0] = ximgproc.jointBilateralFilter(
+                joint=_joint_f32, src=flow_c[:, :, 0], d=_bd, sigmaColor=_sigma_color, sigmaSpace=_sigma_space)
+            flow_c[:, :, 1] = ximgproc.jointBilateralFilter(
+                joint=_joint_f32, src=flow_c[:, :, 1], d=_bd, sigmaColor=_sigma_color, sigmaSpace=_sigma_space)
         valid_mask_c = (ref_arr_c > 0) & (warped_arr_c > 0)
         _soft_sigma = getattr(_C, 'FLOW_SOFT_SIGMA', 12.0)
         _coarse_sigma = _soft_sigma * (coarse_res / fr_work_res)
@@ -409,10 +516,22 @@ def _compute_flow_corrections(warper, reference_path, src_data, src_w, src_h,
     flow_fwd = _estimate_flow(ref_u8_fr, warped_u8_fr)
     fb_mask = _forward_backward_mask(ref_u8_fr, warped_u8_fr, flow_fwd, _C.FB_CONSISTENCY_PX)
 
-    _mk = getattr(_C, 'FLOW_MEDIAN_KERNEL', 5)
+    _mk = getattr(_C, 'FLOW_MEDIAN_KERNEL', 3)
     _mk = _mk if _mk % 2 == 1 else _mk + 1  # must be odd
-    flow_fwd[:, :, 0] = cv2.medianBlur(flow_fwd[:, :, 0], _mk)
-    flow_fwd[:, :, 1] = cv2.medianBlur(flow_fwd[:, :, 1], _mk)
+    if _mk > 1:
+        flow_fwd[:, :, 0] = cv2.medianBlur(flow_fwd[:, :, 0], _mk)
+        flow_fwd[:, :, 1] = cv2.medianBlur(flow_fwd[:, :, 1], _mk)
+
+    _bd = getattr(_C, 'FLOW_BILATERAL_D', 9)
+    if _bd > 0:
+        from cv2 import ximgproc
+        _sigma_color = getattr(_C, 'FLOW_BILATERAL_SIGMA_COLOR', 3.0)
+        _sigma_space = getattr(_C, 'FLOW_BILATERAL_SIGMA_SPACE', 5.0)
+        _joint_f32_fr = ref_u8_fr.astype(np.float32) / 255.0
+        flow_fwd[:, :, 0] = ximgproc.jointBilateralFilter(
+            joint=_joint_f32_fr, src=flow_fwd[:, :, 0], d=_bd, sigmaColor=_sigma_color, sigmaSpace=_sigma_space)
+        flow_fwd[:, :, 1] = ximgproc.jointBilateralFilter(
+            joint=_joint_f32_fr, src=flow_fwd[:, :, 1], d=_bd, sigmaColor=_sigma_color, sigmaSpace=_sigma_space)
 
     if fb_mask.any():
         reliable_dx = flow_fwd[fb_mask, 0]
@@ -429,11 +548,21 @@ def _compute_flow_corrections(warper, reference_path, src_data, src_w, src_h,
 
     valid_mask_fr = (ref_arr_fr > 0) & (warped_arr_fr > 0)
     _soft_sigma = getattr(_C, 'FLOW_SOFT_SIGMA', 12.0)
-    soft_zero_unreliable(flow_fwd, fb_mask, valid_mask_fr, sigma=_soft_sigma)
+    # Suppress flow in cross-temporal change areas (piers, reclaimed land):
+    # unreliable pixels with large ref-warped difference are real changes,
+    # not alignment errors — flow should be zero, not interpolated from neighbors.
+    _change = np.abs(ref_u8_fr.astype(np.int16) - warped_u8_fr.astype(np.int16))
+    _change_thr = np.percentile(_change[valid_mask_fr], 80) if valid_mask_fr.any() else 50
+    _change_thr = max(_change_thr, 30)  # floor to avoid suppressing everything
+    suppress = (~fb_mask) & (_change > _change_thr) & valid_mask_fr
+    soft_zero_unreliable(flow_fwd, fb_mask, valid_mask_fr, sigma=_soft_sigma,
+                         suppress_mask=suppress)
 
-    _fine_clamp_default = getattr(_C, 'MAX_CORRECTION_FINE_M', 30.0)
+    # Fine pass now captures the full correction (warm-started from coarse),
+    # so use the combined clamp when two-pass is active.
+    _combined_clamp = getattr(_C, 'MAX_CORRECTION_COMBINED_M', 100.0)
     _coarse_clamp_default = getattr(_C, 'MAX_CORRECTION_COARSE_M', 75.0)
-    fine_clamp_m = _fine_clamp_default if do_two_pass else _coarse_clamp_default
+    fine_clamp_m = _combined_clamp if do_two_pass else _coarse_clamp_default
     flow_mag = clamp_flow_magnitude(flow_fwd, fine_clamp_m, fr_work_res)
 
     reliable_pct = float(fb_mask.sum()) / max(1, fb_mask.size) * 100
@@ -465,10 +594,20 @@ def _compute_flow_corrections(warper, reference_path, src_data, src_w, src_h,
         fb_mask_dis = fb_err < _C.FB_CONSISTENCY_PX
         dis_pct = float(fb_mask_dis.sum()) / max(1, fb_mask_dis.size) * 100
         if dis_pct >= 10.0:
-            flow_dis[:, :, 0] = cv2.medianBlur(flow_dis[:, :, 0], 5)
-            flow_dis[:, :, 1] = cv2.medianBlur(flow_dis[:, :, 1], 5)
+            if _mk > 1:
+                flow_dis[:, :, 0] = cv2.medianBlur(flow_dis[:, :, 0], _mk)
+                flow_dis[:, :, 1] = cv2.medianBlur(flow_dis[:, :, 1], _mk)
+            
+            if _bd > 0:
+                from cv2 import ximgproc
+                _joint_f32_dis = ref_u8_fr.astype(np.float32) / 255.0
+                flow_dis[:, :, 0] = ximgproc.jointBilateralFilter(
+                    joint=_joint_f32_dis, src=flow_dis[:, :, 0], d=_bd, sigmaColor=_sigma_color, sigmaSpace=_sigma_space)
+                flow_dis[:, :, 1] = ximgproc.jointBilateralFilter(
+                    joint=_joint_f32_dis, src=flow_dis[:, :, 1], d=_bd, sigmaColor=_sigma_color, sigmaSpace=_sigma_space)
+
             soft_zero_unreliable(flow_dis, fb_mask_dis, valid_mask_fr,
-                                sigma=_soft_sigma)
+                                sigma=_soft_sigma, suppress_mask=suppress)
             clamp_flow_magnitude(flow_dis, fine_clamp_m, fr_work_res)
             flow_fwd = flow_dis
             dis_mean = float(np.mean(np.sqrt(
@@ -485,8 +624,9 @@ def _compute_flow_corrections(warper, reference_path, src_data, src_w, src_h,
     del ref_arr_fr, warped_arr_fr, ref_u8_fr, warped_u8_fr, fb_mask, valid_mask_fr
 
     # Combine coarse + fine flow
-    flow_total_x = flow_coarse_fine[:, :, 0] + flow_fwd[:, :, 0]
-    flow_total_y = flow_coarse_fine[:, :, 1] + flow_fwd[:, :, 1]
+    # Fine pass result IS the total flow (warm-started from coarse, no addition)
+    flow_total_x = flow_fwd[:, :, 0]
+    flow_total_y = flow_fwd[:, :, 1]
     del flow_coarse_fine, flow_fwd
 
     # Final clamp on combined flow
@@ -584,6 +724,141 @@ def _remap_and_write(write_path, warper, src_data, src_w, src_h, out_w, out_h,
     print(f"  {label.capitalize()} remap complete", flush=True)
 
 
+def apply_warp_grid_only(
+    input_path: str,
+    reference_path: str,
+    gcps: list[GCP],
+    work_crs,
+    output_bounds: tuple[float, float, float, float],
+    output_res: float,
+    output_crs=None,
+    grid_size: int = 20,
+    grid_iters: int = 300,
+    arap_weight: float = 1.0,
+    n_real_gcps_in: int | None = None,
+    match_weights: np.ndarray | None = None,
+    diagnostics_dir: str | None = None,
+    profiler=None,
+    model_cache=None,
+) -> GridOptimResult:
+    """Run grid optimization only (steps 1-4). Returns cached result for flow+remap."""
+    from .profiler import _NullProfiler
+    _p = profiler or _NullProfiler()
+
+    needs_reproject = (output_crs is not None and str(output_crs) != str(work_crs))
+
+    left, bottom, right, top = output_bounds
+    out_w = int(round((right - left) / output_res))
+    out_h = int(round((top - bottom) / output_res))
+    out_transform: Affine = rasterio.transform.from_bounds(left, bottom, right, top, out_w, out_h) # type: ignore
+    print(f"  Target grid: {out_w} x {out_h} px at {output_res:.2f} m/px", flush=True)
+
+    with _p.section("load_target_features"):
+        target_coast, target_img_rgb, target_u8_coast, coast_scale_t = \
+            _load_target_features(reference_path, out_transform, out_w, out_h, work_crs)
+
+    with _p.section("load_source_features"):
+        src_data, src_w, src_h, source_coast, src_img_rgb, src_u8_coast, coast_scale_s = \
+            _load_source_features(input_path)
+
+    with _p.section("prepare_gcps"):
+        source_pts, target_pts, n_real_gcps, match_weights = _prepare_gcps(
+            gcps, out_transform, out_w, out_h, src_w, src_h, n_real_gcps_in,
+            match_weights_in=match_weights)
+
+    with _p.section("reclamation_mask"):
+        reclamation_mask = _compute_reclamation_mask(
+            target_u8_coast, src_u8_coast, coast_scale_t, coast_scale_s, output_res)
+
+    with _p.section("grid_optim"):
+        warper = optimize_grid_hierarchical(
+            source_img=src_img_rgb,
+            target_img=target_img_rgb,
+            source_pts=source_pts,
+            target_pts=target_pts,
+            source_coast=source_coast,
+            target_coast=target_coast,
+            src_shape=(src_h, src_w),
+            tgt_shape=(out_h, out_w),
+            output_res_m=output_res,
+            levels=_C.DEFAULT_PYRAMID_LEVELS,
+            w_arap=arap_weight,
+            reclamation_mask_tgt=reclamation_mask,
+            n_real_gcps=n_real_gcps,
+            match_weights=match_weights,
+            diagnostics_dir=diagnostics_dir,
+            profiler=_p,
+        )
+
+    return GridOptimResult(
+        warper=warper,
+        input_path=input_path,
+        src_data=src_data,
+        src_w=src_w,
+        src_h=src_h,
+        out_w=out_w,
+        out_h=out_h,
+        out_transform=out_transform,
+        output_bounds=output_bounds,
+        output_res=output_res,
+        work_crs=work_crs,
+        needs_reproject=needs_reproject,
+        output_crs=output_crs,
+        diagnostics_dir=diagnostics_dir,
+    )
+
+
+def apply_warp_flow_and_remap(
+    grid_result: GridOptimResult,
+    reference_path: str,
+    output_path: str,
+    profiler=None,
+) -> str:
+    """Run flow refinement + remap from cached grid result (steps 5-7)."""
+    from .profiler import _NullProfiler
+    _p = profiler or _NullProfiler()
+
+    write_path = output_path + ".grid_tmp.tif" if grid_result.needs_reproject else output_path
+    if os.path.exists(write_path):
+        os.remove(write_path)
+
+    warper = grid_result.warper
+    src_data = grid_result.src_data
+    src_w, src_h = grid_result.src_w, grid_result.src_h
+    out_w, out_h = grid_result.out_w, grid_result.out_h
+    output_bounds = grid_result.output_bounds
+    output_res = grid_result.output_res
+    work_crs = grid_result.work_crs
+
+    flow_x_full = None
+    flow_y_full = None
+    with _p.section("flow_corrections"):
+        try:
+            print("  [FlowRefine] Starting dense optical flow post-refinement (coarse-to-fine)...", flush=True)
+            flow_x_full, flow_y_full = _compute_flow_corrections(
+                warper, reference_path, src_data, src_w, src_h,
+                output_bounds, output_res, out_w, out_h, work_crs)
+        except Exception as e:
+            traceback.print_exc()
+            print(f"  [FlowRefine] WARNING: Flow refinement failed ({e}), "
+                  f"keeping grid-only result", flush=True)
+            flow_x_full = None
+            flow_y_full = None
+
+    with _p.section("remap_write"):
+        _remap_and_write(write_path, warper, src_data, src_w, src_h, out_w, out_h,
+                         work_crs, grid_result.out_transform, flow_x_full, flow_y_full)
+
+    if flow_x_full is not None:
+        del flow_x_full, flow_y_full
+    gc.collect()
+
+    if grid_result.needs_reproject:
+        _reproject_to_output_crs(write_path, output_path, grid_result.output_crs)
+
+    return output_path
+
+
 def apply_warp(
     input_path: str,
     output_path: str,
@@ -609,104 +884,12 @@ def apply_warp(
     output_crs: final output CRS (default: same as work_crs). If different,
                 warps to work_crs first, then reprojects to output_crs.
     """
-    from .profiler import _NullProfiler
-    _p = profiler or _NullProfiler()
-
-    needs_reproject = (output_crs is not None and str(output_crs) != str(work_crs))
-    write_path = output_path + ".grid_tmp.tif" if needs_reproject else output_path
-
-    if os.path.exists(write_path):
-        os.remove(write_path)
-
-    left, bottom, right, top = output_bounds
-    out_w = int(round((right - left) / output_res))
-    out_h = int(round((top - bottom) / output_res))
-    out_transform: Affine = rasterio.transform.from_bounds(left, bottom, right, top, out_w, out_h) # type: ignore
-    print(f"  Target grid: {out_w} x {out_h} px at {output_res:.2f} m/px", flush=True)
-
-    # 1. Load target and source features
-    with _p.section("load_target_features"):
-        target_coast, target_img_rgb, target_u8_coast, coast_scale_t = \
-            _load_target_features(reference_path, out_transform, out_w, out_h, work_crs)
-
-    with _p.section("load_source_features"):
-        src_data, src_w, src_h, source_coast, src_img_rgb, src_u8_coast, coast_scale_s = \
-            _load_source_features(input_path)
-
-    # 2. Prepare GCPs (real + virtual boundary)
-    with _p.section("prepare_gcps"):
-        source_pts, target_pts, n_real_gcps, match_weights = _prepare_gcps(
-            gcps, out_transform, out_w, out_h, src_w, src_h, n_real_gcps_in,
-            match_weights_in=match_weights)
-
-    # 3. Compute reclamation mask
-    with _p.section("reclamation_mask"):
-        reclamation_mask = _compute_reclamation_mask(
-            target_u8_coast, src_u8_coast, coast_scale_t, coast_scale_s, output_res)
-
-    # 4. Run grid optimizer
-    # Build stable identity strings for feature caching.
-    tgt_identity = f"{reference_path}:{out_w}x{out_h}"
-    src_mtime = os.path.getmtime(input_path)
-    src_identity = f"{input_path}:{src_w}x{src_h}:{src_mtime}"
-
-    src_feat_precomputed = None
-    tgt_feat_precomputed = None
-    w_feat = float(os.environ.get('W_FEAT', '0.0'))  # DINOv3 feature loss weight (env override: W_FEAT=0.05)
-
-    with _p.section("grid_optim"):
-        warper = optimize_grid_hierarchical(
-            source_img=src_img_rgb,
-            target_img=target_img_rgb,
-            source_pts=source_pts,
-            target_pts=target_pts,
-            source_coast=source_coast,
-            target_coast=target_coast,
-            src_shape=(src_h, src_w),
-            tgt_shape=(out_h, out_w),
-            output_res_m=output_res,
-            levels=_C.DEFAULT_PYRAMID_LEVELS,
-            w_arap=arap_weight,
-            w_feat=w_feat,
-            reclamation_mask_tgt=reclamation_mask,
-            n_real_gcps=n_real_gcps,
-            match_weights=match_weights,
-            target_identity=tgt_identity,
-            source_identity=src_identity,
-            diagnostics_dir=diagnostics_dir,
-            profiler=_p,
-            src_feat_precomputed=src_feat_precomputed,
-            tgt_feat_precomputed=tgt_feat_precomputed,
-            feat_px_per_token_override=8.0 if src_feat_precomputed is not None else None,
-        )
-
-    # 5. Dense optical flow post-refinement
-    flow_x_full = None
-    flow_y_full = None
-    with _p.section("flow_corrections"):
-        try:
-            print("  [FlowRefine] Starting dense optical flow post-refinement (coarse-to-fine)...", flush=True)
-            flow_x_full, flow_y_full = _compute_flow_corrections(
-                warper, reference_path, src_data, src_w, src_h,
-                output_bounds, output_res, out_w, out_h, work_crs)
-        except Exception as e:
-            traceback.print_exc()
-            print(f"  [FlowRefine] WARNING: Flow refinement failed ({e}), "
-                  f"keeping grid-only result", flush=True)
-            flow_x_full = None
-            flow_y_full = None
-
-    # 6. Single-pass remap to disk
-    with _p.section("remap_write"):
-        _remap_and_write(write_path, warper, src_data, src_w, src_h, out_w, out_h,
-                         work_crs, out_transform, flow_x_full, flow_y_full)
-
-    if flow_x_full is not None:
-        del flow_x_full, flow_y_full
-    gc.collect()
-
-    # 7. Reproject to output CRS if needed
-    if needs_reproject:
-        _reproject_to_output_crs(write_path, output_path, output_crs)
-
-    return output_path
+    grid_result = apply_warp_grid_only(
+        input_path, reference_path, gcps, work_crs,
+        output_bounds, output_res, output_crs=output_crs,
+        grid_size=grid_size, grid_iters=grid_iters,
+        arap_weight=arap_weight, n_real_gcps_in=n_real_gcps_in,
+        match_weights=match_weights, diagnostics_dir=diagnostics_dir,
+        profiler=profiler, model_cache=model_cache,
+    )
+    return apply_warp_flow_and_remap(grid_result, reference_path, output_path, profiler=profiler)

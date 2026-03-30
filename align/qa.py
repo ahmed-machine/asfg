@@ -14,7 +14,9 @@ _QA_GRID_ROWS = 4
 _QA_GRID_COLS = 6
 _MIN_CELL_EDGE_PX = 20
 _MIN_CELL_PATCHES = 2
-_MIN_IOU_UNION_PX = 100
+_IOU_RAMP_LO = 50       # union pixels where IoU penalty starts ramping in
+_IOU_RAMP_HI = 200      # union pixels where IoU penalty reaches full weight
+_MAX_METRIC_M = 500.0   # cap for inf grid_score / patch_med (meters)
 
 
 def compute_shoreline_iou_and_median(ref_arr, test_arr, valid_mask, res_m):
@@ -31,7 +33,7 @@ def compute_shoreline_iou_and_median(ref_arr, test_arr, valid_mask, res_m):
     e_test = cv2.morphologyEx(m_test.astype(np.uint8), cv2.MORPH_GRADIENT, k) > 0
     common = e_ref | e_test
     if not np.any(common):
-        return iou, float("inf")
+        return iou, _MAX_METRIC_M
 
     d_ref = cv2.distanceTransform((~e_ref).astype(np.uint8), cv2.DIST_L2, 3)
     d_test = cv2.distanceTransform((~e_test).astype(np.uint8), cv2.DIST_L2, 3)
@@ -120,7 +122,7 @@ def compute_patch_residual_median(ref_arr, test_arr, valid_mask, res_m,
                 test_patches.append(b * local_win)
 
     if not ref_patches:
-        return {"median": float("inf"), "p90": float("inf"), "max": float("inf"), "count": 0}
+        return {"median": _MAX_METRIC_M, "p90": _MAX_METRIC_M, "max": _MAX_METRIC_M, "count": 0}
 
     # Batch phase correlation on GPU/MPS
     device = get_torch_device()
@@ -133,7 +135,7 @@ def compute_patch_residual_median(ref_arr, test_arr, valid_mask, res_m,
     mags = np.hypot(shifts[valid, 0], shifts[valid, 1]) * res_m
 
     if len(mags) == 0:
-        return {"median": float("inf"), "p90": float("inf"), "max": float("inf"), "count": 0}
+        return {"median": _MAX_METRIC_M, "p90": _MAX_METRIC_M, "max": _MAX_METRIC_M, "count": 0}
     return {
         "median": float(np.median(mags)),
         "p90": float(np.percentile(mags, 90)),
@@ -193,6 +195,98 @@ def _derive_legacy_from_grid(cells, n_cols):
     return west, center, east, north_shift
 
 
+def _compute_patch_grid_metrics(ref_arr, out_arr, valid_mask, eval_res,
+                                n_rows, n_cols, patch=128, stride=64,
+                                min_valid=0.5, min_resp=0.03):
+    """Per-grid-cell patch displacement via batched phase correlation.
+
+    Returns list of cell dicts with patch_med (meters) for each cell.
+    """
+    device = get_torch_device()
+    h, w = ref_arr.shape
+    row_h = h / n_rows
+    col_w = w / n_cols
+    win = np.outer(np.hanning(patch), np.hanning(patch)).astype(np.float32)
+    cells = []
+
+    for r in range(n_rows):
+        r0 = int(round(r * row_h))
+        r1 = int(round((r + 1) * row_h))
+        for c in range(n_cols):
+            c0 = int(round(c * col_w))
+            c1 = int(round((c + 1) * col_w))
+
+            cell_ref = ref_arr[r0:r1, c0:c1]
+            cell_out = out_arr[r0:r1, c0:c1]
+            cell_valid = valid_mask[r0:r1, c0:c1]
+            ch, cw = cell_ref.shape
+
+            ref_patches = []
+            out_patches = []
+            for pr0 in range(0, max(1, ch - patch + 1), stride):
+                pr1 = min(pr0 + patch, ch)
+                if pr1 - pr0 < patch:
+                    pr0 = max(0, pr1 - patch)
+                for pc0 in range(0, max(1, cw - patch + 1), stride):
+                    pc1 = min(pc0 + patch, cw)
+                    if pc1 - pc0 < patch:
+                        pc0 = max(0, pc1 - patch)
+                    if np.mean(cell_valid[pr0:pr1, pc0:pc1]) < min_valid:
+                        continue
+                    a = cell_ref[pr0:pr1, pc0:pc1].astype(np.float32)
+                    b = cell_out[pr0:pr1, pc0:pc1].astype(np.float32)
+                    if a.shape == win.shape:
+                        ref_patches.append(a * win)
+                        out_patches.append(b * win)
+
+            if len(ref_patches) < 2:
+                cells.append({"row": r, "col": c, "patch_med": None,
+                              "patch_count": len(ref_patches), "valid": False})
+                continue
+
+            ref_t = torch.from_numpy(np.stack(ref_patches)).to(device)
+            out_t = torch.from_numpy(np.stack(out_patches)).to(device)
+            with torch.no_grad():
+                shifts, _, vmask = _batch_phase_correlate(ref_t, out_t, min_resp)
+            mags = np.hypot(shifts[vmask, 0], shifts[vmask, 1]) * eval_res
+
+            if len(mags) < 2:
+                cells.append({"row": r, "col": c, "patch_med": None,
+                              "patch_count": int(len(mags)), "valid": False})
+                continue
+
+            cells.append({
+                "row": r, "col": c,
+                "patch_med": float(np.median(mags)),
+                "patch_count": int(len(mags)),
+                "valid": True,
+            })
+
+    return cells
+
+
+def _compute_boundary_distance(mask_ref, mask_out, valid_mask, eval_res):
+    """Compute median boundary distance (meters) between two binary masks.
+
+    Uses distance transforms on the mask boundaries. Returns the median
+    symmetric distance in meters, or None if no boundary pixels exist.
+    """
+    k = np.ones((3, 3), np.uint8)
+    edge_ref = cv2.morphologyEx(mask_ref.astype(np.uint8), cv2.MORPH_GRADIENT, k) > 0
+    edge_out = cv2.morphologyEx(mask_out.astype(np.uint8), cv2.MORPH_GRADIENT, k) > 0
+    edge_ref = edge_ref & valid_mask
+    edge_out = edge_out & valid_mask
+    common = edge_ref | edge_out
+
+    if not np.any(common):
+        return None
+
+    d_ref = cv2.distanceTransform((~edge_ref).astype(np.uint8), cv2.DIST_L2, 3)
+    d_out = cv2.distanceTransform((~edge_out).astype(np.uint8), cv2.DIST_L2, 3)
+    sym = 0.5 * (d_ref[common] + d_out[common]) * eval_res
+    return float(np.median(sym))
+
+
 def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0, mask_mode="coastal_obia"):
     """Compute grid-based shoreline drift and patch residual metrics."""
     bundle_ref = build_semantic_masks(ref_arr, mode=mask_mode)
@@ -226,7 +320,8 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
     if valid_count > 0:
         grid_score = float(np.mean([c["shoreline_med"] for c in valid_cells]))
     else:
-        grid_score = float("inf")
+        grid_score = _MAX_METRIC_M
+    grid_coverage = valid_count / total_count if total_count > 0 else 0.0
 
     # Derive legacy directional keys from grid
     west, center, east, north_shift = _derive_legacy_from_grid(cells, n_cols)
@@ -239,7 +334,7 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
     shore_union = int(np.sum(m_ref | m_out))
     shore_iou = float(np.sum(m_ref & m_out) / shore_union) if shore_union > 0 else 0.0
 
-    # Patch residual
+    # Patch residual (global)
     patch_result = compute_patch_residual_median(
         to_u8(ref_arr),
         to_u8(out_arr),
@@ -250,19 +345,48 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
     )
     patch_med = patch_result["median"]
 
+    # Per-cell patch displacement (Phase 3a: inland coverage)
+    patch_grid_cells = _compute_patch_grid_metrics(
+        to_u8(ref_arr), to_u8(out_arr),
+        valid_mask & (stable_ref | stable_out),
+        eval_res, n_rows, n_cols,
+    )
+    patch_grid_valid = [c for c in patch_grid_cells if c["valid"]]
+    patch_grid_coverage = len(patch_grid_valid) / len(patch_grid_cells) if patch_grid_cells else 0.0
+
+    # Boundary distance metrics (Phase 3b: replaces IoU as shift-sensitive)
+    stable_boundary_m = _compute_boundary_distance(stable_ref, stable_out, valid_mask, eval_res)
+    shore_boundary_m = _compute_boundary_distance(m_ref, m_out, valid_mask, eval_res)
+
     # No valid grid cells and no patches — nothing to score
     if valid_count == 0 and patch_result["count"] == 0:
         return None
 
-    # Score formula
-    grid_contrib = 0.55 * grid_score if valid_count > 0 else 0.0
-    patch_contrib = 0.25 * patch_med
+    # Score formula — weights shift toward patch_med when grid has low coverage
+    if grid_coverage >= 0.25:
+        grid_w, patch_w = 0.55, 0.25
+    elif grid_coverage > 0:
+        blend = grid_coverage / 0.25
+        grid_w = 0.55 * blend
+        patch_w = 0.25 + 0.55 * (1.0 - blend)
+    else:
+        grid_w, patch_w = 0.0, 0.80
 
-    # IoU penalties — drop when union is too small for meaningful comparison
-    stable_iou_penalty = 18.0 * (1.0 - stable_iou) if stable_union >= _MIN_IOU_UNION_PX else 0.0
-    shore_iou_penalty = 12.0 * (1.0 - shore_iou) if shore_union >= _MIN_IOU_UNION_PX else 0.0
+    grid_contrib = grid_w * grid_score
+    patch_contrib = patch_w * patch_med
 
-    score = grid_contrib + patch_contrib + stable_iou_penalty + shore_iou_penalty
+    # Boundary distance penalties (smooth ramp by union size)
+    def _boundary_penalty(weight, boundary_m, union_px):
+        if boundary_m is None:
+            return 0.0
+        ramp = float(np.clip((union_px - _IOU_RAMP_LO) / (_IOU_RAMP_HI - _IOU_RAMP_LO), 0.0, 1.0))
+        # Scale: 0m = 0 penalty, boundary_m feeds directly (capped at weight)
+        return min(weight, boundary_m * (weight / 50.0)) * ramp
+
+    stable_boundary_penalty = _boundary_penalty(18.0, stable_boundary_m, stable_union)
+    shore_boundary_penalty = _boundary_penalty(12.0, shore_boundary_m, shore_union)
+
+    score = grid_contrib + patch_contrib + stable_boundary_penalty + shore_boundary_penalty
 
     return {
         # Legacy keys (derived from grid cells for compat)
@@ -279,21 +403,36 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
             "total_count": total_count,
         },
         "grid_score": grid_score,
-        # Patch metrics (unchanged)
+        "grid_coverage": round(grid_coverage, 3),
+        # Patch metrics
         "patch_med": patch_med,
         "patch_p90": patch_result["p90"],
         "patch_max": patch_result["max"],
         "patch_count": patch_result["count"],
-        # IoU (unchanged)
+        # Per-cell patch grid (inland coverage)
+        "patch_grid": {
+            "cells": patch_grid_cells,
+            "valid_count": len(patch_grid_valid),
+            "total_count": len(patch_grid_cells),
+            "coverage": round(patch_grid_coverage, 3),
+            "median_m": float(np.mean([c["patch_med"] for c in patch_grid_valid]))
+                        if patch_grid_valid else None,
+        },
+        # IoU (kept for backward compat)
         "stable_iou": stable_iou,
         "shore_iou": shore_iou,
+        # Boundary distance (meters — shift-sensitive replacement for IoU)
+        "stable_boundary_m": stable_boundary_m,
+        "shore_boundary_m": shore_boundary_m,
         # Score
         "score": float(score),
         "score_breakdown": {
             "grid_contrib": round(float(grid_contrib), 2),
             "patch_contrib": round(float(patch_contrib), 2),
-            "stable_iou_penalty": round(float(stable_iou_penalty), 2),
-            "shore_iou_penalty": round(float(shore_iou_penalty), 2),
+            "stable_boundary_penalty": round(float(stable_boundary_penalty), 2),
+            "shore_boundary_penalty": round(float(shore_boundary_penalty), 2),
+            "grid_weight": round(grid_w, 3),
+            "patch_weight": round(patch_w, 3),
         },
     }
 

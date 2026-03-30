@@ -2,7 +2,7 @@
 
 Automated georectification pipeline for declassified Cold War-era reconnaissance satellite imagery acquired by the United States between 1959 and 1984. Given a scanned film frame (or multi-frame strip) and a modern georeferenced basemap, the pipeline estimates and corrects the spatial mapping between the historical image and the reference through a sequence of increasingly fine-grained registration stages. The output is a geometrically corrected GeoTIFF suitable for land-use analysis, climate, and historical research.
 
-The imagery comes from three declassification releases under [Executive Order 12951](https://en.wikipedia.org/wiki/Executive_Order_12951): [Declass-1](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-1) (1995, CORONA/ARGON/LANYARD 1960–1972), [Declass-2](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-2) (2002, KH-7/KH-9 1963–1980), and [Declass-3](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-3) (2011, remaining KH-7/KH-9 missions). About 5% of the 1.5M film frames in these datasets have been digitised and are available online via [USGS EarthExplorer](https://earthexplorer.usgs.gov/).
+The imagery comes from three declassification releases under [Executive Order 12951](https://www.govinfo.gov/content/pkg/FR-1995-02-28/pdf/95-5050.pdf): [Declass-1](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-1) (1995, CORONA/ARGON/LANYARD 1960–1972), [Declass-2](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-2) (2002, KH-7/KH-9 1963–1980), and [Declass-3](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-3) (2011, remaining KH-7/KH-9 missions). About 5% of the 1.5M film frames in these datasets have been digitised and are available online via [USGS EarthExplorer](https://earthexplorer.usgs.gov/).
 
 ![Feature matching between reference (left) and target KH-9 frame (right)](assets/feature-matching-example.jpg)
 
@@ -110,9 +110,10 @@ align/                  Alignment pipeline modules
 preprocess/             Preprocessing modules
   catalog.py              Camera system definitions, CSV parsing, scene/strip grouping
   usgs.py                 USGS M2M API client, download, archive extraction
-  georef.py               Rough georeferencing (corner GCPs) and Sentinel-2 reference fetch
+  asp.py                  ASP tool discovery for image_mosaic
+  georef.py               Rough georeferencing (corner GCPs), coarse-align-crop, Sentinel-2 fetch
   orientation.py          4-way rotation detection and verification
-  stitch.py               Multi-frame strip stitching (VRT-based)
+  stitch.py               Multi-frame strip stitching (ASP image_mosaic + VRT fallback)
   reseau.py               KH-9 réseau grid detection and film distortion correction
   mosaic.py               Strip assembly, seam blending, radiometric normalization
 data/profiles/          Camera-specific parameter profiles (YAML with inheritance)
@@ -129,6 +130,10 @@ numpy, opencv-python, rasterio, scipy, scikit-image, Pillow, torch, torchvision,
 
 `align/romav2/` (RoMa v2) and `align/sea_raft/` (SEA-RAFT) are vendored for reproducibility. A CUDA or Apple MPS GPU is recommended; CPU inference works but is substantially slower.
 
+### Optional: Ames Stereo Pipeline (ASP)
+
+[NASA Ames Stereo Pipeline](https://stereopipeline.readthedocs.io/) `image_mosaic` is used for sub-frame stitching of KH-4/7/9 scanner tiles when available. ASP is optional — when not installed, stitching falls back to the built-in VRT-based stitcher. Download from [ASP releases](https://github.com/NeoGeographyToolkit/StereoPipeline/releases).
+
 ## References
 
 1. Edstedt, J., Nordström, D., Zhang, Y., et al. (2025). RoMa v2: Harder Better Faster Denser Feature Matching. *arXiv:2511.15706*.
@@ -139,3 +144,4 @@ numpy, opencv-python, rasterio, scipy, scikit-image, Pillow, torch, torchvision,
 6. Guo, H., Liu, J., Yang, B., et al. (2022). Outlier removal and feature point pairs optimization for piecewise linear transformation in the co-registration of very high-resolution optical remote sensing imagery. *ISPRS J. Photogrammetry and Remote Sensing*.
 7. Lowe, D. G. (2004). Distinctive Image Features from Scale-Invariant Keypoints. *IJCV*, 60(2), 91–110.
 8. Donovan, M. et al. sPyMicMac: TPS-based réseau correction for KH-9 Hexagon imagery.
+9. Beyer, R. A., Alexandrov, O., & McMichael, S. (2018). The Ames Stereo Pipeline: NASA's Open Source Software for Deriving and Processing Terrain Data. *Earth and Space Science*, 5(9), 537–548. https://doi.org/10.1029/2018EA000409. (image_mosaic sub-frame stitching)

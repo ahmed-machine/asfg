@@ -13,10 +13,11 @@ import cv2
 import numpy as np
 import rasterio
 import rasterio.transform
-from rasterio.crs import CRS
 from rasterio.warp import transform as transform_coords
 
 import torch
+
+from .geo import WGS84
 
 from . import constants as _C
 from .geo import get_torch_device, fit_affine_from_gcps
@@ -425,7 +426,7 @@ def _prepare_single_anchor(anchor, arr_ref, arr_off_shifted, h_img, w_img,
     else:
         anchor_patch_half = patch_half
 
-    work_xy = transform_coords(CRS.from_epsg(4326), work_crs, [lon], [lat])
+    work_xy = transform_coords(WGS84, work_crs, [lon], [lat])
     anchor_x, anchor_y = work_xy[0][0], work_xy[1][0]
 
     if not (overlap[0] <= anchor_x <= overlap[2] and
@@ -620,6 +621,70 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
         for fut in as_completed(futures):
             prep_results[futures[fut]] = fut.result()
 
+    # Phase 1.5: Use pre-search offsets to estimate residual affine correction.
+    # When the rough georef has significant rotation/translation error, the
+    # pre-search NCC matches across many anchors encode this error as a
+    # spatial field of displacement vectors.  Fitting a rigid transform
+    # (translation + rotation) to these vectors and applying it to the offset
+    # adjustments improves fine matching success rate.
+    _presearch_global_offset = None  # (dE_m, dN_m) if rigid fit succeeds
+    presearch_pts = []  # (ref_row, ref_col, off_row_adj, off_col_adj, ncc)
+    for prep in prep_results:
+        if prep is None or prep["status"] != "ready":
+            continue
+        ncc = prep.get("presearch_ncc", 0.0)
+        if ncc >= 0.25 and (abs(prep["off_row_adj"]) > 0 or abs(prep["off_col_adj"]) > 0):
+            presearch_pts.append((
+                prep["ref_row"], prep["ref_col"],
+                prep["off_row_adj"], prep["off_col_adj"], ncc))
+
+    if len(presearch_pts) >= 4:
+        # Fit a rigid transform (translation + rotation) from the pre-search
+        # offsets.  Each pre-search result gives a displacement vector at a
+        # known image position — together these encode residual affine error.
+        pts = np.array(presearch_pts)
+        weights = pts[:, 4]  # NCC as weight
+        ref_rows, ref_cols = pts[:, 0], pts[:, 1]
+        d_rows, d_cols = pts[:, 2], pts[:, 3]
+
+        # Source = reference positions, dst = where they matched in offset
+        src_pts = np.column_stack([ref_cols, ref_rows]).astype(np.float32)
+        dst_pts = np.column_stack([ref_cols + d_cols, ref_rows + d_rows]).astype(np.float32)
+
+        # Fit similarity transform (translation + rotation + uniform scale)
+        # using cv2.estimateAffinePartial2D with RANSAC for robustness
+        M, inliers = cv2.estimateAffinePartial2D(
+            src_pts, dst_pts, method=cv2.RANSAC,
+            ransacReprojThreshold=max(200 / fine_res, 20.0),
+            confidence=0.90)
+
+        if M is None or inliers is None:
+            print(f"  [Anchor presearch] Rigid fit failed ({len(presearch_pts)} points)", flush=True)
+        if M is not None and inliers is not None:
+            n_inliers = int(inliers.sum())
+            # Extract translation, rotation, scale from the 2x3 matrix
+            tx, ty = M[0, 2], M[1, 2]
+            angle = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
+            scale = np.sqrt(M[0, 0]**2 + M[1, 0]**2)
+            shift_m = np.sqrt((tx * fine_res)**2 + (ty * fine_res)**2)
+
+            if shift_m > 5 and n_inliers >= 3:
+                _presearch_global_offset = (float(tx * fine_res), float(ty * fine_res))
+                print(f"  [Anchor presearch] Rigid fit from {n_inliers}/{len(presearch_pts)} anchors: "
+                      f"dE={tx*fine_res:.0f}m, dN={ty*fine_res:.0f}m, "
+                      f"rot={angle:.2f}°, scale={scale:.4f}", flush=True)
+
+                # Apply per-anchor correction using the fitted transform
+                for prep in prep_results:
+                    if prep is not None and prep["status"] == "ready":
+                        r, c = prep["ref_row"], prep["ref_col"]
+                        # Predicted offset at this position
+                        pred_c = M[0, 0] * c + M[0, 1] * r + M[0, 2] - c
+                        pred_r = M[1, 0] * c + M[1, 1] * r + M[1, 2] - r
+                        # Subtract predicted from actual pre-search offset
+                        prep["off_row_adj"] = prep["off_row_adj"] - int(round(pred_r))
+                        prep["off_col_adj"] = prep["off_col_adj"] - int(round(pred_c))
+
     # Phase 2: Sequential GPU inference (RoMa) on prepared anchors
     for prep in prep_results:
         if prep is None:
@@ -670,11 +735,14 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
         if best_match is None and presearch_ncc >= 0.44 and feature_type in ("island_center", "reef_feature"):
             print(f"    Located: {name} (presearch mask fallback: NCC={presearch_ncc:.2f})")
             best_match = AnchorMatchResult(float(off_col_adj), float(off_row_adj), presearch_ncc * 0.8, "PresearchMask")
-        elif best_match is None and presearch_ncc >= 0.50 and feature_type == "corner" and presearch_offset_m < 300.0:
+        elif best_match is None and presearch_ncc >= 0.50 and feature_type == "corner" and presearch_offset_m < 500.0:
             print(f"    Located: {name} (presearch corner fallback: NCC={presearch_ncc:.2f}, offset={presearch_offset_m:.0f}m)")
             best_match = AnchorMatchResult(float(off_col_adj), float(off_row_adj), presearch_ncc * 0.7, "PresearchCorner")
+        elif best_match is None and presearch_ncc >= 0.45 and presearch_offset_m < 500.0:
+            print(f"    Located: {name} (presearch general fallback: NCC={presearch_ncc:.2f}, offset={presearch_offset_m:.0f}m)")
+            best_match = AnchorMatchResult(float(off_col_adj), float(off_row_adj), presearch_ncc * 0.6, "PresearchGeneral")
         elif best_match is None and presearch_ncc >= 0.35:
-            print(f"    Skipping presearch fallback for {name} (type={feature_type!r}, not island/reef/corner)")
+            print(f"    Skipping presearch fallback for {name} (type={feature_type!r}, NCC={presearch_ncc:.2f})")
 
         if best_match is not None:
             ref_gx, ref_gy, off_gx, off_gy = _anchor_to_geo(
@@ -922,4 +990,4 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                         break
 
     results = _filter_anchor_displacement_outliers(results)
-    return results
+    return results, {"presearch_global_offset_m": _presearch_global_offset}

@@ -36,22 +36,14 @@ grid_optim:
   lr: 0.002
   w_data: 1.0
   w_chamfer: 0.30
-  w_feat: 0.0
   w_arap: 0.5
   w_laplacian: 0.2
   w_disp: 0.05
   max_residual_norm: 0.03
-  # DINOv3 feature loss tuning
-  feat_coverage_gate: true
-  feat_cadence: 10
-  feat_scale_factor: 1.0
-  feat_mid_ratio: 0.3
-  # Per-level multiplicative scales (indexed by level_idx)
   level_w_data_scale: [1.0, 1.5, 2.0]
-  level_w_disp_scale: [1.0, 0.667, 0.5]
-  level_reg_scale: [1.0, 1.15, 1.30]
+  level_w_disp_scale: [1.0, 0.8, 0.7]
+  level_reg_scale: [1.0, 1.30, 1.50]
   level_chamfer_scale: [1.0, 0.667, 0.5]
-  level_w_feat_scale: [0.0, 1.0, 1.0]
 
 flow:
   max_flow_bias_m: 15.0
@@ -64,3 +56,13 @@ normalization:
   flow_joint_percentile: true
   flow_percentile_lo: 1
   flow_percentile_hi: 99
+
+qa:
+  grid_weight: 0.55
+  patch_weight: 0.25
+  stable_boundary_weight: 18.0
+  shore_boundary_weight: 12.0
+  accept_image_score_max: 140.0
+  accept_holdout_median_max: 90.0
+  accept_cv_mean_max: 90.0
+  accept_coverage_min: 0.10

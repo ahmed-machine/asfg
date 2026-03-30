@@ -22,8 +22,9 @@ from osgeo import gdal
 from pyproj import Transformer
 from rasterio.crs import CRS
 from . import constants as _C
-from .constants import OUTPUT_CRS_EPSG  # static, never overridden
 from .geo import (
+    WEB_MERCATOR,
+    WGS84,
     clear_overlap_cache,
     compute_overlap,
     compute_overlap_or_none,
@@ -36,6 +37,7 @@ from .geo import (
     open_pair,
     read_overlap_pair,
     read_overlap_region,
+    work_shift_to_dataset_shift,
 )
 from .global_localization import localize_to_reference, translate_input_to_hypothesis
 from .image import shift_array, to_u8, is_cloudy_patch, make_land_mask, clahe_normalize
@@ -60,7 +62,7 @@ from .warp import apply_warp
 from .checkpoint import save_checkpoint
 from .qa import evaluate_alignment_quality_paths, generate_debug_image
 from .qa_runner import build_candidate_report, split_holdout_pairs, write_qa_report
-from .types import GCP, GlobalHypothesis, MatchPair, MetadataPrior, QaReport
+from .types import BBox, GCP, GlobalHypothesis, MaskProvider, MatchPair, MetadataPrior, QaReport
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +76,7 @@ class AlignState:
     reference_path: str
     output_path: str
     work_crs: Optional[CRS] = None
-    overlap: Optional[tuple[float, float, float, float]] = None
+    overlap: Optional[BBox] = None
     anchors_path: Optional[str] = None
     best: bool = True
     match_res: float = 5.0
@@ -116,6 +118,8 @@ class AlignState:
     use_sift_refinement: bool = False
 
     was_corrected: bool = False
+    needs_ortho: bool = False             # deferred orthorectification pending
+    rough_georef_path: Optional[str] = None  # path to rough georef for ortho
     correction_outliers: List[str] = field(default_factory=list)
 
     M_geo: Optional[np.ndarray] = None
@@ -128,7 +132,7 @@ class AlignState:
     grid_size: int = 20
     grid_iters: int = 300
     arap_weight: float = 1.0
-    mask_provider: str = "coastal_obia"
+    mask_provider: MaskProvider = MaskProvider.COASTAL_OBIA
     global_search: bool = True
     global_search_res: float = 40.0
     global_search_top_k: int = 3
@@ -164,11 +168,9 @@ def _assign_rough_georeference(input_path: str, prior_bounds: tuple,
     """
     west, south, east, north = prior_bounds
     transform = rasterio.transform.from_bounds(west, south, east, north, width, height)
-    crs = CRS.from_epsg(4326)
-
     with rasterio.open(input_path) as src:
         profile = src.profile.copy()
-        profile.update(crs=crs, transform=transform)
+        profile.update(crs=WGS84, transform=transform)
 
         base, ext = os.path.splitext(input_path)
         tmp_path = f"{base}.rough_georef{ext}"
@@ -178,6 +180,195 @@ def _assign_rough_georeference(input_path: str, prior_bounds: tuple,
                     data = src.read(band_idx, window=window)
                     dst.write(data, band_idx, window=window)
     return tmp_path
+
+
+def _orthorectify_against_reference(rough_georef_path: str, reference_path: str,
+                                     work_crs, overlap: tuple,
+                                     coarse_dx: float = 0.0,
+                                     coarse_dy: float = 0.0,
+                                     model_cache=None) -> str | None:
+    """Automatic orthorectification using reference-based feature matching.
+
+    When a raw scan has only a rough affine georef from metadata, this function
+    uses RoMa neural matching against the reference image to find dense
+    correspondences, then TPS-warps the scan to correct panoramic distortion,
+    rotation, scale, and translation errors simultaneously.
+
+    Parameters
+    ----------
+    coarse_dx, coarse_dy : float
+        Coarse translation offset in metres (east, south) from prior
+        alignment steps.  Applied as pixel shifts to the offset array
+        before neural matching so that corresponding terrain overlaps.
+    model_cache : ModelCache, optional
+        Shared model cache.  If None a temporary one is created.
+
+    Returns the path to the orthorectified file, or None if insufficient
+    matches were found (caller should keep the rough georef).
+    """
+    import cv2
+    from .matching import match_with_roma
+    from .models import ModelCache, get_torch_device
+
+    ortho_res = 5.0  # matching resolution for orthorectification (m/px)
+    min_matches = 30
+
+    # Convert coarse metric offset to pixel shifts at ortho_res
+    shift_px_x = int(round(coarse_dx / ortho_res))
+    shift_py_y = int(round(coarse_dy / ortho_res))
+
+    print(f"  [Orthorectify] Matching against reference at {ortho_res}m/px "
+          f"(coarse shift: dx={coarse_dx:+.0f}m dy={coarse_dy:+.0f}m → "
+          f"px shift {shift_px_x:+d},{shift_py_y:+d})...",
+          flush=True)
+
+    src_off = rasterio.open(rough_georef_path)
+    src_ref = rasterio.open(reference_path)
+
+    try:
+        arr_off, off_transform = read_overlap_region(
+            src_off, overlap, work_crs, ortho_res)
+        arr_ref, ref_transform = read_overlap_region(
+            src_ref, overlap, work_crs, ortho_res)
+    except Exception as e:
+        print(f"  [Orthorectify] Failed to read overlap: {e}", flush=True)
+        src_off.close()
+        src_ref.close()
+        return None
+
+    # Apply coarse shift to offset array so it overlaps with reference
+    if shift_px_x != 0 or shift_py_y != 0:
+        arr_off = shift_array(arr_off, -shift_px_x, -shift_py_y)
+
+    valid_off = float(np.mean(arr_off > 0))
+    valid_ref = float(np.mean(arr_ref > 0))
+    if valid_off < 0.05 or valid_ref < 0.05:
+        print(f"  [Orthorectify] Insufficient overlap "
+              f"(off={valid_off:.0%}, ref={valid_ref:.0%})", flush=True)
+        src_off.close()
+        src_ref.close()
+        return None
+
+    # Use shared model cache or create a temporary one
+    cache = model_cache if model_cache is not None else ModelCache(get_torch_device())
+
+    # Run RoMa matching — pass shifted arrays and coarse pixel shifts
+    try:
+        matches = match_with_roma(
+            arr_ref, arr_off, ref_transform, off_transform,
+            shift_px_x=shift_px_x, shift_py_y=shift_py_y,
+            neural_res=ortho_res,
+            model_cache=cache,
+            src_offset=src_off, work_crs=work_crs,
+        )
+    except Exception as e:
+        print(f"  [Orthorectify] RoMa matching failed: {e}", flush=True)
+        src_off.close()
+        src_ref.close()
+        return None
+
+    src_off.close()
+    src_ref.close()
+
+    print(f"  [Orthorectify] RoMa found {len(matches)} matches", flush=True)
+
+    if len(matches) < min_matches:
+        print(f"  [Orthorectify] Only {len(matches)} matches (need {min_matches}), "
+              f"keeping rough georef", flush=True)
+        return None
+
+    # RANSAC filter
+    src_pts = np.array([(m.off_x, m.off_y) for m in matches],
+                       dtype=np.float32).reshape(-1, 1, 2)
+    dst_pts = np.array([(m.ref_x, m.ref_y) for m in matches],
+                       dtype=np.float32).reshape(-1, 1, 2)
+    _, inliers = cv2.estimateAffine2D(
+        src_pts, dst_pts, method=cv2.RANSAC,
+        ransacReprojThreshold=30.0, confidence=0.95)
+    if inliers is None:
+        print(f"  [Orthorectify] RANSAC failed", flush=True)
+        return None
+    inlier_mask = inliers.ravel().astype(bool)
+    inlier_matches = [m for m, k in zip(matches, inlier_mask) if k]
+    print(f"  [Orthorectify] {len(inlier_matches)}/{len(matches)} RANSAC inliers",
+          flush=True)
+
+    if len(inlier_matches) < min_matches:
+        print(f"  [Orthorectify] Only {len(inlier_matches)} inliers, keeping rough georef",
+              flush=True)
+        return None
+
+    # Convert to GDAL GCPs: offset pixel coords → reference geographic coords
+    # The offset coords (m.off_x/y) are in work_crs (UTM meters).
+    # We need pixel coords in the rough georef, and geographic coords for the GCP target.
+    from rasterio.warp import transform as _transform
+    ref_xs = [m.ref_x for m in inlier_matches]
+    ref_ys = [m.ref_y for m in inlier_matches]
+    # Transform reference coords from work_crs to EPSG:4326 for GCP targets
+    ref_lons, ref_lats = _transform(work_crs, WGS84, ref_xs, ref_ys)
+
+    with rasterio.open(rough_georef_path) as src:
+        rough_transform = src.transform
+
+    gcp_list = []
+    for i, m in enumerate(inlier_matches):
+        # Convert offset work_crs coords to pixel coords in the rough georef
+        # First transform from work_crs to the rough georef CRS (EPSG:4326)
+        off_lons, off_lats = _transform(work_crs, WGS84,
+                                        [m.off_x], [m.off_y])
+        px_col, px_row = ~rough_transform * (off_lons[0], off_lats[0])
+        gcp_list.append(gdal.GCP(ref_lons[i], ref_lats[i], 0,
+                                 float(px_col), float(px_row)))
+
+    # TPS warp — follow the pattern from apply_scale_rotation_precorrection():
+    # let GDAL auto-determine bounds from the GCPs (no forced outputBounds).
+    # Set explicit resolution from the reference to avoid inheriting the
+    # rough georef's wrong pixel size.
+    base, ext = os.path.splitext(rough_georef_path)
+    tmp_gcp_path = base + ".ortho_gcps" + ext
+    ortho_path = base.replace(".rough_georef", ".orthorectified") + ext
+
+    ds_in = gdal.Open(rough_georef_path)
+    ds_gcp = gdal.Translate(tmp_gcp_path, ds_in, GCPs=gcp_list,
+                            outputSRS="EPSG:4326")
+    ds_gcp = None
+    ds_in = None
+
+    # Use reference pixel size so the ortho output has consistent scale
+    with rasterio.open(reference_path) as ref:
+        ref_res = abs(ref.transform.a)  # degrees per pixel
+
+    warp_kwargs = {
+        "dstSRS": "EPSG:4326",
+        "format": "GTiff",
+        "tps": True,
+        "xRes": ref_res,
+        "yRes": ref_res,
+        "resampleAlg": "bilinear",
+        "multithread": True,
+        "creationOptions": ["COMPRESS=LZW", "TILED=YES", "PREDICTOR=2",
+                            "BIGTIFF=YES", "NUM_THREADS=ALL_CPUS"],
+        "warpMemoryLimit": 2048 * 1024 * 1024,
+    }
+
+    ds_out = gdal.Warp(ortho_path, tmp_gcp_path, **warp_kwargs)
+    ds_out = None
+
+    if os.path.exists(tmp_gcp_path):
+        os.remove(tmp_gcp_path)
+
+    if not os.path.exists(ortho_path):
+        print(f"  [Orthorectify] GDAL warp failed", flush=True)
+        return None
+
+    with rasterio.open(ortho_path) as src:
+        print(f"  [Orthorectify] Success: {len(inlier_matches)} GCPs, "
+              f"size {src.width}x{src.height}, "
+              f"res {abs(src.transform.a)*111000:.1f}m/px, "
+              f"bounds {src.bounds.left:.3f}-{src.bounds.right:.3f}E",
+              flush=True)
+
+    return ortho_path
 
 
 def _ensure_overviews(path, width, height):
@@ -227,8 +418,12 @@ def step_setup(args) -> AlignState:
     metadata_prior_paths = [str(path) for path in (getattr(args, "metadata_priors", None) or [])]
     work_crs = get_metric_crs(src_offset, src_ref, priors=priors)
 
-    # When target has no CRS, assign a rough geotransform from metadata priors
+    # When target has no CRS, assign a rough geotransform from metadata priors.
+    # Orthorectification is deferred to step_orthorectify (after coarse offset)
+    # so that coarse translation shifts are available for RoMa matching.
     rough_georef_tmp = None
+    ortho_applied = False
+    needs_ortho = False
     if src_offset.crs is None and priors:
         from .metadata_priors import merge_prior_bounds
         prior_bounds = merge_prior_bounds(priors)
@@ -240,6 +435,7 @@ def step_setup(args) -> AlignState:
             src_offset = rasterio.open(args.input)
             print(f"  Assigned rough georeference from metadata priors")
             print(f"  CRS: {src_offset.crs}, Bounds: {src_offset.bounds}")
+            needs_ortho = True
 
     # Build GDAL overviews for faster reads at lower resolutions
     off_w, off_h = src_offset.width, src_offset.height
@@ -260,16 +456,24 @@ def step_setup(args) -> AlignState:
     offset_res_m = get_native_resolution_m(src_offset, priors=priors)
     ref_res_m = get_native_resolution_m(src_ref)
     expected_scale = offset_res_m / ref_res_m
-    print(f"Native resolution: target={offset_res_m:.2f} m/px, reference={ref_res_m:.2f} m/px")
-    print(f"Expected scale ratio: {expected_scale:.3f}x")
+    if ortho_applied:
+        # Orthorectification already corrected scale/rotation/distortion.
+        # Force expected_scale=1.0 to skip scale/rotation detection.
+        expected_scale = 1.0
+        print(f"Native resolution: target={offset_res_m:.2f} m/px, reference={ref_res_m:.2f} m/px")
+        print(f"Expected scale ratio: {expected_scale:.3f}x (ortho-corrected)")
+    else:
+        print(f"Native resolution: target={offset_res_m:.2f} m/px, reference={ref_res_m:.2f} m/px")
+        print(f"Expected scale ratio: {expected_scale:.3f}x")
     print()
 
     target_bounds_work = dataset_bounds_in_crs(src_offset, work_crs)
     reference_bounds_work = dataset_bounds_in_crs(src_ref, work_crs)
-    overlap = compute_overlap_or_none(src_offset, src_ref, work_crs)
+    _overlap_raw = compute_overlap_or_none(src_offset, src_ref, work_crs)
+    overlap = BBox(*_overlap_raw) if _overlap_raw is not None else None
     if overlap is not None:
-        overlap_w = overlap[2] - overlap[0]
-        overlap_h = overlap[3] - overlap[1]
+        overlap_w = overlap.right - overlap.left
+        overlap_h = overlap.top - overlap.bottom
         print(f"Overlap region: {overlap_w:.0f} x {overlap_h:.0f} meters")
     else:
         print("Overlap region: none detected from rough georeferencing")
@@ -308,7 +512,7 @@ def step_setup(args) -> AlignState:
         grid_size=getattr(args, 'grid_size', 20),
         grid_iters=getattr(args, 'grid_iters', 300),
         arap_weight=getattr(args, 'arap_weight', 1.0),
-        mask_provider=getattr(args, 'mask_provider', 'coastal_obia'),
+        mask_provider=MaskProvider(getattr(args, 'mask_provider', 'coastal_obia')),
         global_search=bool(getattr(args, 'global_search', True)),
         global_search_res=float(getattr(args, 'global_search_res', 40.0)),
         global_search_top_k=int(getattr(args, 'global_search_top_k', 3)),
@@ -318,6 +522,9 @@ def step_setup(args) -> AlignState:
         metadata_priors=priors,
         reference_bounds_work=reference_bounds_work,
         target_bounds_work=target_bounds_work,
+        was_corrected=ortho_applied,
+        needs_ortho=needs_ortho,
+        rough_georef_path=rough_georef_tmp,
         qa_json_path=getattr(args, 'qa_json', None),
         diagnostics_dir=getattr(args, 'diagnostics_dir', None),
         allow_abstain=bool(getattr(args, 'allow_abstain', False)),
@@ -335,7 +542,8 @@ def _refresh_work_region(state: AlignState) -> AlignState:
         state.work_crs = get_metric_crs(src_offset, src_ref, priors=state.metadata_priors)
         state.target_bounds_work = dataset_bounds_in_crs(src_offset, state.work_crs)
         state.reference_bounds_work = dataset_bounds_in_crs(src_ref, state.work_crs)
-        state.overlap = compute_overlap_or_none(src_offset, src_ref, state.work_crs)
+        _raw = compute_overlap_or_none(src_offset, src_ref, state.work_crs)
+        state.overlap = BBox(*_raw) if _raw is not None else None
     return state
 
 
@@ -348,10 +556,10 @@ def step_global_localization(state: AlignState, args) -> AlignState:
                 hypothesis_id="rough_overlap",
                 score=1.0,
                 source="rough_georef_overlap",
-                left=state.overlap[0],
-                bottom=state.overlap[1],
-                right=state.overlap[2],
-                top=state.overlap[3],
+                left=state.overlap.left,
+                bottom=state.overlap.bottom,
+                right=state.overlap.right,
+                top=state.overlap.top,
                 dx_m=0.0,
                 dy_m=0.0,
                 work_crs=str(state.work_crs),
@@ -398,8 +606,8 @@ def step_global_localization(state: AlignState, args) -> AlignState:
         state = _refresh_work_region(state)
         if state.overlap is None:
             raise ValueError("Global localization translated the image but no overlap was produced")
-        overlap_w = state.overlap[2] - state.overlap[0]
-        overlap_h = state.overlap[3] - state.overlap[1]
+        overlap_w = state.overlap.right - state.overlap.left
+        overlap_h = state.overlap.top - state.overlap.bottom
         print(f"  Localized overlap region: {overlap_w:.0f} x {overlap_h:.0f} meters")
     print()
     return state
@@ -416,8 +624,8 @@ def _grayscale_ncc_crosscheck(state: AlignState, src_ref, src_offset) -> None:
     """
     print("  Pass 3: grayscale NCC cross-check at 5 m/px...")
     try:
-        arr_ref, _ = read_overlap_region(src_ref, state.overlap, state.work_crs, 5.0)
-        arr_off, _ = read_overlap_region(src_offset, state.overlap, state.work_crs, 5.0)
+        arr_ref, _ = read_overlap_region(src_ref, state.overlap.as_tuple(), state.work_crs, 5.0)
+        arr_off, _ = read_overlap_region(src_offset, state.overlap.as_tuple(), state.work_crs, 5.0)
 
         valid_ref = arr_ref > 0
         if not np.any(valid_ref):
@@ -491,12 +699,14 @@ def step_coarse_offset(state: AlignState, profiler=None) -> AlignState:
     src_offset = rasterio.open(state.current_input)
     src_ref = rasterio.open(state.reference_path)
 
-    print(f"  Pass 1: coarse scan at {_C.COARSE_RES} m/px...")
+    from .params import get_params as _get_params  # noqa: used in multiple functions
+    _coarse_p = _get_params().coarse
+    print(f"  Pass 1: coarse scan at {_C.COARSE_RES} m/px...", flush=True)
     with _p.section("pass1"):
         dx_c, dy_c, corr_c = detect_offset_at_resolution(
-            src_offset, src_ref, state.overlap, state.work_crs, _C.COARSE_RES,
+            src_offset, src_ref, state.overlap.as_tuple(), state.work_crs, _C.COARSE_RES,
             template_radius_m=_C.DEFAULT_TEMPLATE_RADIUS_M, mask_mode=state.mask_provider,
-            diagnostics_dir=state.diagnostics_dir)
+            diagnostics_dir=state.diagnostics_dir, min_ncc=_coarse_p.min_ncc)
     if dx_c is None or dy_c is None or corr_c is None:
         if state.chosen_hypothesis is not None:
             # Global search already positioned the image — coarse refinement
@@ -520,15 +730,36 @@ def step_coarse_offset(state: AlignState, profiler=None) -> AlignState:
     dx_c_f, dy_c_f = float(dx_c), float(dy_c)
     print(f"    dx={dx_c_f:+8.0f}m, dy={dy_c_f:+8.0f}m (corr={corr_c:.4f})")
 
-    print(f"  Pass 2: refine at {_C.REFINE_RES} m/px (search +/-{_C.DEFAULT_SEARCH_MARGIN_M:.0f}m around coarse)...")
+    # Pass 2: refine with adaptive search margin expansion.
+    # If the initial margin is insufficient (e.g. large metadata error), we
+    # progressively double it up to 4× the default, giving the matcher a
+    # chance to recover before giving up.
+    search_margin = _C.DEFAULT_SEARCH_MARGIN_M
+    max_search_margin = _C.DEFAULT_SEARCH_MARGIN_M * 4
+    dx_r, dy_r, corr_r = None, None, None
     with _p.section("pass2"):
-        dx_r, dy_r, corr_r = detect_offset_at_resolution(
-            src_offset, src_ref, state.overlap, state.work_crs, _C.REFINE_RES,
-            template_radius_m=_C.DEFAULT_TEMPLATE_RADIUS_M, coarse_offset=(dx_c_f, dy_c_f), search_margin_m=_C.DEFAULT_SEARCH_MARGIN_M,
-            mask_mode=state.mask_provider,
-            diagnostics_dir=state.diagnostics_dir)
+        while search_margin <= max_search_margin:
+            print(f"  Pass 2: refine at {_C.REFINE_RES} m/px "
+                  f"(search +/-{search_margin:.0f}m around coarse)...")
+            dx_r, dy_r, corr_r = detect_offset_at_resolution(
+                src_offset, src_ref, state.overlap.as_tuple(), state.work_crs, _C.REFINE_RES,
+                template_radius_m=_C.DEFAULT_TEMPLATE_RADIUS_M,
+                coarse_offset=(dx_c_f, dy_c_f),
+                search_margin_m=search_margin,
+                mask_mode=state.mask_provider,
+                diagnostics_dir=state.diagnostics_dir,
+                min_ncc=_coarse_p.min_ncc)
+            if (dx_r is not None and dy_r is not None and
+                    corr_r is not None and corr_r > _coarse_p.min_ncc):
+                break
+            # Expand margin and retry
+            next_margin = search_margin * 2
+            if next_margin <= max_search_margin:
+                print(f"    Refinement failed at +/-{search_margin:.0f}m, "
+                      f"expanding to +/-{next_margin:.0f}m...")
+            search_margin = next_margin
 
-    if dx_r is not None and dy_r is not None and corr_r is not None and corr_r > 0.3:
+    if dx_r is not None and dy_r is not None and corr_r is not None and corr_r > _coarse_p.min_ncc:
         dx_r_f, dy_r_f = float(dx_r), float(dy_r)
         print(f"    dx={dx_r_f:+8.0f}m, dy={dy_r_f:+8.0f}m (corr={corr_r:.4f})")
         refinement_dist = np.sqrt((dx_r_f - dx_c_f) ** 2 + (dy_r_f - dy_c_f) ** 2)
@@ -559,8 +790,8 @@ def step_coarse_offset(state: AlignState, profiler=None) -> AlignState:
 
     # Sanity check: coarse offset should not exceed half the overlap extent
     if state.overlap is not None:
-        overlap_w = state.overlap[2] - state.overlap[0]
-        overlap_h = state.overlap[3] - state.overlap[1]
+        overlap_w = state.overlap.right - state.overlap.left
+        overlap_h = state.overlap.top - state.overlap.bottom
         max_reasonable = 0.5 * min(overlap_w, overlap_h)
         if state.coarse_total > max_reasonable:
             print(f"  WARNING: Coarse offset {state.coarse_total:.0f}m exceeds "
@@ -576,10 +807,65 @@ def step_coarse_offset(state: AlignState, profiler=None) -> AlignState:
     return state
 
 
+def step_orthorectify(state: AlignState) -> AlignState:
+    """Step 1.25: Deferred orthorectification using coarse offset.
+
+    Runs only when the input was a raw scan that received a rough georeference
+    from metadata priors (needs_ortho=True).  Now that coarse_dx/coarse_dy are
+    known, the neural matcher can receive properly-shifted patches and find
+    dense correspondences for TPS warping.
+    """
+    if not state.needs_ortho:
+        return state
+
+    if state.overlap is None:
+        print("  [Orthorectify] Skipped — no overlap region available", flush=True)
+        return state
+
+    print("Step 1.25: Deferred orthorectification (post coarse offset)", flush=True)
+
+    ortho_path = _orthorectify_against_reference(
+        state.current_input,
+        state.reference_path,
+        state.work_crs,
+        state.overlap.as_tuple(),
+        coarse_dx=state.coarse_dx,
+        coarse_dy=state.coarse_dy,
+        model_cache=state.model_cache,
+    )
+
+    if ortho_path is not None:
+        state.current_input = ortho_path
+        state.temp_paths.append(ortho_path)
+        state.was_corrected = True
+        state.needs_ortho = False
+
+        # Invalidate overlap cache and refresh after orthorectification
+        clear_overlap_cache()
+        state = _refresh_work_region(state)
+
+        # Orthorectification corrected scale/rotation — skip re-detection
+        state.expected_scale = 1.0
+
+        # Re-detect coarse offset on the orthorectified image (residual should
+        # be much smaller now)
+        print("  Re-detecting coarse offset on orthorectified image...", flush=True)
+        state = _redetect_coarse_after_precorrection(state)
+
+        print(f"  [Orthorectify] Pipeline continuing with orthorectified image",
+              flush=True)
+    else:
+        print("  [Orthorectify] Could not orthorectify — continuing with rough georef",
+              flush=True)
+
+    print()
+    return state
+
+
 def step_handle_large_offset(state: AlignState, args) -> AlignState:
     """Handle already-aligned or very large offsets (>2km)."""
     if state.coarse_total < 10:
-        if abs(state.expected_scale - 1.0) < 0.05:
+        if abs(state.expected_scale - 1.0) < 0.05 and not state.was_corrected:
             raise AlreadyAlignedError(
                 "Images appear already well-aligned (offset < 10m, scale ~1.0)")
         else:
@@ -596,10 +882,21 @@ def step_handle_large_offset(state: AlignState, args) -> AlignState:
                   f"continuing to feature matching with {state.coarse_total:.0f}m residual")
         else:
             src = rasterio.open(state.current_input)
-            left = src.bounds.left - state.coarse_dx
-            bottom = src.bounds.bottom + state.coarse_dy
-            right = src.bounds.right - state.coarse_dx
-            top = src.bounds.top + state.coarse_dy
+            # Convert metric offset to source CRS units.
+            # coarse_dx > 0 means offset image is east of reference →
+            # shift bounds west (subtract); coarse_dy > 0 means south →
+            # shift bounds north (add). work_shift_to_dataset_shift maps
+            # (dx_m, dy_m) such that positive dx shifts west, positive dy
+            # shifts north.
+            ds_dx, ds_dy = work_shift_to_dataset_shift(
+                src, state.work_crs, state.coarse_dx, state.coarse_dy)
+            left = src.bounds.left + ds_dx
+            bottom = src.bounds.bottom + ds_dy
+            right = src.bounds.right + ds_dx
+            top = src.bounds.top + ds_dy
+            unit = "°" if src.crs.is_geographic else "m"
+            print(f"  Bounds shift: dx={ds_dx:.6f}{unit}, dy={ds_dy:.6f}{unit} "
+                  f"(new center: {(left+right)/2:.4f}, {(bottom+top)/2:.4f})")
             src.close()
 
             if not state.yes:
@@ -653,6 +950,7 @@ def step_handle_large_offset(state: AlignState, args) -> AlignState:
 
 def step_scale_rotation(state: AlignState, args, profiler=None) -> AlignState:
     """Step 1.5: Scale and rotation detection and pre-correction."""
+    from .params import get_params as _get_params
     _p = profiler or _NullProfiler()
     if state.overlap is None or state.work_crs is None:
         raise ValueError("Scale/rotation detection requires an established work region")
@@ -666,15 +964,16 @@ def step_scale_rotation(state: AlignState, args, profiler=None) -> AlignState:
 
     # --- Try local scale detection first ---
     local_patches = None
-    print("  Attempting patch-based local scale detection (4x3 grid)...")
+    _sr_p = _get_params().scale_rotation
+    print(f"  Attempting patch-based local scale detection ({_sr_p.grid_cols}x{_sr_p.grid_rows} grid)...")
     with _p.section("local_scales"):
         try:
             src_offset = rasterio.open(state.current_input)
             src_ref = rasterio.open(state.reference_path)
             local_patches = detect_local_scales(
-                src_offset, src_ref, state.overlap, state.work_crs,
+                src_offset, src_ref, state.overlap.as_tuple(), state.work_crs,
                 state.coarse_dx, state.coarse_dy,
-                grid_cols=_C.SCALE_GRID_COLS, grid_rows=_C.SCALE_GRID_ROWS,
+                grid_cols=_sr_p.grid_cols, grid_rows=_sr_p.grid_rows,
                 model_cache=state.model_cache)
             src_offset.close()
             src_ref.close()
@@ -692,6 +991,27 @@ def step_scale_rotation(state: AlignState, args, profiler=None) -> AlignState:
     if local_patches is None and not state.precorrection_applied:
         with _p.section("global_scale_rotation"):
             state = _apply_global_precorrection(state, args)
+
+    # Last resort: if no detection method worked but expected_scale is far from 1.0,
+    # apply expected_scale directly.  Better than proceeding with wrong scale — all
+    # downstream matching would fail at >20% scale mismatch.
+    if not state.precorrection_applied and abs(state.expected_scale - 1.0) > 0.15:
+        print(f"  Scale/rotation detection failed — applying expected_scale "
+              f"{state.expected_scale:.3f} as fallback", flush=True)
+        from .scale import apply_scale_rotation_precorrection
+        with _p.section("apply_expected_scale"):
+            overlap_center = None
+            if state.overlap:
+                overlap_center = ((state.overlap.left + state.overlap.right) / 2,
+                                  (state.overlap.bottom + state.overlap.top) / 2)
+            result = apply_scale_rotation_precorrection(
+                state.current_input, state.expected_scale, 0.0,
+                state.work_crs, overlap_center=overlap_center)
+            if result is not None:
+                state.precorrection_applied = True
+                state.precorrection_tmp = result
+                state.current_input = result
+                print(f"  Applied expected_scale={state.expected_scale:.3f} precorrection")
 
     # Invalidate overlap cache after precorrection changes
     if state.precorrection_applied:
@@ -744,8 +1064,8 @@ def _apply_local_precorrection(state: AlignState, local_patches) -> AlignState:
         print("  Scale/rotation within tolerance, skipping pre-correction")
         return state
 
-    overlap_cx = (state.overlap[0] + state.overlap[2]) / 2
-    overlap_cy = (state.overlap[1] + state.overlap[3]) / 2
+    overlap_cx = (state.overlap.left + state.overlap.right) / 2
+    overlap_cy = (state.overlap.bottom + state.overlap.top) / 2
     print(f"  Applying LOCAL scale/rotation pre-correction (center: "
           f"{overlap_cx:.0f}, {overlap_cy:.0f} in work CRS)...")
     precorrected = apply_local_scale_precorrection(
@@ -770,15 +1090,15 @@ def _apply_global_precorrection(state: AlignState, args) -> AlignState:
     print("  Falling back to global scale/rotation detection...")
     src_offset = rasterio.open(state.current_input)
     src_ref = rasterio.open(state.reference_path)
-
-    result = detect_scale_rotation(
-        src_offset, src_ref, state.overlap, state.work_crs,
-        state.coarse_dx, state.coarse_dy, state.expected_scale,
-        model_cache=state.model_cache,
-        diagnostics_dir=state.diagnostics_dir)
-
-    src_offset.close()
-    src_ref.close()
+    try:
+        result = detect_scale_rotation(
+            src_offset, src_ref, state.overlap.as_tuple(), state.work_crs,
+            state.coarse_dx, state.coarse_dy, state.expected_scale,
+            model_cache=state.model_cache,
+            diagnostics_dir=state.diagnostics_dir)
+    finally:
+        src_offset.close()
+        src_ref.close()
 
     if result.method is None:
         print("  No significant scale/rotation detected")
@@ -801,8 +1121,8 @@ def _apply_global_precorrection(state: AlignState, args) -> AlignState:
         print("  Scale/rotation within tolerance, skipping pre-correction")
         return state
 
-    overlap_cx = (state.overlap[0] + state.overlap[2]) / 2
-    overlap_cy = (state.overlap[1] + state.overlap[3]) / 2
+    overlap_cx = (state.overlap.left + state.overlap.right) / 2
+    overlap_cy = (state.overlap.bottom + state.overlap.top) / 2
     print(f"  Applying scale/rotation pre-correction (center: "
           f"{overlap_cx:.0f}, {overlap_cy:.0f} in work CRS)...")
     precorrected = apply_scale_rotation_precorrection(
@@ -828,7 +1148,7 @@ def _apply_global_precorrection(state: AlignState, args) -> AlignState:
             src_offset = rasterio.open(state.current_input)
             src_ref = rasterio.open(state.reference_path)
             local_patches_2 = detect_local_scales(
-                src_offset, src_ref, state.overlap, state.work_crs,
+                src_offset, src_ref, state.overlap.as_tuple(), state.work_crs,
                 state.coarse_dx, state.coarse_dy,
                 model_cache=state.model_cache)
             src_offset.close()
@@ -854,8 +1174,8 @@ def _apply_global_precorrection(state: AlignState, args) -> AlignState:
                       f"avg scale={avg_scale2:.4f}, rotation={avg_rot2:.3f} deg")
 
                 if abs(avg_scale2 - 1.0) > 0.005 or abs(avg_rot2) > 0.05:
-                    overlap_cx = (state.overlap[0] + state.overlap[2]) / 2
-                    overlap_cy = (state.overlap[1] + state.overlap[3]) / 2
+                    overlap_cx = (state.overlap.left + state.overlap.right) / 2
+                    overlap_cy = (state.overlap.bottom + state.overlap.top) / 2
                     print("    Applying local refinement...")
                     precorrected_2 = apply_local_scale_precorrection(
                         state.current_input, local_patches_2, state.work_crs,
@@ -878,7 +1198,7 @@ def _apply_global_precorrection(state: AlignState, args) -> AlignState:
                             # Recompute overlap
                             src_offset = rasterio.open(state.current_input)
                             src_ref = rasterio.open(state.reference_path)
-                            state.overlap = compute_overlap(src_offset, src_ref, state.work_crs)
+                            state.overlap = BBox(*compute_overlap(src_offset, src_ref, state.work_crs))
                             src_offset.close()
                             src_ref.close()
                         else:
@@ -886,16 +1206,16 @@ def _apply_global_precorrection(state: AlignState, args) -> AlignState:
                             print("    Validating with SIFT match comparison...")
                             src_offset = rasterio.open(state.current_input)
                             src_ref = rasterio.open(state.reference_path)
-                            overlap_after = compute_overlap(src_offset, src_ref, state.work_crs)
+                            overlap_after = BBox(*compute_overlap(src_offset, src_ref, state.work_crs))
                             src_offset.close()
                             src_ref.close()
 
                             sift_before = _quick_sift_count(
                                 old_tmp, state.reference_path,
-                                state.overlap, state.work_crs)
+                                state.overlap.as_tuple(), state.work_crs)
                             sift_after = _quick_sift_count(
                                 precorrected_2, state.reference_path,
-                                overlap_after, state.work_crs)
+                                overlap_after.as_tuple(), state.work_crs)
                             print(f"    SIFT matches: before={sift_before}, after={sift_after}")
 
                             if sift_after < sift_before * 0.8:
@@ -921,13 +1241,14 @@ def _apply_global_precorrection(state: AlignState, args) -> AlignState:
 
 def _redetect_coarse_after_precorrection(state: AlignState) -> AlignState:
     """Re-detect coarse offset on pre-corrected image."""
+    from .params import get_params as _get_params
     coarse_before = np.sqrt(state.coarse_dx ** 2 + state.coarse_dy ** 2)
     print("  Re-detecting coarse offset on pre-corrected image...")
     src_offset = rasterio.open(state.current_input)
     src_ref = rasterio.open(state.reference_path)
 
     try:
-        state.overlap = compute_overlap(src_offset, src_ref, state.work_crs)
+        state.overlap = BBox(*compute_overlap(src_offset, src_ref, state.work_crs))
     except ValueError:
         print("  WARNING: No overlap after pre-correction, reverting to original")
         state.precorrection_applied = False
@@ -940,9 +1261,10 @@ def _redetect_coarse_after_precorrection(state: AlignState) -> AlignState:
         return state
 
     dx_pc, dy_pc, corr_pc = detect_offset_at_resolution(
-        src_offset, src_ref, state.overlap, state.work_crs, 5.0,
-        template_radius_m=_C.DEFAULT_TEMPLATE_RADIUS_M)
-    if dx_pc is not None and dy_pc is not None and corr_pc is not None and corr_pc > 0.3:
+        src_offset, src_ref, state.overlap.as_tuple(), state.work_crs, 5.0,
+        template_radius_m=_C.DEFAULT_TEMPLATE_RADIUS_M,
+        min_ncc=_get_params().coarse.min_ncc)
+    if dx_pc is not None and dy_pc is not None and corr_pc is not None and corr_pc > _get_params().coarse.min_ncc:
         dx_pc_f, dy_pc_f = float(dx_pc), float(dy_pc)
         coarse_after = np.sqrt(dx_pc_f ** 2 + dy_pc_f ** 2)
         if coarse_after > coarse_before * 1.5:
@@ -976,12 +1298,9 @@ def _redetect_coarse_after_precorrection(state: AlignState) -> AlignState:
 
 def _quick_sift_count(img_path, ref_path, ovlp, crs, res=5.0):
     """Count SIFT matches as alignment quality proxy."""
-    s_o = rasterio.open(img_path)
-    s_r = rasterio.open(ref_path)
-    a_r, _ = read_overlap_region(s_r, ovlp, crs, res)
-    a_o, _ = read_overlap_region(s_o, ovlp, crs, res)
-    s_o.close()
-    s_r.close()
+    with rasterio.open(img_path) as s_o, rasterio.open(ref_path) as s_r:
+        a_r, _ = read_overlap_region(s_r, ovlp, crs, res)
+        a_o, _ = read_overlap_region(s_o, ovlp, crs, res)
     sift = cv2.SIFT_create(nfeatures=2000) # type: ignore
     _, d1 = sift.detectAndCompute(to_u8(a_r), None)
     _, d2 = sift.detectAndCompute(to_u8(a_o), None)
@@ -1073,6 +1392,7 @@ def _save_match_debug_image(arr_ref, arr_off, ref_transform, off_transform,
 
 def step_feature_matching(state: AlignState, args, profiler=None) -> AlignState:
     """Step 2: Feature matching (neural cascade -> NCC fallback)."""
+    from .params import get_params as _get_params
     _p = profiler or _NullProfiler()
     if state.overlap is None or state.work_crs is None:
         raise ValueError("Feature matching requires an established work region")
@@ -1094,8 +1414,8 @@ def step_feature_matching(state: AlignState, args, profiler=None) -> AlignState:
     # Memory safeguard — matching creates ~28 bytes per pixel across both images
     # (2× float32 overlap cache, 2× uint8 CLAHE, masks, Sobel gradients, weight maps).
     # Cap total array footprint at ~24 GB to leave headroom for models + OS.
-    overlap_w = state.overlap[2] - state.overlap[0]
-    overlap_h = state.overlap[3] - state.overlap[1]
+    overlap_w = state.overlap.right - state.overlap.left
+    overlap_h = state.overlap.top - state.overlap.bottom
     BYTES_PER_PIXEL = 28  # empirical: all arrays combined, both images
     MEM_CAP_BYTES = 24 * 1024 ** 3
 
@@ -1122,10 +1442,10 @@ def step_feature_matching(state: AlignState, args, profiler=None) -> AlignState:
 
     print(f"  Reading reference overlap at {neural_res}m/px...")
     arr_ref_neural, ref_neural_transform = read_overlap_region(
-        src_ref, state.overlap, state.work_crs, neural_res)
+        src_ref, state.overlap.as_tuple(), state.work_crs, neural_res)
     print(f"  Reading offset overlap at {neural_res}m/px...")
     arr_off_neural, off_neural_transform = read_overlap_region(
-        src_offset, state.overlap, state.work_crs, neural_res)
+        src_offset, state.overlap.as_tuple(), state.work_crs, neural_res)
 
     h_neural, w_neural = arr_ref_neural.shape
     print(f"  Image size: {w_neural} x {h_neural} px at {neural_res}m/px")
@@ -1143,8 +1463,8 @@ def step_feature_matching(state: AlignState, args, profiler=None) -> AlignState:
         print(f"  2a: Locating anchor GCPs from {os.path.basename(state.anchors_path)}...", flush=True)
         with _p.section("anchors"):
             try:
-                anchor_pairs = locate_anchors(
-                    state.anchors_path, src_ref, src_offset, state.overlap, state.work_crs,
+                anchor_pairs, anchor_meta = locate_anchors(
+                    state.anchors_path, src_ref, src_offset, state.overlap.as_tuple(), state.work_crs,
                     ref_neural_transform, off_neural_transform,
                     arr_ref_neural, arr_off_neural_shifted,
                     shift_px_x_neural, shift_py_y_neural, neural_res,
@@ -1191,10 +1511,10 @@ def step_feature_matching(state: AlignState, args, profiler=None) -> AlignState:
         with _p.section("phase_correlation"):
             print(f"    Reading reference overlap at {fine_res}m/px...")
             arr_ref_fine, ref_fine_transform = read_overlap_region(
-                src_ref, state.overlap, state.work_crs, fine_res)
+                src_ref, state.overlap.as_tuple(), state.work_crs, fine_res)
             print(f"    Reading offset overlap at {fine_res}m/px...")
             arr_off_fine, off_fine_transform = read_overlap_region(
-                src_offset, state.overlap, state.work_crs, fine_res)
+                src_offset, state.overlap.as_tuple(), state.work_crs, fine_res)
             shift_px_x_fine = int(round(state.coarse_dx / fine_res))
             shift_py_y_fine = int(round(state.coarse_dy / fine_res))
             if shift_px_x_fine == 0 and shift_py_y_fine == 0:
@@ -1217,7 +1537,8 @@ def step_feature_matching(state: AlignState, args, profiler=None) -> AlignState:
                                dtype=np.float32).reshape(-1, 1, 2)
             geo_dst = np.array([m.off_coords() for m in auto_pairs],
                                dtype=np.float32).reshape(-1, 1, 2)
-            geo_ransac_thresh = max(_C.RANSAC_REPROJ_THRESHOLD * neural_res, 20.0)
+            _match_p = _get_params().matching
+            geo_ransac_thresh = max(_match_p.ransac_reproj_threshold * neural_res, 20.0)
             _, geo_inliers = cv2.estimateAffine2D(
                 geo_src, geo_dst, method=cv2.RANSAC,
                 ransacReprojThreshold=geo_ransac_thresh)
@@ -1301,7 +1622,7 @@ def step_feature_matching(state: AlignState, args, profiler=None) -> AlignState:
         )
         with _p.section("gcp_selection"):
             state.matched_pairs, state.gcp_coverage = select_best_gcps(
-                train_pairs, state.overlap,
+                train_pairs, state.overlap.as_tuple(),
                 target_count=60 if state.best else 40,
                 correction_outliers=state.correction_outliers,
                 arr_ref=arr_ref_fine,
@@ -1483,9 +1804,9 @@ def _second_neural_pass(state, src_ref, src_offset, neural_res, fine_res,
           f"at {coarse_neural_res:.1f}m/px...")
     try:
         arr_ref_c, ref_c_t = read_overlap_region(
-            src_ref, state.overlap, state.work_crs, coarse_neural_res)
+            src_ref, state.overlap.as_tuple(), state.work_crs, coarse_neural_res)
         arr_off_c, off_c_t = read_overlap_region(
-            src_offset, state.overlap, state.work_crs, coarse_neural_res)
+            src_offset, state.overlap.as_tuple(), state.work_crs, coarse_neural_res)
         shift_x_c = int(round(state.coarse_dx / coarse_neural_res))
         shift_y_c = int(round(state.coarse_dy / coarse_neural_res))
         if shift_x_c == 0 and shift_y_c == 0:
@@ -1527,7 +1848,7 @@ def _second_neural_pass(state, src_ref, src_offset, neural_res, fine_res,
                 + "..."
             )
             state.matched_pairs, state.gcp_coverage = select_best_gcps(
-                train_pairs, state.overlap,
+                train_pairs, state.overlap.as_tuple(),
                 target_count=60 if state.best else 40,
                 correction_outliers=state.correction_outliers,
                 arr_ref=arr_ref_fine,
@@ -1550,9 +1871,9 @@ def _ncc_fallback(state: AlignState, src_ref, src_offset, neural_res):
         print("Step 2 (NCC fallback): Fine NCC + phase-correlation refinement (small offset mode)", flush=True)
         ncc_fine_res = 1.0 if state.best else 2.0
         arr_ref_match, ref_match_transform = read_overlap_region(
-            src_ref, state.overlap, state.work_crs, ncc_fine_res)
+            src_ref, state.overlap.as_tuple(), state.work_crs, ncc_fine_res)
         arr_offset_match, offset_match_transform = read_overlap_region(
-            src_offset, state.overlap, state.work_crs, ncc_fine_res)
+            src_offset, state.overlap.as_tuple(), state.work_crs, ncc_fine_res)
 
         h_img, w_img = arr_ref_match.shape
         ref_u8 = clahe_normalize(arr_ref_match)
@@ -1607,9 +1928,9 @@ def _ncc_fallback(state: AlignState, src_ref, src_offset, neural_res):
         print("Step 2 (NCC fallback): Land mask template matching at grid points", flush=True)
         match_res = state.match_res
         arr_ref_match, ref_match_transform = read_overlap_region(
-            src_ref, state.overlap, state.work_crs, match_res)
+            src_ref, state.overlap.as_tuple(), state.work_crs, match_res)
         arr_offset_match, offset_match_transform = read_overlap_region(
-            src_offset, state.overlap, state.work_crs, match_res)
+            src_offset, state.overlap.as_tuple(), state.work_crs, match_res)
 
         h_img, w_img = arr_ref_match.shape
         ref_land = make_land_mask(arr_ref_match)
@@ -1952,16 +2273,16 @@ def step_validate_and_filter(state: AlignState) -> AlignState:
                 print(f"    All {n_before_tin} GCPs passed topological check")
 
         # --- FPP Accuracy Difference optimization (Phase B) ---
-        _skip_fpp = getattr(_C, 'SKIP_FPP', state.skip_fpp)
+        _skip_fpp = state.skip_fpp
         if not _skip_fpp and len(state.matched_pairs) >= 6 and boundary_pairs_geo:
             fpp_res = max(state.offset_res_m, state.ref_res_m, 2.0)
             print(f"  FPP accuracy optimization at {fpp_res:.1f}m/px...")
             try:
                 src_ref_fpp = rasterio.open(state.reference_path)
                 arr_ref_fpp, ref_fpp_transform = read_overlap_region(
-                    src_ref_fpp, state.overlap, state.work_crs, fpp_res)
+                    src_ref_fpp, state.overlap.as_tuple(), state.work_crs, fpp_res)
                 arr_off_fpp, off_fpp_transform = read_overlap_region(
-                    src_offset, state.overlap, state.work_crs, fpp_res)
+                    src_offset, state.overlap.as_tuple(), state.work_crs, fpp_res)
                 src_ref_fpp.close()
 
                 n_before_fpp = len(state.matched_pairs)
@@ -2005,7 +2326,7 @@ def step_validate_and_filter(state: AlignState) -> AlignState:
             debug_output = state.output_path.replace('.tif', '_debug.jpg')
         print(f"  Saving diagnostic visualization to {os.path.basename(debug_output)}...")
         with rasterio.open(state.reference_path) as src_ref:
-            generate_debug_image(src_ref, src_offset, state.overlap, state.work_crs,
+            generate_debug_image(src_ref, src_offset, state.overlap.as_tuple(), state.work_crs,
                                  state.matched_pairs, state.geo_residuals,
                                  state.mean_residual, debug_output)
 
@@ -2148,7 +2469,7 @@ def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
             raise UserAbortError("User declined warp application")
 
     # Output in Web Mercator for web overlay
-    output_crs = CRS.from_epsg(OUTPUT_CRS_EPSG)
+    output_crs = WEB_MERCATOR
     qa_eval_res = max(2.0, min(6.0, max(state.offset_res_m, state.ref_res_m)))
 
     all_gcps = list(state.gcps) + list(state.boundary_gcps)
@@ -2161,7 +2482,7 @@ def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
     with _p.section("apply_warp"):
         apply_warp(state.current_input, state.output_path, state.reference_path, all_gcps,
                    state.work_crs,
-                   output_bounds=state.overlap,
+                   output_bounds=state.overlap.as_tuple(),
                    output_res=state.offset_res_m,
                    output_crs=output_crs,
                    grid_size=state.grid_size,
@@ -2185,7 +2506,7 @@ def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
             qa_grid = evaluate_alignment_quality_paths(
                 state.output_path,
                 state.reference_path,
-                state.overlap,
+                state.overlap.as_tuple(),
                 state.work_crs,
                 eval_res=qa_eval_res,
                 mask_mode=state.mask_provider,
@@ -2206,13 +2527,13 @@ def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
                 tps_ok = _tps_warp_gcps(
                     state.current_input, tps_tmp,
                     all_gcps, state.work_crs, output_crs,
-                    state.overlap, state.offset_res_m,
+                    state.overlap.as_tuple(), state.offset_res_m,
                 )
                 if tps_ok:
                     try:
                         flow_applied = apply_flow_refinement_to_file(
                             tps_tmp, state.reference_path,
-                            state.work_crs, state.overlap,
+                            state.work_crs, state.overlap.as_tuple(),
                             state.offset_res_m,
                         )
                         if flow_applied:
@@ -2222,7 +2543,7 @@ def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
                     qa_tps = evaluate_alignment_quality_paths(
                         tps_tmp,
                         state.reference_path,
-                        state.overlap,
+                        state.overlap.as_tuple(),
                         state.work_crs,
                         eval_res=qa_eval_res,
                         mask_mode=state.mask_provider,
@@ -2237,7 +2558,7 @@ def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
             "grid",
             state.output_path,
             state.reference_path,
-            state.overlap,
+            state.overlap.as_tuple(),
             state.work_crs,
             holdout_pairs=state.qa_holdout_pairs,
             M_geo=state.M_geo,
@@ -2259,7 +2580,7 @@ def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
                 "tps",
                 tps_tmp,
                 state.reference_path,
-                state.overlap,
+                state.overlap.as_tuple(),
                 state.work_crs,
                 holdout_pairs=state.qa_holdout_pairs,
                 M_geo=state.M_geo,
@@ -2376,6 +2697,8 @@ def run(args, model_cache=None, profile=True) -> str:
                             os.path.join(state.diagnostics_dir, "checkpoints"))
         with profiler.section("coarse_offset"):
             state = step_coarse_offset(state, profiler=profiler)
+        with profiler.section("orthorectify"):
+            state = step_orthorectify(state)
         with profiler.section("handle_large_offset"):
             state = step_handle_large_offset(state, args)
         with profiler.section("scale_rotation"):

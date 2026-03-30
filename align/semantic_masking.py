@@ -241,9 +241,6 @@ class CoastalObiaMaskProvider:
         valid = arr > 0
         u8 = to_u8(arr)
 
-        # Adapt kernel sizes to effective resolution.  At full resolution
-        # (scale=1.0) we use 5x5 / 11x11.  When downscaled we shrink the
-        # kernels proportionally but clamp to a 3x3 minimum (must be odd).
         def _kern(base_k: int) -> int:
             k = max(3, int(round(base_k * scale)))
             return k if k % 2 == 1 else k + 1
@@ -277,15 +274,10 @@ class CoastalObiaMaskProvider:
         brightness = np.zeros_like(local_mean, dtype=np.float32)
         brightness[valid] = local_mean[valid] / 255.0
 
-        # Broad water-like definition for morphological reconstruction.
-        # At reduced resolution downsampling acts as a low-pass filter,
-        # suppressing both gradient and local-std signals.  We compensate
-        # by tightening the thresholds proportionally so textured land
-        # does not leak into the waterlike mask.
-        wl_grad_mid = min(0.28, 0.28 * scale)   # class-1 gradient gate
-        wl_std_mid  = min(0.18, 0.18 * scale)   # class-1 std gate
-        wl_grad_low = min(0.10, 0.10 * scale)   # catch-all gradient
-        wl_std_low  = min(0.08, 0.08 * scale)   # catch-all std
+        wl_grad_mid = min(0.28, 0.28 * scale)   
+        wl_std_mid  = min(0.18, 0.18 * scale)   
+        wl_grad_low = min(0.10, 0.10 * scale)   
+        wl_std_low  = min(0.08, 0.08 * scale)   
 
         waterlike = (
             class_0
@@ -315,16 +307,11 @@ class CoastalObiaMaskProvider:
         if float(np.mean(sea_connected[valid])) < 0.01:
             return None
 
-        # Distance to sea and support fields.
-        # All pixel-distance thresholds are expressed in "full-res equivalent
-        # pixels" so they stay constant regardless of the downscale factor.
         dist_to_sea = ndi.distance_transform_edt(~sea_connected)
 
         if _debug_dir:
             self._dump_sea_distance(arr, sea_connected, dist_to_sea, land, _debug_dir)
 
-        # Scale distance thresholds: at full res we use 20px for inland_land;
-        # at half res the same ground distance is 10px, etc.
         inland_thresh = max(4.0, 20.0 * scale)
         coastal_band_thresh = max(8.0, 40.0 * scale)
         near_sea_thresh = max(5.0, 24.0 * scale)
@@ -332,25 +319,16 @@ class CoastalObiaMaskProvider:
         cc_dist_thresh = max(4.0, 18.0 * scale)
 
         inland_land = land & (dist_to_sea >= inland_thresh)
-        # The land_support dilation must reach at least `inland_thresh`
-        # pixels so that coastal land immediately seaward of inland_land
-        # is marked as supported.  At full resolution the 5x5 kernel with
-        # 3 iterations reaches ~9px (> 20px not guaranteed, but the inland
-        # threshold already carves a wide buffer).  We keep the same
-        # *ground distance* reach at every scale.
         morph_k = max(3, _kern(5))
-        # Each dilation iteration extends by ~(morph_k//2) pixels.
-        # We want total reach >= inland_thresh + small margin.
         reach_per_iter = max(1, morph_k // 2)
         morph_iters = max(1, int(np.ceil((inland_thresh + 2) / reach_per_iter)))
+        
         land_support = cv2.dilate(
             inland_land.astype(np.uint8),
             np.ones((morph_k, morph_k), np.uint8),
             iterations=morph_iters,
         ) > 0
 
-        # Sea margin dilation — same ground-distance reach as full-res (3
-        # iterations of 5x5 ≈ 9px at full res → 9*scale px at downscaled).
         sea_margin_reach = max(3.0, 9.0 * scale)
         sea_margin_iters = max(1, int(np.ceil(sea_margin_reach / reach_per_iter)))
         sea_margin = cv2.dilate(
@@ -359,7 +337,6 @@ class CoastalObiaMaskProvider:
             iterations=sea_margin_iters,
         ) > 0
 
-        # Segment the coastal band
         coastal_band = ((dist_to_sea <= coastal_band_thresh) | sea_margin) & valid
         coastal_area = int(np.count_nonzero(coastal_band))
         min_coastal = max(100, int(round(500 * scale * scale)))
@@ -372,20 +349,11 @@ class CoastalObiaMaskProvider:
             std_norm,
         ])
 
-        # felzenszwalb parameter adaptation for downscaled images.
-        # - `scale` (felzenszwalb sense): controls the observation-vs-boundary
-        #   cost tradeoff.  At lower resolution each pixel covers more ground,
-        #   so we reduce it proportionally to avoid over-merging disparate
-        #   coastal features (shoal + land) into single segments.
-        # - `sigma`: pre-smoothing before graph construction.  Downsampling
-        #   already acts as a low-pass filter, so we reduce sigma to preserve
-        #   the fine edges that distinguish shoals from land.
-        # - `min_size`: post-merge threshold.  Scale quadratically with the
-        #   downscale factor since area shrinks as scale^2.
         fz_scale = max(20.0, 100.0 * scale)
         fz_sigma = max(0.3, 0.8 * scale)
         min_size = max(8, min(256, int(round(coastal_area * scale / 10000.0 * scale))))
         min_size = max(min_size, int(round(32 * scale * scale)))
+        
         segments = felzenszwalb(
             seg_features, scale=fz_scale, sigma=fz_sigma, min_size=min_size,
             channel_axis=-1,

@@ -355,7 +355,9 @@ def detect_multiscale_ncc(ref_land, offset_land, expected_scale):
     if template.shape[0] < 20 or template.shape[1] < 20:
         return None
 
-    scale_min, scale_max = 0.7, 1.35
+    # Adaptive scale range centered on expected_scale
+    scale_min = max(0.4, expected_scale * 0.7)
+    scale_max = min(2.0, expected_scale * 1.5)
     n_scales = 25
     scales = np.linspace(scale_min, scale_max, n_scales)
     rotations = np.linspace(-6, 6, 13)
@@ -395,21 +397,21 @@ def _gate_neural(result):
         return False
     sx, sy, rot, n_inliers = result
     avg = (sx + sy) / 2
-    return n_inliers >= 8 and 0.75 < avg < 1.30
+    return n_inliers >= 8 and 0.45 < avg < 1.80
 
 
 def _gate_ncc_land(result):
     if result is None:
         return False
     scale, rot, corr = result
-    return corr >= 0.55 and 0.75 < scale < 1.30
+    return corr >= 0.55 and 0.45 < scale < 1.80
 
 
 def _gate_ncc_gradient(result):
     if result is None:
         return False
     scale, rot, corr = result
-    return corr >= 0.4 and 0.75 < scale < 1.30
+    return corr >= 0.4 and 0.45 < scale < 1.80
 
 
 def _to_scale_result_4(result, method):
@@ -641,8 +643,8 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
                     sx, sy, rot, n_inliers, _inlier_mask = res_affine
                     avg_s = (sx + sy) / 2
                     
-                    if not (0.75 < avg_s < 1.30) or n_inliers < 8:
-                        reason = "scale out of range" if not (0.75 < avg_s < 1.30) else "too few inliers"
+                    if not (0.45 < avg_s < 1.80) or n_inliers < 8:
+                        reason = "scale out of range" if not (0.45 < avg_s < 1.80) else "too few inliers"
                         print(f"{label}: rejected ({reason}, s={avg_s:.4f}, n={n_inliers})")
                         status = 'rejected'
                     else:
@@ -759,13 +761,12 @@ def apply_scale_rotation_precorrection(input_path, scale, rotation_deg, work_crs
 
     Returns path to the corrected temporary file, or None on failure.
     """
-    src = rasterio.open(input_path)
-    width = src.width
-    height = src.height
-    src_transform = src.transform
-    src_crs = src.crs
-    src_bounds = src.bounds
-    src.close()
+    with rasterio.open(input_path) as src:
+        width = src.width
+        height = src.height
+        src_transform = src.transform
+        src_crs = src.crs
+        src_bounds = src.bounds
 
     if overlap_center is not None:
         cx, cy = overlap_center
@@ -870,12 +871,11 @@ def apply_local_scale_precorrection(input_path, patch_results, work_crs,
 
     Returns path to the corrected temporary file, or None on failure.
     """
-    src = rasterio.open(input_path)
-    width = src.width
-    height = src.height
-    src_transform = src.transform
-    src_crs = src.crs
-    src.close()
+    with rasterio.open(input_path) as src:
+        width = src.width
+        height = src.height
+        src_transform = src.transform
+        src_crs = src.crs
 
     centers = np.array([[p['cx'], p['cy']] for p in patch_results])
     sx_vals = np.array([p['scale_x'] for p in patch_results])

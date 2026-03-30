@@ -124,6 +124,25 @@ def load_version(version_dir):
             row["icp"] = summary.get("icp")
             row["step_timings"] = summary.get("step_timings")
             row["exit_code"] = summary.get("exit_code")
+            if summary.get("ground_truth"):
+                row["ground_truth"] = summary["ground_truth"]
+        except Exception:
+            pass
+
+    # Also check for standalone gt_eval.json
+    gt_eval_path = v_path / "gt_eval.json"
+    if gt_eval_path.exists() and "ground_truth" not in row:
+        try:
+            gt = json.loads(gt_eval_path.read_text())
+            row["ground_truth"] = {
+                "oracle_median_m": gt.get("oracle_median_m"),
+                "oracle_mean_m": gt.get("oracle_mean_m"),
+                "oracle_p90_m": gt.get("oracle_p90_m"),
+                "oracle_patch_count": gt.get("oracle_patch_count"),
+                "grid_median_m": gt.get("grid", {}).get("grid_median_m"),
+                "coastal_median_m": gt.get("coastal", {}).get("median_m"),
+                "inland_median_m": gt.get("inland", {}).get("median_m"),
+            }
         except Exception:
             pass
 
@@ -287,7 +306,9 @@ def format_text(rows, baseline_version=None):
         print(f"\n=== Score Breakdown (v{latest['version']}) ===")
         total_score = lg.get("score", 0)
         # Support both old keys (west_contrib etc.) and new keys (grid_contrib etc.)
-        breakdown_keys = ["grid_contrib", "patch_contrib", "stable_iou_penalty", "shore_iou_penalty",
+        breakdown_keys = ["grid_contrib", "patch_contrib",
+                          "stable_boundary_penalty", "shore_boundary_penalty",
+                          "stable_iou_penalty", "shore_iou_penalty",
                           "west_contrib", "center_contrib", "east_contrib", "north_contrib"]
         for key in breakdown_keys:
             val = sb.get(key)
@@ -337,6 +358,22 @@ def format_text(rows, baseline_version=None):
             print(f"  ICP: applied (dx={icp.get('dx_m', '?')}m, dy={icp.get('dy_m', '?')}m)")
         elif icp.get("applied") is False:
             print(f"  ICP: skipped ({icp.get('reason', 'unknown')})")
+
+    # Ground truth (latest)
+    gt = latest.get("ground_truth")
+    if gt:
+        print(f"\n=== Ground Truth (v{latest['version']}) ===")
+        for key, label in [("oracle_median_m", "Oracle median"),
+                           ("oracle_mean_m", "Oracle mean"),
+                           ("oracle_p90_m", "Oracle p90"),
+                           ("grid_median_m", "Grid median"),
+                           ("coastal_median_m", "Coastal median"),
+                           ("inland_median_m", "Inland median")]:
+            val = gt.get(key)
+            if val is not None:
+                print(f"  {label:>16}: {val:.1f}m")
+        if gt.get("oracle_patch_count"):
+            print(f"  {'Patch count':>16}: {gt['oracle_patch_count']}")
 
     # Best-ever
     print(f"\n=== Best-Ever Comparison ===")
@@ -446,6 +483,9 @@ def format_json(rows, baseline_version=None):
     # Score breakdown
     score_breakdown = lg.get("score_breakdown") if lg else None
 
+    # Ground truth
+    ground_truth = latest.get("ground_truth")
+
     output = {
         "versions": rows,
         "latest": latest,
@@ -454,6 +494,7 @@ def format_json(rows, baseline_version=None):
         "best_ever": best_ever,
         "process_health": process_health,
         "score_breakdown": score_breakdown,
+        "ground_truth": ground_truth,
     }
 
     print(json.dumps(output, indent=2))

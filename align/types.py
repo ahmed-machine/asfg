@@ -24,6 +24,28 @@ class MaskMode(str, Enum):
     COASTAL_OBIA = "coastal_obia"
 
 
+class MaskProvider(str, Enum):
+    """Mask provider backend for pipeline-level mask_provider field."""
+    HEURISTIC = "heuristic"
+    COASTAL_OBIA = "coastal_obia"
+
+
+# ---------------------------------------------------------------------------
+# Bounding box
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BBox:
+    """Axis-aligned bounding box in projected coordinates."""
+    left: float
+    bottom: float
+    right: float
+    top: float
+
+    def as_tuple(self) -> tuple[float, float, float, float]:
+        return (self.left, self.bottom, self.right, self.top)
+
+
 # ---------------------------------------------------------------------------
 # Result dataclasses for function returns (replacing bare tuples)
 # ---------------------------------------------------------------------------
@@ -243,6 +265,7 @@ class QaReport:
     cv_mean_m: Optional[float] = None
     hypothesis_id: str = ""
     reasons: list[str] = field(default_factory=list)
+    quality_grade: str = "D"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

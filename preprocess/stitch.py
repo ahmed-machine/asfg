@@ -136,9 +136,13 @@ def _ncc_overlap(frame_a_path: str, frame_b_path: str, rotated: bool = False,
 
 
 def compute_overlap(frame_a_path: str, frame_b_path: str, scale: float = 0.10) -> tuple:
-    """Compute horizontal overlap between two adjacent frames using SIFT.
+    """Compute horizontal overlap between two adjacent scanner tiles.
 
-    Falls back to NCC template matching if SIFT doesn't find enough matches.
+    Uses SIFT feature matching on CLAHE-normalized full-frame images.
+    SIFT naturally focuses on textured regions (land, coastlines) and
+    ignores featureless areas (sea, black borders).
+
+    Tests both normal and 180°-flipped orientations of B.
 
     Returns (overlap_px, frame_b_is_rotated, match_count).
     """
@@ -153,145 +157,67 @@ def compute_overlap(frame_a_path: str, frame_b_path: str, scale: float = 0.10) -
     w_a, h_a = ds_a.RasterXSize, ds_a.RasterYSize
     w_b, h_b = ds_b.RasterXSize, ds_b.RasterYSize
 
-    strip_frac = 0.30
-    strip_w_a = int(w_a * strip_frac)
-    strip_w_b = int(w_b * strip_frac)
+    ow_a, oh_a = max(128, int(w_a * scale)), max(128, int(h_a * scale))
+    ow_b, oh_b = max(128, int(w_b * scale)), max(128, int(h_b * scale))
 
-    out_w_a = int(strip_w_a * scale)
-    out_h_a = int(h_a * scale)
-    out_w_b = int(strip_w_b * scale)
-    out_h_b = int(h_b * scale)
-
-    band_a = ds_a.GetRasterBand(1)
-    band_b = ds_b.GetRasterBand(1)
-
-    # Right edge of A
-    img_a = band_a.ReadAsArray(
-        xoff=w_a - strip_w_a, yoff=0, win_xsize=strip_w_a, win_ysize=h_a,
-        buf_xsize=out_w_a, buf_ysize=out_h_a,
-    )
-    # Left edge of B (normal orientation)
-    img_b = band_b.ReadAsArray(
-        xoff=0, yoff=0, win_xsize=strip_w_b, win_ysize=h_b,
-        buf_xsize=out_w_b, buf_ysize=out_h_b,
-    )
-
-    if img_a is None or img_b is None:
-        ds_a = ds_b = None
-        return (0, False, 0)
-
-    img_a = img_a.astype(np.uint8)
-    img_b = img_b.astype(np.uint8)
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    img_a_eq = clahe.apply(img_a)
-    img_b_eq = clahe.apply(img_b)
-
-    sift = cv2.SIFT_create(nfeatures=5000)
-    kp_a, desc_a = sift.detectAndCompute(img_a_eq, None)
-    kp_b, desc_b = sift.detectAndCompute(img_b_eq, None)
-
-    if desc_a is None or desc_b is None or len(kp_a) < 10 or len(kp_b) < 10:
-        ds_a = ds_b = None
-        return (0, False, 0)
-
-    FLANN_INDEX_KDTREE = 1
-    flann = cv2.FlannBasedMatcher(
-        dict(algorithm=FLANN_INDEX_KDTREE, trees=5),
-        dict(checks=50),
-    )
-    raw_matches = flann.knnMatch(desc_b, desc_a, k=2)
-
-    good = []
-    for pair in raw_matches:
-        if len(pair) == 2:
-            m, n = pair
-            if m.distance < 0.7 * n.distance:
-                good.append(m)
-
-    if len(good) >= 10:
-        ds_a = ds_b = None
-        pts_b = np.float32([kp_b[m.queryIdx].pt for m in good])
-        pts_a = np.float32([kp_a[m.trainIdx].pt for m in good])
-
-        dx_values = []
-        for pa, pb in zip(pts_a, pts_b):
-            overlap_px = strip_w_a - pa[0] / scale + pb[0] / scale
-            dx_values.append(overlap_px)
-
-        median_overlap = round(np.median(dx_values))
-        if median_overlap < 0 or median_overlap > w_a * 0.5:
-            return (0, False, 0)
-
-        print(f"    Matches: {len(good)}, median overlap: {median_overlap}px "
-              f"({100 * median_overlap / w_a:.1f}%)")
-        return (median_overlap, False, len(good))
-
-    # Try with B rotated 180 degrees
-    print(f"    Only {len(good)} matches in normal orientation, trying 180 rotation...")
-
-    strip_w_b_right = int(w_b * strip_frac)
-    out_w_b_right = int(strip_w_b_right * scale)
-    out_h_b_right = int(h_b * scale)
-
-    img_b_right = band_b.ReadAsArray(
-        xoff=w_b - strip_w_b_right, yoff=0,
-        win_xsize=strip_w_b_right, win_ysize=h_b,
-        buf_xsize=out_w_b_right, buf_ysize=out_h_b_right,
-    )
+    img_a = ds_a.GetRasterBand(1).ReadAsArray(buf_xsize=ow_a, buf_ysize=oh_a).astype(np.uint8)
+    img_b = ds_b.GetRasterBand(1).ReadAsArray(buf_xsize=ow_b, buf_ysize=oh_b).astype(np.uint8)
     ds_a = ds_b = None
 
-    if img_b_right is None:
+    if img_a is None or img_b is None:
         return (0, False, 0)
 
-    img_b_rot = img_b_right[::-1, ::-1].astype(np.uint8)
-    img_b_rot_eq = clahe.apply(img_b_rot)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    img_a = clahe.apply(img_a)
+    img_b_norm = clahe.apply(img_b)
+    img_b_rot = img_b_norm[::-1, ::-1]
 
-    kp_b_rot, desc_b_rot = sift.detectAndCompute(img_b_rot_eq, None)
-    if desc_b_rot is None or len(kp_b_rot) < 10:
-        return (0, False, 0)
+    sift = cv2.SIFT_create(nfeatures=10000)
 
-    raw_matches_rot = flann.knnMatch(desc_b_rot, desc_a, k=2)
-    good_rot = []
-    for pair in raw_matches_rot:
-        if len(pair) == 2:
-            m, n = pair
-            if m.distance < 0.7 * n.distance:
-                good_rot.append(m)
+    def _sift_overlap(img1, img2, rotated=False):
+        kp1, desc1 = sift.detectAndCompute(img1, None)
+        kp2, desc2 = sift.detectAndCompute(img2, None)
+        if desc1 is None or desc2 is None or len(kp1) < 5 or len(kp2) < 5:
+            return 0, 0
+        flann = cv2.FlannBasedMatcher(
+            dict(algorithm=1, trees=5), dict(checks=50))
+        raw = flann.knnMatch(desc1, desc2, k=2)
+        good = [m for m, n in raw
+                if len([m, n]) == 2 and m.distance < 0.7 * n.distance]
+        if len(good) < 4:
+            return 0, len(good)
+        # Compute horizontal shift from matches
+        dxs = []
+        for m in good:
+            x1 = kp1[m.queryIdx].pt[0] / scale
+            x2 = kp2[m.trainIdx].pt[0] / scale
+            dxs.append(x2 - x1)
+        dxs = np.array(dxs)
+        # Robust median
+        median_dx = float(np.median(dxs))
+        # Reject outliers
+        inliers = np.abs(dxs - median_dx) < w_a * 0.05
+        if inliers.sum() >= 3:
+            median_dx = float(np.median(dxs[inliers]))
+        overlap = int(round(w_a - abs(median_dx)))
+        overlap = max(0, min(overlap, min(w_a, w_b) - 10))
+        label = " (180°)" if rotated else ""
+        print(f"    SIFT overlap{label}: {inliers.sum()}/{len(good)} inliers, "
+              f"dx={median_dx:.0f}px, overlap={overlap}px ({100*overlap/w_a:.0f}%)")
+        return overlap, int(inliers.sum())
 
-    if len(good_rot) < 10:
-        # SIFT failed in both orientations — try NCC fallback
-        print(f"    Only {len(good_rot)} rotated matches. Trying NCC fallback...")
-        # Try normal orientation first
-        ncc_overlap = _ncc_overlap(frame_a_path, frame_b_path, rotated=False)
-        if ncc_overlap > 0:
-            return (ncc_overlap, False, 0)
-        # Try rotated
-        ncc_overlap = _ncc_overlap(frame_a_path, frame_b_path, rotated=True)
-        if ncc_overlap > 0:
-            return (ncc_overlap, True, 0)
-        # Try reverse direction (B->A) — frames might be in wrong order
-        ncc_overlap = _ncc_overlap(frame_b_path, frame_a_path, rotated=False)
-        if ncc_overlap > 0:
-            print(f"    NOTE: Reverse direction B->A worked — frames may be misordered")
-            return (ncc_overlap, False, 0)
-        return (0, False, 0)
+    ov_n, n_n = _sift_overlap(img_a, img_b_norm, rotated=False)
+    ov_r, n_r = _sift_overlap(img_a, img_b_rot, rotated=True)
 
-    pts_b_rot = np.float32([kp_b_rot[m.queryIdx].pt for m in good_rot])
-    pts_a_rot = np.float32([kp_a[m.trainIdx].pt for m in good_rot])
+    # Pick the orientation with more inliers
+    if n_n >= n_r and n_n >= 3:
+        return (ov_n, False, n_n)
+    elif n_r >= 3:
+        return (ov_r, True, n_r)
 
-    dx_values = []
-    for pa, pb in zip(pts_a_rot, pts_b_rot):
-        overlap_px = strip_w_a - pa[0] / scale + pb[0] / scale
-        dx_values.append(overlap_px)
-
-    median_overlap = round(np.median(dx_values))
-    if median_overlap < 0 or median_overlap > w_a * 0.5:
-        return (0, False, 0)
-
-    print(f"    ROTATED matches: {len(good_rot)}, median overlap: {median_overlap}px "
-          f"({100 * median_overlap / w_a:.1f}%)")
-    return (median_overlap, True, len(good_rot))
+    # Both failed
+    print(f"    Overlap detection failed (inliers: norm={n_n}, rot={n_r})")
+    return (0, False, 0)
 
 
 def _blend_overlaps(output_path, frame_info, x_offsets, overlaps):
@@ -674,6 +600,87 @@ def discover_frame_order(frames, scale=0.10):
     return result_frames, overlaps, rot_flags
 
 
+def stitch_with_asp(frames: list, output_path: str, camera_name: str,
+                    entity_id: str, asp_params=None) -> str | None:
+    """Stitch sub-frames using ASP's image_mosaic (preferred when available).
+
+    ASP's image_mosaic is battle-tested on KH-4/KH-7/KH-9 scanner tiles
+    and handles overlap detection, blending, and rotation correctly.
+
+    Args:
+        frames: List of sub-frame TIFF paths.
+        output_path: Output stitched TIFF path.
+        camera_name: Camera system name (e.g. "KH-4", "KH-9").
+        entity_id: Entity ID for aft/fore detection.
+        asp_params: Optional AspParams from profile (for overlap/blend config).
+
+    Returns output_path on success, None if ASP is not available.
+    """
+    from .asp import find_asp_tool
+
+    asp_bin = find_asp_tool("image_mosaic")
+    if asp_bin is None:
+        return None
+
+    # Get overlap/blend from profile if available, else use camera-based defaults
+    camera_upper = camera_name.upper().replace("-", "")
+    if asp_params is not None and asp_params.stitch_overlap_width > 0:
+        overlap_width = asp_params.stitch_overlap_width
+        blend_radius = asp_params.stitch_blend_radius
+    elif camera_upper.startswith("KH4"):
+        overlap_width = 7000
+        blend_radius = 2000
+    elif camera_upper.startswith("KH7"):
+        overlap_width = 10000
+        blend_radius = 2000
+    else:
+        overlap_width = 3000
+        blend_radius = 2000
+
+    # KH-4: reverse frame order (d, c, b, a)
+    if camera_upper.startswith("KH4"):
+        ordered = list(reversed(frames))
+    else:
+        ordered = frames
+
+    # Detect Aft vs Forward camera from entity ID
+    is_aft = False
+    if camera_upper.startswith("KH4"):
+        parts = entity_id.upper()
+        if "DA" in parts and "DF" not in parts:
+            is_aft = True
+
+    cmd = [asp_bin] + ordered + [
+        "-o", output_path,
+        "--ot", "byte",
+        "--overlap-width", str(overlap_width),
+        "--blend-radius", str(blend_radius),
+    ]
+    if is_aft:
+        cmd.append("--rotate")
+
+    cam_label = "Aft (180° rotation)" if is_aft else "Forward"
+    print(f"  ASP image_mosaic: {len(frames)} frames, "
+          f"overlap={overlap_width}, blend={blend_radius}, camera={cam_label}")
+    print(f"  Order: {' → '.join(os.path.basename(f) for f in ordered)}")
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  ASP image_mosaic failed: {result.stderr[:500]}")
+        return None
+
+    # ASP appends "-tile-0.tif" to the output name
+    asp_output = output_path.replace(".tif", "-tile-0.tif")
+    if os.path.exists(asp_output) and not os.path.exists(output_path):
+        os.rename(asp_output, output_path)
+    elif not os.path.exists(output_path) and not os.path.exists(asp_output):
+        print(f"  ASP image_mosaic: no output file found")
+        return None
+
+    print(f"  ASP stitched: {output_path}")
+    return output_path
+
+
 def stitch_frames(frames: list, output_path: str, output_dir: str,
                   preserve_order: bool = False) -> str:
     """Stitch a list of frame paths into a single panoramic strip.
@@ -743,21 +750,38 @@ def stitch_frames(frames: list, output_path: str, output_dir: str,
                 overlaps.append(ov_ab if ov_ab > 0 else 0)
                 rotated_flags[1] = rot_ab if ov_ab > 0 else False
         else:
-            # For >2 frames, keep parallel sequential matching
-            with ProcessPoolExecutor() as executor:
-                futures = {}
-                for i in range(len(ordered_frames) - 1):
-                    fut = executor.submit(compute_overlap, ordered_frames[i], ordered_frames[i + 1])
-                    futures[fut] = i
-                results = [None] * (len(ordered_frames) - 1)
-                for fut in as_completed(futures):
-                    idx = futures[fut]
-                    results[idx] = fut.result()
-            for i, r in enumerate(results):
+            # For >2 frames, test BOTH directions (a→b→c→d vs d→c→b→a)
+            # and pick the one with higher total phase correlation score.
+            # KH-4 sub-frames are scanner tiles that may be in either
+            # left-to-right or right-to-left order depending on scanner setup.
+            fwd_frames = list(ordered_frames)
+            rev_frames = list(reversed(ordered_frames))
+
+            def _compute_sequential(frame_list):
+                results = []
+                total_score = 0.0
+                for i in range(len(frame_list) - 1):
+                    ov, rot, n = compute_overlap(frame_list[i], frame_list[i + 1])
+                    results.append((ov, rot, n))
+                    # Use overlap as score proxy (phase score not returned)
+                    total_score += ov
+                return results, total_score
+
+            fwd_results, fwd_score = _compute_sequential(fwd_frames)
+            rev_results, rev_score = _compute_sequential(rev_frames)
+
+            if rev_score > fwd_score * 1.05:
+                print(f"    Reversed frame order (score {rev_score:.0f} > {fwd_score:.0f})")
+                ordered_frames = rev_frames
+                chosen_results = rev_results
+            else:
+                chosen_results = fwd_results
+
+            for i, r in enumerate(chosen_results):
                 overlaps.append(r[0] if r else 0)
                 if r and r[1]:
-                    print(f"    Frame {i+1} needs 180° rotation")
-                    rotated_flags[i + 1] = True
+                    print(f"    Frame {i+1}: overlap detector suggested 180° "
+                          f"rotation — ignoring (sub-frames share orientation)")
     else:
         # Graph-based ordering — discover correct layout from all-pairs matching.
         ordered_frames, overlaps, rotated_flags = discover_frame_order(cropped_frames)

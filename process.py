@@ -21,8 +21,8 @@ import sys
 
 from preprocess.catalog import parse_csvs, group_into_strips, filter_scenes, identify_camera
 from preprocess.usgs import download_scenes, fetch_corners_batch, extract_archive, list_frames
-from preprocess.stitch import stitch_frames, compute_subset_corners, detect_subframe_seams, split_at_seams
-from preprocess.georef import georef_with_corners
+from preprocess.stitch import stitch_frames, stitch_with_asp, detect_subframe_seams, split_at_seams
+from preprocess.georef import georef_with_corners, coarse_align_and_crop
 from preprocess.mosaic import build_all_mosaics, build_mosaic
 from preprocess.georef import fetch_sentinel2_reference
 from preprocess.orientation import swap_corners_180, rotate_corners_cw90, rotate_corners_ccw90, detect_orientation, verify_orientation_against_reference
@@ -52,6 +52,102 @@ def ensure_dirs(output_dir: str):
         os.makedirs(os.path.join(output_dir, subdir), exist_ok=True)
 
 
+def _check_duplicate_scans(frame_a: str, frame_b: str) -> bool:
+    """Check if two frames are duplicate scans of the same film frame.
+
+    Uses phase correlation at low resolution.  If the horizontal shift is
+    less than 5% of image width, frames are considered duplicates.
+    Tests both normal and 180°-flipped orientations of B.
+    """
+    import numpy as np
+    from osgeo import gdal
+    gdal.UseExceptions()
+
+    ds_a = gdal.Open(frame_a)
+    ds_b = gdal.Open(frame_b)
+    if ds_a is None or ds_b is None:
+        return False
+
+    w_a, h_a = ds_a.RasterXSize, ds_a.RasterYSize
+    w_b, h_b = ds_b.RasterXSize, ds_b.RasterYSize
+
+    # Different sizes → not duplicates
+    if abs(w_a - w_b) > 100 or abs(h_a - h_b) > 100:
+        ds_a = ds_b = None
+        return False
+
+    # Read at ~2% scale
+    scale = 0.02
+    ow, oh = max(64, int(w_a * scale)), max(64, int(h_a * scale))
+
+    a = ds_a.GetRasterBand(1).ReadAsArray(buf_xsize=ow, buf_ysize=oh).astype(np.float32)
+    b = ds_b.GetRasterBand(1).ReadAsArray(buf_xsize=ow, buf_ysize=oh).astype(np.float32)
+    ds_a = ds_b = None
+
+    def _phase_corr_shift(img1, img2):
+        """Return (dx, dy) pixel shift via phase correlation."""
+        # Mask out black borders — crop to rows/cols where both have data
+        valid1 = img1 > 10
+        valid2 = img2 > 10
+        both_valid = valid1 & valid2
+        rows = np.any(both_valid, axis=1)
+        cols = np.any(both_valid, axis=0)
+        if not rows.any() or not cols.any():
+            return 0, 0, 0.0
+        r0, r1 = np.where(rows)[0][[0, -1]]
+        c0, c1 = np.where(cols)[0][[0, -1]]
+        i1 = img1[r0:r1+1, c0:c1+1]
+        i2 = img2[r0:r1+1, c0:c1+1]
+        if i1.shape[0] < 16 or i1.shape[1] < 16:
+            return 0, 0, 0.0
+
+        A = np.fft.fft2(i1)
+        B = np.fft.fft2(i2)
+        cross = A * np.conj(B)
+        cross /= np.abs(cross) + 1e-8
+        corr = np.fft.ifft2(cross).real
+        peak = np.unravel_index(np.argmax(corr), corr.shape)
+        dy, dx = peak[0], peak[1]
+        if dy > corr.shape[0] // 2:
+            dy -= corr.shape[0]
+        if dx > corr.shape[1] // 2:
+            dx -= corr.shape[1]
+        return dx, dy, float(corr.max())
+
+    # Test normal orientation
+    dx, dy, score = _phase_corr_shift(a, b)
+    dx_fullres = abs(dx / scale)
+    threshold = w_a * 0.05  # 5% of width
+
+    if dx_fullres < threshold and score > 0.02:
+        print(f"    Duplicate check: dx={dx_fullres:.0f}px "
+              f"({100*dx_fullres/w_a:.1f}%), score={score:.3f} → duplicate")
+        return True
+
+    # Test B flipped 180°
+    b_flip = b[::-1, ::-1]
+    dx2, dy2, score2 = _phase_corr_shift(a, b_flip)
+    dx2_fullres = abs(dx2 / scale)
+
+    if dx2_fullres < threshold and score2 > 0.02:
+        print(f"    Duplicate check (180°): dx={dx2_fullres:.0f}px "
+              f"({100*dx2_fullres/w_a:.1f}%), score={score2:.3f} → duplicate")
+        return True
+
+    print(f"    Duplicate check: dx={dx_fullres:.0f}px, "
+          f"dx_180={dx2_fullres:.0f}px → not duplicate (stitching)")
+    return False
+
+
+def _get_image_width(path: str) -> int:
+    """Get image width via GDAL."""
+    result = subprocess.run(["gdalinfo", "-json", path], capture_output=True, text=True)
+    if result.returncode != 0:
+        return 0
+    info = json.loads(result.stdout)
+    return info["size"][0]
+
+
 def _stitch_if_needed(frames: list[str], eid: str, camera,
                       stitched_path: str, output_dir: str) -> str:
     """Stitch frames or handle single-frame seam detection.
@@ -60,7 +156,11 @@ def _stitch_if_needed(frames: list[str], eid: str, camera,
     """
     if camera.needs_stitching and len(frames) > 1:
         print(f"\n  --- Stitch: {eid} ({len(frames)} frames) ---")
-        stitch_frames(frames, stitched_path, output_dir, preserve_order=True)
+        # Prefer ASP's image_mosaic when available (handles KH-4/7/9 correctly)
+        asp_result = stitch_with_asp(frames, stitched_path, camera.name, eid)
+        if asp_result is None:
+            print("  ASP not available, using built-in stitcher")
+            stitch_frames(frames, stitched_path, output_dir, preserve_order=True)
         return stitched_path
 
     if len(frames) == 1 and camera.needs_stitching:
@@ -143,10 +243,15 @@ def process_scene(scene, output_dir: str, file_map: dict, reference: str,
         print(f"\n  --- Georef: {eid} ---")
         georef_with_corners(input_for_orient, georef_path, gcp_corners)
 
-        # Step 5b: Post-georef verification (report only, no auto-correction)
+        # Step 5b: Post-georef verification — auto-correct if 180° flip needed
         if reference and os.path.exists(reference):
             print(f"\n  --- Post-georef orientation check: {eid} ---")
-            verify_orientation_against_reference(georef_path, reference)
+            correction = verify_orientation_against_reference(georef_path, reference)
+            if correction == 180:
+                print(f"  Auto-correcting: re-georeferencing with 180° flipped corners")
+                flipped_corners = swap_corners_180(gcp_corners)
+                os.remove(georef_path)
+                georef_with_corners(input_for_orient, georef_path, flipped_corners)
 
         # Clean up stitched intermediates to save disk
         stitched_int = os.path.join(output_dir, "stitched", f"{eid}_stitched.tif")
@@ -184,10 +289,25 @@ def generate_manifest(scenes: list, output_dir: str, reference: str) -> str:
             print(f"  [skip] Already aligned: {eid}")
             continue
 
+        # Coarse-align and crop wide strips to reference bbox before alignment.
+        # This finds the actual content overlap (accounting for USGS corner
+        # offset), shifts the image, and crops to the reference footprint +
+        # margin so the alignment pipeline doesn't search 200km of ocean.
+        input_for_align = georef_path
+        cropped_path = os.path.join(output_dir, "georef", f"{eid}_cropped.tif")
+        if not os.path.exists(cropped_path):
+            crop_result = coarse_align_and_crop(
+                georef_path, reference, cropped_path,
+            )
+            if crop_result:
+                input_for_align = crop_result
+        else:
+            input_for_align = cropped_path
+
         diag_dir = os.path.join(output_dir, "diagnostics", eid)
 
         jobs.append({
-            "input": os.path.abspath(georef_path),
+            "input": os.path.abspath(input_for_align),
             "output": os.path.abspath(aligned_path),
             "diagnostics_dir": os.path.abspath(diag_dir),
         })
@@ -367,7 +487,7 @@ def process_frames_dir(frames_dir: str, output_dir: str, crop_bbox: tuple = None
         if rotation != 0:
             print(f"  Orientation: {rotation} CW (via GCP assignment, no image rotation)")
 
-    # Step 4: Georeference
+    # Step 4: Georeference with corner coordinates
     print("\n" + "=" * 60)
     print("Step 4: Georeference with M2M corner coordinates")
     print("=" * 60)

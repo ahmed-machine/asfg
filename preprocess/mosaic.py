@@ -22,9 +22,11 @@ def _resample_to_common_grid(paths, tmp_dir):
     pixel_sizes = []
     for p in paths:
         ds = gdal.Open(p)
-        gt = ds.GetGeoTransform()
-        pixel_sizes.append((abs(gt[1]), abs(gt[5])))
-        ds = None
+        try:
+            gt = ds.GetGeoTransform()
+            pixel_sizes.append((abs(gt[1]), abs(gt[5])))
+        finally:
+            ds = None
 
     med_x = float(np.median([ps[0] for ps in pixel_sizes]))
     med_y = float(np.median([ps[1] for ps in pixel_sizes]))
@@ -69,15 +71,17 @@ def _compute_pairwise_corrections(paths):
     strip_info = []
     for i, p in enumerate(paths):
         ds = gdal.Open(p)
-        gt = ds.GetGeoTransform()
-        w, h = ds.RasterXSize, ds.RasterYSize
-        n_bands = ds.RasterCount
-        strip_info.append({
-            "path": p, "gt": gt, "w": w, "h": h, "idx": i,
-            "n_bands": n_bands,
-            "y_origin": gt[3],  # top-left Y (for sorting)
-        })
-        ds = None
+        try:
+            gt = ds.GetGeoTransform()
+            w, h = ds.RasterXSize, ds.RasterYSize
+            n_bands = ds.RasterCount
+            strip_info.append({
+                "path": p, "gt": gt, "w": w, "h": h, "idx": i,
+                "n_bands": n_bands,
+                "y_origin": gt[3],  # top-left Y (for sorting)
+            })
+        finally:
+            ds = None
 
     # Sort by Y-origin descending (northernmost first for typical projections)
     strip_info.sort(key=lambda s: -s["y_origin"])
@@ -161,16 +165,18 @@ def _compute_pairwise_corrections(paths):
 
         ds_a = gdal.Open(sa["path"])
         ds_b = gdal.Open(sb["path"])
-        # Read band 1 (data band), downsampled to bounded size
-        img_a = ds_a.GetRasterBand(1).ReadAsArray(
-            xoff=a_col, yoff=a_row, win_xsize=a_cols, win_ysize=a_rows,
-            buf_xsize=sample_w, buf_ysize=sample_h,
-        )
-        img_b = ds_b.GetRasterBand(1).ReadAsArray(
-            xoff=b_col, yoff=b_row, win_xsize=b_cols, win_ysize=b_rows,
-            buf_xsize=sample_w, buf_ysize=sample_h,
-        )
-        ds_a = ds_b = None
+        try:
+            # Read band 1 (data band), downsampled to bounded size
+            img_a = ds_a.GetRasterBand(1).ReadAsArray(
+                xoff=a_col, yoff=a_row, win_xsize=a_cols, win_ysize=a_rows,
+                buf_xsize=sample_w, buf_ysize=sample_h,
+            )
+            img_b = ds_b.GetRasterBand(1).ReadAsArray(
+                xoff=b_col, yoff=b_row, win_xsize=b_cols, win_ysize=b_rows,
+                buf_xsize=sample_w, buf_ysize=sample_h,
+            )
+        finally:
+            ds_a = ds_b = None
 
         if img_a is None or img_b is None:
             pairwise_shifts.append(None)
@@ -305,12 +311,14 @@ def _apply_geo_corrections(paths, corrections, tmp_dir):
         shutil.copy2(p, corrected)
 
         ds = gdal.Open(corrected, gdal.GA_Update)
-        gt = list(ds.GetGeoTransform())
-        gt[0] += dx  # X origin
-        gt[3] += dy  # Y origin
-        ds.SetGeoTransform(tuple(gt))
-        ds.FlushCache()
-        ds = None
+        try:
+            gt = list(ds.GetGeoTransform())
+            gt[0] += dx  # X origin
+            gt[3] += dy  # Y origin
+            ds.SetGeoTransform(tuple(gt))
+            ds.FlushCache()
+        finally:
+            ds = None
 
         out_paths.append(corrected)
 
@@ -334,13 +342,15 @@ def _find_seams(prepared_paths):
     strip_info = []
     for i, p in enumerate(prepared_paths):
         ds = gdal.Open(p)
-        gt = ds.GetGeoTransform()
-        w, h = ds.RasterXSize, ds.RasterYSize
-        strip_info.append({
-            "path": p, "gt": gt, "w": w, "h": h, "idx": i,
-            "y_origin": gt[3],
-        })
-        ds = None
+        try:
+            gt = ds.GetGeoTransform()
+            w, h = ds.RasterXSize, ds.RasterYSize
+            strip_info.append({
+                "path": p, "gt": gt, "w": w, "h": h, "idx": i,
+                "y_origin": gt[3],
+            })
+        finally:
+            ds = None
 
     strip_info.sort(key=lambda s: -s["y_origin"])
     n = len(strip_info)
@@ -402,28 +412,29 @@ def _find_seams(prepared_paths):
 
         ds_a = gdal.Open(sa["path"])
         ds_b = gdal.Open(sb["path"])
+        try:
+            img_a = ds_a.GetRasterBand(1).ReadAsArray(
+                xoff=a_col, yoff=a_row, win_xsize=a_cols, win_ysize=a_rows,
+                buf_xsize=out_w, buf_ysize=out_h,
+            ).astype(np.float32)
+            img_b = ds_b.GetRasterBand(1).ReadAsArray(
+                xoff=b_col, yoff=b_row, win_xsize=b_cols, win_ysize=b_rows,
+                buf_xsize=out_w, buf_ysize=out_h,
+            ).astype(np.float32)
 
-        img_a = ds_a.GetRasterBand(1).ReadAsArray(
-            xoff=a_col, yoff=a_row, win_xsize=a_cols, win_ysize=a_rows,
-            buf_xsize=out_w, buf_ysize=out_h,
-        ).astype(np.float32)
-        img_b = ds_b.GetRasterBand(1).ReadAsArray(
-            xoff=b_col, yoff=b_row, win_xsize=b_cols, win_ysize=b_rows,
-            buf_xsize=out_w, buf_ysize=out_h,
-        ).astype(np.float32)
-
-        # Also read alpha to mask invalid areas
-        alpha_idx_a = ds_a.RasterCount
-        alpha_idx_b = ds_b.RasterCount
-        alpha_a = ds_a.GetRasterBand(alpha_idx_a).ReadAsArray(
-            xoff=a_col, yoff=a_row, win_xsize=a_cols, win_ysize=a_rows,
-            buf_xsize=out_w, buf_ysize=out_h,
-        )
-        alpha_b = ds_b.GetRasterBand(alpha_idx_b).ReadAsArray(
-            xoff=b_col, yoff=b_row, win_xsize=b_cols, win_ysize=b_rows,
-            buf_xsize=out_w, buf_ysize=out_h,
-        )
-        ds_a = ds_b = None
+            # Also read alpha to mask invalid areas
+            alpha_idx_a = ds_a.RasterCount
+            alpha_idx_b = ds_b.RasterCount
+            alpha_a = ds_a.GetRasterBand(alpha_idx_a).ReadAsArray(
+                xoff=a_col, yoff=a_row, win_xsize=a_cols, win_ysize=a_rows,
+                buf_xsize=out_w, buf_ysize=out_h,
+            )
+            alpha_b = ds_b.GetRasterBand(alpha_idx_b).ReadAsArray(
+                xoff=b_col, yoff=b_row, win_xsize=b_cols, win_ysize=b_rows,
+                buf_xsize=out_w, buf_ysize=out_h,
+            )
+        finally:
+            ds_a = ds_b = None
 
         # Cost: pixel difference + edge penalty
         diff = np.abs(img_a - img_b)
@@ -578,6 +589,21 @@ def _multiband_blend(prepared_paths, seams, strip_info, output_path):
     gdal.UseExceptions()
 
     datasets = [gdal.Open(p) for p in prepared_paths]
+    try:
+        _multiband_blend_inner(datasets, seams, strip_info, output_path)
+    finally:
+        for _ds in datasets:
+            _ds = None
+        del datasets
+    print(f"    Blending: 100%")
+
+
+def _multiband_blend_inner(datasets, seams, strip_info, output_path):
+    """Inner implementation of multiband blend (called with datasets already open)."""
+    from osgeo import gdal
+    import numpy as np
+    import cv2
+
     gts = [ds.GetGeoTransform() for ds in datasets]
     pixel_w = gts[0][1]
     pixel_h = gts[0][5]
@@ -840,9 +866,6 @@ def _multiband_blend(prepared_paths, seams, strip_info, output_path):
 
     out_ds.FlushCache()
     out_ds = None
-    for ds in datasets:
-        ds = None
-    print(f"    Blending: 100%")
 
 
 def _compute_radiometric_params(datasets, offsets, seams, strip_info):
@@ -1025,118 +1048,120 @@ def _prepare_strip(input_path, output_path, threshold=10, margin=500):
     gdal.UseExceptions()
 
     ds = gdal.Open(input_path)
-    n_bands = ds.RasterCount
-    w, h = ds.RasterXSize, ds.RasterYSize
+    try:
+        n_bands = ds.RasterCount
+        w, h = ds.RasterXSize, ds.RasterYSize
 
-    if n_bands < 2:
-        import shutil
-        shutil.copy2(input_path, output_path)
-        return
+        if n_bands < 2:
+            import shutil
+            shutil.copy2(input_path, output_path)
+            return
 
-    alpha_band_idx = n_bands
-    scale = 32
-    small_w, small_h = w // scale, h // scale
+        alpha_band_idx = n_bands
+        scale = 32
+        small_w, small_h = w // scale, h // scale
 
-    # --- Border detection at 1/32 scale ---
-    data_small = ds.GetRasterBand(1).ReadAsArray(
-        buf_xsize=small_w, buf_ysize=small_h
-    )
-    valid = (data_small > threshold).astype(np.uint8)
-
-    # Close to fill dark interior features (shadows, water bodies)
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    valid = cv2.morphologyEx(valid, cv2.MORPH_CLOSE, kernel_close)
-
-    # Open to remove noise specks in border region
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    valid = cv2.morphologyEx(valid, cv2.MORPH_OPEN, kernel_open)
-
-    # Fill interior holes — keeps only border-connected dark as "border"
-    valid = ndimage.binary_fill_holes(valid).astype(np.uint8)
-
-    # Mask film edge annotations (frame numbers, dates, fiducial marks)
-    # KH panoramic camera films have bright text in the top/bottom ~3% of the strip.
-    # These survive the threshold-based border detection because they're not black.
-    edge_band = max(3, int(small_h * 0.03))
-    valid[:edge_band, :] = 0
-    valid[-edge_band:, :] = 0
-
-    # Largest connected component filter to remove small isolated valid patches
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(valid, connectivity=8)
-    if n_labels > 2:
-        # Keep only the largest foreground component
-        # Label 0 is background; find largest among labels >= 1
-        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-        valid = (labels == largest).astype(np.uint8)
-
-    # --- Distance-based feathering at 1/32 scale ---
-    dist_small = cv2.distanceTransform(valid, cv2.DIST_L2, 5).astype(np.float32)
-    # Scale distances to full-res pixel units
-    dist_small *= scale
-    # Compute alpha weight: linear ramp from 0 at border to 1 at margin distance
-    margin_f = float(margin)
-    weight_small = np.clip(dist_small / margin_f, 0.0, 1.0).astype(np.float32)
-
-    print(f"      Border pixels (1/{scale}): {int(np.sum(valid == 0))} / {small_w * small_h} "
-          f"({100 * np.sum(valid == 0) / (small_w * small_h):.1f}%)")
-
-    # --- Full-res write (chunked) ---
-    driver = gdal.GetDriverByName("GTiff")
-    out_ds = driver.Create(output_path, w, h, n_bands,
-                           ds.GetRasterBand(1).DataType,
-                           ["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES",
-                            "BIGTIFF=IF_SAFER"])
-    if ds.GetGeoTransform():
-        out_ds.SetGeoTransform(ds.GetGeoTransform())
-    if ds.GetProjection():
-        out_ds.SetProjection(ds.GetProjection())
-
-    chunk_h = 1024
-    for y in range(0, h, chunk_h):
-        rows = min(chunk_h, h - y)
-
-        # Determine corresponding rows in the small image
-        sy_start = y // scale
-        sy_end = min((y + rows + scale - 1) // scale, small_h)
-
-        # Upscale mask and weight slices for this chunk
-        mask_slice = valid[sy_start:sy_end, :]
-        weight_slice = weight_small[sy_start:sy_end, :]
-
-        mask_full = cv2.resize(mask_slice, (w, rows),
-                               interpolation=cv2.INTER_NEAREST)
-        weight_full = cv2.resize(weight_slice, (w, rows),
-                                 interpolation=cv2.INTER_LINEAR)
-
-        # Copy data bands
-        for b in range(1, n_bands):
-            data = ds.GetRasterBand(b).ReadAsArray(
-                xoff=0, yoff=y, win_xsize=w, win_ysize=rows
-            )
-            out_ds.GetRasterBand(b).WriteArray(data, xoff=0, yoff=y)
-
-        # Process alpha
-        alpha_data = ds.GetRasterBand(alpha_band_idx).ReadAsArray(
-            xoff=0, yoff=y, win_xsize=w, win_ysize=rows
-        ).astype(np.float32)
-
-        # Zero alpha in border regions
-        alpha_data[mask_full == 0] = 0
-        # Apply feathering ramp in valid regions
-        valid_px = mask_full > 0
-        alpha_data[valid_px] = (alpha_data[valid_px] * weight_full[valid_px]).clip(0, 255)
-
-        out_ds.GetRasterBand(alpha_band_idx).WriteArray(
-            alpha_data.astype(np.uint8), xoff=0, yoff=y
+        # --- Border detection at 1/32 scale ---
+        data_small = ds.GetRasterBand(1).ReadAsArray(
+            buf_xsize=small_w, buf_ysize=small_h
         )
+        valid = (data_small > threshold).astype(np.uint8)
 
-        if y % (chunk_h * 50) == 0 and y > 0:
-            pct = int(100 * y / h)
-            print(f"      Strip prep: {pct}%")
+        # Close to fill dark interior features (shadows, water bodies)
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        valid = cv2.morphologyEx(valid, cv2.MORPH_CLOSE, kernel_close)
 
-    out_ds.FlushCache()
-    out_ds = None
-    ds = None
+        # Open to remove noise specks in border region
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        valid = cv2.morphologyEx(valid, cv2.MORPH_OPEN, kernel_open)
+
+        # Fill interior holes — keeps only border-connected dark as "border"
+        valid = ndimage.binary_fill_holes(valid).astype(np.uint8)
+
+        # Mask film edge annotations (frame numbers, dates, fiducial marks)
+        # KH panoramic camera films have bright text in the top/bottom ~3% of the strip.
+        # These survive the threshold-based border detection because they're not black.
+        edge_band = max(3, int(small_h * 0.03))
+        valid[:edge_band, :] = 0
+        valid[-edge_band:, :] = 0
+
+        # Largest connected component filter to remove small isolated valid patches
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(valid, connectivity=8)
+        if n_labels > 2:
+            # Keep only the largest foreground component
+            # Label 0 is background; find largest among labels >= 1
+            largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            valid = (labels == largest).astype(np.uint8)
+
+        # --- Distance-based feathering at 1/32 scale ---
+        dist_small = cv2.distanceTransform(valid, cv2.DIST_L2, 5).astype(np.float32)
+        # Scale distances to full-res pixel units
+        dist_small *= scale
+        # Compute alpha weight: linear ramp from 0 at border to 1 at margin distance
+        margin_f = float(margin)
+        weight_small = np.clip(dist_small / margin_f, 0.0, 1.0).astype(np.float32)
+
+        print(f"      Border pixels (1/{scale}): {int(np.sum(valid == 0))} / {small_w * small_h} "
+              f"({100 * np.sum(valid == 0) / (small_w * small_h):.1f}%)")
+
+        # --- Full-res write (chunked) ---
+        driver = gdal.GetDriverByName("GTiff")
+        out_ds = driver.Create(output_path, w, h, n_bands,
+                               ds.GetRasterBand(1).DataType,
+                               ["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES",
+                                "BIGTIFF=IF_SAFER"])
+        if ds.GetGeoTransform():
+            out_ds.SetGeoTransform(ds.GetGeoTransform())
+        if ds.GetProjection():
+            out_ds.SetProjection(ds.GetProjection())
+
+        chunk_h = 1024
+        for y in range(0, h, chunk_h):
+            rows = min(chunk_h, h - y)
+
+            # Determine corresponding rows in the small image
+            sy_start = y // scale
+            sy_end = min((y + rows + scale - 1) // scale, small_h)
+
+            # Upscale mask and weight slices for this chunk
+            mask_slice = valid[sy_start:sy_end, :]
+            weight_slice = weight_small[sy_start:sy_end, :]
+
+            mask_full = cv2.resize(mask_slice, (w, rows),
+                                   interpolation=cv2.INTER_NEAREST)
+            weight_full = cv2.resize(weight_slice, (w, rows),
+                                     interpolation=cv2.INTER_LINEAR)
+
+            # Copy data bands
+            for b in range(1, n_bands):
+                data = ds.GetRasterBand(b).ReadAsArray(
+                    xoff=0, yoff=y, win_xsize=w, win_ysize=rows
+                )
+                out_ds.GetRasterBand(b).WriteArray(data, xoff=0, yoff=y)
+
+            # Process alpha
+            alpha_data = ds.GetRasterBand(alpha_band_idx).ReadAsArray(
+                xoff=0, yoff=y, win_xsize=w, win_ysize=rows
+            ).astype(np.float32)
+
+            # Zero alpha in border regions
+            alpha_data[mask_full == 0] = 0
+            # Apply feathering ramp in valid regions
+            valid_px = mask_full > 0
+            alpha_data[valid_px] = (alpha_data[valid_px] * weight_full[valid_px]).clip(0, 255)
+
+            out_ds.GetRasterBand(alpha_band_idx).WriteArray(
+                alpha_data.astype(np.uint8), xoff=0, yoff=y
+            )
+
+            if y % (chunk_h * 50) == 0 and y > 0:
+                pct = int(100 * y / h)
+                print(f"      Strip prep: {pct}%")
+
+        out_ds.FlushCache()
+        out_ds = None
+    finally:
+        ds = None
 
 
 def _fill_interior_nodata(output_path):
@@ -1152,59 +1177,60 @@ def _fill_interior_nodata(output_path):
     gdal.UseExceptions()
 
     ds = gdal.Open(output_path, gdal.GA_Update)
-    w, h = ds.RasterXSize, ds.RasterYSize
-    scale = 32
-    small_w, small_h = w // scale, h // scale
+    try:
+        w, h = ds.RasterXSize, ds.RasterYSize
+        scale = 32
+        small_w, small_h = w // scale, h // scale
 
-    # Read alpha at reduced scale
-    alpha_small = ds.GetRasterBand(2).ReadAsArray(
-        buf_xsize=small_w, buf_ysize=small_h
-    )
-    has_data = alpha_small > 0
-    filled = ndimage.binary_fill_holes(has_data)
-    fill_mask_small = filled & ~has_data
+        # Read alpha at reduced scale
+        alpha_small = ds.GetRasterBand(2).ReadAsArray(
+            buf_xsize=small_w, buf_ysize=small_h
+        )
+        has_data = alpha_small > 0
+        filled = ndimage.binary_fill_holes(has_data)
+        fill_mask_small = filled & ~has_data
 
-    n_fill = int(np.sum(fill_mask_small))
-    if n_fill == 0:
-        print("    No interior nodata holes to fill")
+        n_fill = int(np.sum(fill_mask_small))
+        if n_fill == 0:
+            print("    No interior nodata holes to fill")
+            return
+
+        print(f"    Filling {n_fill} interior nodata pixels (1/{scale} scale)")
+
+        # Patch full-res in chunks
+        data_band = ds.GetRasterBand(1)
+        alpha_band = ds.GetRasterBand(2)
+        chunk_h = 1024
+
+        for y in range(0, h, chunk_h):
+            rows = min(chunk_h, h - y)
+            sy_start = y // scale
+            sy_end = min((y + rows + scale - 1) // scale, small_h)
+
+            # Check if any fill pixels in this row range
+            fill_slice = fill_mask_small[sy_start:sy_end, :]
+            if not np.any(fill_slice):
+                continue
+
+            # Upscale fill mask for this chunk
+            fill_full = cv2.resize(fill_slice.astype(np.uint8), (w, rows),
+                                   interpolation=cv2.INTER_NEAREST).astype(bool)
+
+            if not np.any(fill_full):
+                continue
+
+            data = data_band.ReadAsArray(xoff=0, yoff=y, win_xsize=w, win_ysize=rows)
+            alpha = alpha_band.ReadAsArray(xoff=0, yoff=y, win_xsize=w, win_ysize=rows)
+
+            data[fill_full] = 0
+            alpha[fill_full] = 255
+
+            data_band.WriteArray(data, xoff=0, yoff=y)
+            alpha_band.WriteArray(alpha, xoff=0, yoff=y)
+
+        ds.FlushCache()
+    finally:
         ds = None
-        return
-
-    print(f"    Filling {n_fill} interior nodata pixels (1/{scale} scale)")
-
-    # Patch full-res in chunks
-    data_band = ds.GetRasterBand(1)
-    alpha_band = ds.GetRasterBand(2)
-    chunk_h = 1024
-
-    for y in range(0, h, chunk_h):
-        rows = min(chunk_h, h - y)
-        sy_start = y // scale
-        sy_end = min((y + rows + scale - 1) // scale, small_h)
-
-        # Check if any fill pixels in this row range
-        fill_slice = fill_mask_small[sy_start:sy_end, :]
-        if not np.any(fill_slice):
-            continue
-
-        # Upscale fill mask for this chunk
-        fill_full = cv2.resize(fill_slice.astype(np.uint8), (w, rows),
-                               interpolation=cv2.INTER_NEAREST).astype(bool)
-
-        if not np.any(fill_full):
-            continue
-
-        data = data_band.ReadAsArray(xoff=0, yoff=y, win_xsize=w, win_ysize=rows)
-        alpha = alpha_band.ReadAsArray(xoff=0, yoff=y, win_xsize=w, win_ysize=rows)
-
-        data[fill_full] = 0
-        alpha[fill_full] = 255
-
-        data_band.WriteArray(data, xoff=0, yoff=y)
-        alpha_band.WriteArray(alpha, xoff=0, yoff=y)
-
-    ds.FlushCache()
-    ds = None
 
 
 def _alpha_composite(feathered_paths, output_path):
@@ -1220,117 +1246,119 @@ def _alpha_composite(feathered_paths, output_path):
 
     # Open all inputs and compute output extent
     datasets = [gdal.Open(p) for p in feathered_paths]
-    gts = [ds.GetGeoTransform() for ds in datasets]
+    try:
+        gts = [ds.GetGeoTransform() for ds in datasets]
 
-    # All inputs should share the same pixel size
-    pixel_w = gts[0][1]
-    pixel_h = gts[0][5]
+        # All inputs should share the same pixel size
+        pixel_w = gts[0][1]
+        pixel_h = gts[0][5]
 
-    # Compute union extent in geo coordinates
-    extents = []
-    for ds, gt in zip(datasets, gts):
-        x_min = gt[0]
-        y_max = gt[3]
-        x_max = x_min + ds.RasterXSize * gt[1]
-        y_min = y_max + ds.RasterYSize * gt[5]  # gt[5] is negative
-        extents.append((x_min, y_min, x_max, y_max))
+        # Compute union extent in geo coordinates
+        extents = []
+        for ds, gt in zip(datasets, gts):
+            x_min = gt[0]
+            y_max = gt[3]
+            x_max = x_min + ds.RasterXSize * gt[1]
+            y_min = y_max + ds.RasterYSize * gt[5]  # gt[5] is negative
+            extents.append((x_min, y_min, x_max, y_max))
 
-    union_x_min = min(e[0] for e in extents)
-    union_y_min = min(e[1] for e in extents)
-    union_x_max = max(e[2] for e in extents)
-    union_y_max = max(e[3] for e in extents)
+        union_x_min = min(e[0] for e in extents)
+        union_y_min = min(e[1] for e in extents)
+        union_x_max = max(e[2] for e in extents)
+        union_y_max = max(e[3] for e in extents)
 
-    out_w = int(round((union_x_max - union_x_min) / pixel_w))
-    out_h = int(round((union_y_min - union_y_max) / pixel_h))  # pixel_h is negative
+        out_w = int(round((union_x_max - union_x_min) / pixel_w))
+        out_h = int(round((union_y_min - union_y_max) / pixel_h))  # pixel_h is negative
 
-    out_gt = (union_x_min, pixel_w, 0.0, union_y_max, 0.0, pixel_h)
+        out_gt = (union_x_min, pixel_w, 0.0, union_y_max, 0.0, pixel_h)
 
-    # Precompute each input's pixel offset into the output grid
-    offsets = []
-    for ds, gt in zip(datasets, gts):
-        ox = int(round((gt[0] - union_x_min) / pixel_w))
-        oy = int(round((gt[3] - union_y_max) / pixel_h))
-        offsets.append((ox, oy, ds.RasterXSize, ds.RasterYSize))
+        # Precompute each input's pixel offset into the output grid
+        offsets = []
+        for ds, gt in zip(datasets, gts):
+            ox = int(round((gt[0] - union_x_min) / pixel_w))
+            oy = int(round((gt[3] - union_y_max) / pixel_h))
+            offsets.append((ox, oy, ds.RasterXSize, ds.RasterYSize))
 
-    # Create output: 1 data band + 1 alpha band
-    driver = gdal.GetDriverByName("GTiff")
-    out_ds = driver.Create(output_path, out_w, out_h, 2, gdal.GDT_Byte,
-                           ["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES",
-                            "BIGTIFF=IF_SAFER"])
-    out_ds.SetGeoTransform(out_gt)
-    out_ds.SetProjection(datasets[0].GetProjection())
-    out_ds.GetRasterBand(2).SetColorInterpretation(gdal.GCI_AlphaBand)
+        # Create output: 1 data band + 1 alpha band
+        driver = gdal.GetDriverByName("GTiff")
+        out_ds = driver.Create(output_path, out_w, out_h, 2, gdal.GDT_Byte,
+                               ["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES",
+                                "BIGTIFF=IF_SAFER"])
+        out_ds.SetGeoTransform(out_gt)
+        out_ds.SetProjection(datasets[0].GetProjection())
+        out_ds.GetRasterBand(2).SetColorInterpretation(gdal.GCI_AlphaBand)
 
-    out_data_band = out_ds.GetRasterBand(1)
-    out_alpha_band = out_ds.GetRasterBand(2)
+        out_data_band = out_ds.GetRasterBand(1)
+        out_alpha_band = out_ds.GetRasterBand(2)
 
-    chunk_h = 1024
-    for y_out in range(0, out_h, chunk_h):
-        rows = min(chunk_h, out_h - y_out)
-        weight_sum = np.zeros((rows, out_w), dtype=np.float32)
-        data_sum = np.zeros((rows, out_w), dtype=np.float32)
+        chunk_h = 1024
+        for y_out in range(0, out_h, chunk_h):
+            rows = min(chunk_h, out_h - y_out)
+            weight_sum = np.zeros((rows, out_w), dtype=np.float32)
+            data_sum = np.zeros((rows, out_w), dtype=np.float32)
 
-        for i, ds in enumerate(datasets):
-            ox, oy, iw, ih = offsets[i]
-            # Compute overlap between this chunk and this input
-            src_y_start = y_out - oy
-            src_y_end = src_y_start + rows
-            dst_y_start = 0
-            dst_y_end = rows
+            for i, ds in enumerate(datasets):
+                ox, oy, iw, ih = offsets[i]
+                # Compute overlap between this chunk and this input
+                src_y_start = y_out - oy
+                src_y_end = src_y_start + rows
+                dst_y_start = 0
+                dst_y_end = rows
 
-            if src_y_start < 0:
-                dst_y_start = -src_y_start
-                src_y_start = 0
-            if src_y_end > ih:
-                dst_y_end = rows - (src_y_end - ih)
-                src_y_end = ih
-            if src_y_start >= src_y_end:
-                continue
+                if src_y_start < 0:
+                    dst_y_start = -src_y_start
+                    src_y_start = 0
+                if src_y_end > ih:
+                    dst_y_end = rows - (src_y_end - ih)
+                    src_y_end = ih
+                if src_y_start >= src_y_end:
+                    continue
 
-            src_x_start = -ox if ox < 0 else 0
-            dst_x_start = ox if ox >= 0 else 0
-            src_x_end = min(iw, out_w - ox) if ox >= 0 else min(iw, out_w)
-            dst_x_end = dst_x_start + (src_x_end - src_x_start)
+                src_x_start = -ox if ox < 0 else 0
+                dst_x_start = ox if ox >= 0 else 0
+                src_x_end = min(iw, out_w - ox) if ox >= 0 else min(iw, out_w)
+                dst_x_end = dst_x_start + (src_x_end - src_x_start)
 
-            if src_x_start >= src_x_end:
-                continue
+                if src_x_start >= src_x_end:
+                    continue
 
-            read_w = src_x_end - src_x_start
-            read_h = src_y_end - src_y_start
+                read_w = src_x_end - src_x_start
+                read_h = src_y_end - src_y_start
 
-            data_chunk = ds.GetRasterBand(1).ReadAsArray(
-                xoff=int(src_x_start), yoff=int(src_y_start),
-                win_xsize=int(read_w), win_ysize=int(read_h)
-            ).astype(np.float32)
+                data_chunk = ds.GetRasterBand(1).ReadAsArray(
+                    xoff=int(src_x_start), yoff=int(src_y_start),
+                    win_xsize=int(read_w), win_ysize=int(read_h)
+                ).astype(np.float32)
 
-            alpha_chunk = ds.GetRasterBand(2).ReadAsArray(
-                xoff=int(src_x_start), yoff=int(src_y_start),
-                win_xsize=int(read_w), win_ysize=int(read_h)
-            ).astype(np.float32)
+                alpha_chunk = ds.GetRasterBand(2).ReadAsArray(
+                    xoff=int(src_x_start), yoff=int(src_y_start),
+                    win_xsize=int(read_w), win_ysize=int(read_h)
+                ).astype(np.float32)
 
-            sl_y = slice(int(dst_y_start), int(dst_y_end))
-            sl_x = slice(int(dst_x_start), int(dst_x_end))
-            data_sum[sl_y, sl_x] += data_chunk * alpha_chunk
-            weight_sum[sl_y, sl_x] += alpha_chunk
+                sl_y = slice(int(dst_y_start), int(dst_y_end))
+                sl_x = slice(int(dst_x_start), int(dst_x_end))
+                data_sum[sl_y, sl_x] += data_chunk * alpha_chunk
+                weight_sum[sl_y, sl_x] += alpha_chunk
 
-        # Compute blended result
-        valid = weight_sum > 0
-        out_data = np.zeros((rows, out_w), dtype=np.uint8)
-        out_alpha = np.zeros((rows, out_w), dtype=np.uint8)
-        out_data[valid] = (data_sum[valid] / weight_sum[valid]).clip(0, 255).astype(np.uint8)
-        out_alpha[valid] = 255
+            # Compute blended result
+            valid = weight_sum > 0
+            out_data = np.zeros((rows, out_w), dtype=np.uint8)
+            out_alpha = np.zeros((rows, out_w), dtype=np.uint8)
+            out_data[valid] = (data_sum[valid] / weight_sum[valid]).clip(0, 255).astype(np.uint8)
+            out_alpha[valid] = 255
 
-        out_data_band.WriteArray(out_data, xoff=0, yoff=y_out)
-        out_alpha_band.WriteArray(out_alpha, xoff=0, yoff=y_out)
+            out_data_band.WriteArray(out_data, xoff=0, yoff=y_out)
+            out_alpha_band.WriteArray(out_alpha, xoff=0, yoff=y_out)
 
-        if y_out % (chunk_h * 20) == 0 and y_out > 0:
-            pct = int(100 * y_out / out_h)
-            print(f"    Compositing: {pct}%")
+            if y_out % (chunk_h * 20) == 0 and y_out > 0:
+                pct = int(100 * y_out / out_h)
+                print(f"    Compositing: {pct}%")
 
-    out_ds.FlushCache()
-    out_ds = None
-    for ds in datasets:
-        ds = None
+        out_ds.FlushCache()
+        out_ds = None
+    finally:
+        for _ds in datasets:
+            _ds = None
     print(f"    Compositing: 100%")
 
 
@@ -1469,9 +1497,11 @@ def build_mosaic(aligned_paths: list, output_path: str, feather_margin: int = 50
     strip_origins = []
     for p in aligned_paths:
         ds = gdal.Open(p)
-        gt = ds.GetGeoTransform()
-        strip_origins.append((gt[3], p))  # y_origin (top-left Y)
-        ds = None
+        try:
+            gt = ds.GetGeoTransform()
+            strip_origins.append((gt[3], p))  # y_origin (top-left Y)
+        finally:
+            ds = None
     strip_origins.sort(key=lambda x: -x[0])  # descending Y = northernmost first
     sorted_paths = [p for _, p in strip_origins]
     print(f"  Strip order (N→S): {[os.path.basename(p) for p in sorted_paths]}")

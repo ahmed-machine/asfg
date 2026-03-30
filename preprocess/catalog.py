@@ -278,6 +278,7 @@ def group_into_strips(scenes: list) -> list:
     return strips
 
 
+
 def filter_scenes(scenes: list, entity_ids: list = None,
                   camera_systems: list = None,
                   download_only: bool = True) -> list:

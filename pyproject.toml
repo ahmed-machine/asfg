@@ -8,7 +8,6 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = ">=3.12,<3.14"
 numpy = "^2.4.2"
-opencv-python = "^4.13.0.92"
 rasterio = "^1.5.0"
 scipy = "^1.17.0"
 scikit-image = "^0.26.0"
@@ -16,6 +15,7 @@ pillow = "^12.1.1"
 kornia = "^0.8.2"
 torch = "^2.10.0"
 torchvision = "^0.25.0"
+opencv-contrib-python = "^4.13.0.92"
 
 
 [build-system]
