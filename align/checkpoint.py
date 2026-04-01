@@ -147,10 +147,14 @@ def load_checkpoint(phase_id: str, checkpoint_dir: str) -> "AlignState":
         else:
             data["chosen_hypothesis"] = tuple(ch)
 
-    # Overlap tuple
+    # Overlap BBox
     ov = data.get("overlap")
     if ov is not None:
-        data["overlap"] = tuple(ov)
+        from .types import BBox
+        if isinstance(ov, (list, tuple)) and len(ov) == 4:
+            data["overlap"] = BBox(*ov)
+        elif not isinstance(ov, BBox):
+            data["overlap"] = BBox(*ov)
 
     # Reference window tuple
     rw = data.get("reference_window")
@@ -217,6 +221,11 @@ class _NumpySafeEncoder(json.JSONEncoder):
             return obj.to_dict()
         if hasattr(obj, "_asdict"):
             return obj._asdict()
+        if hasattr(obj, "as_tuple"):
+            return obj.as_tuple()
+        if hasattr(obj, "__dataclass_fields__"):
+            from dataclasses import asdict
+            return asdict(obj)
         return super().default(obj)
 
 

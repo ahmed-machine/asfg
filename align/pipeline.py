@@ -992,27 +992,6 @@ def step_scale_rotation(state: AlignState, args, profiler=None) -> AlignState:
         with _p.section("global_scale_rotation"):
             state = _apply_global_precorrection(state, args)
 
-    # Last resort: if no detection method worked but expected_scale is far from 1.0,
-    # apply expected_scale directly.  Better than proceeding with wrong scale — all
-    # downstream matching would fail at >20% scale mismatch.
-    if not state.precorrection_applied and abs(state.expected_scale - 1.0) > 0.15:
-        print(f"  Scale/rotation detection failed — applying expected_scale "
-              f"{state.expected_scale:.3f} as fallback", flush=True)
-        from .scale import apply_scale_rotation_precorrection
-        with _p.section("apply_expected_scale"):
-            overlap_center = None
-            if state.overlap:
-                overlap_center = ((state.overlap.left + state.overlap.right) / 2,
-                                  (state.overlap.bottom + state.overlap.top) / 2)
-            result = apply_scale_rotation_precorrection(
-                state.current_input, state.expected_scale, 0.0,
-                state.work_crs, overlap_center=overlap_center)
-            if result is not None:
-                state.precorrection_applied = True
-                state.precorrection_tmp = result
-                state.current_input = result
-                print(f"  Applied expected_scale={state.expected_scale:.3f} precorrection")
-
     # Invalidate overlap cache after precorrection changes
     if state.precorrection_applied:
         clear_overlap_cache()
@@ -1267,7 +1246,7 @@ def _redetect_coarse_after_precorrection(state: AlignState) -> AlignState:
     if dx_pc is not None and dy_pc is not None and corr_pc is not None and corr_pc > _get_params().coarse.min_ncc:
         dx_pc_f, dy_pc_f = float(dx_pc), float(dy_pc)
         coarse_after = np.sqrt(dx_pc_f ** 2 + dy_pc_f ** 2)
-        if coarse_after > coarse_before * 1.5:
+        if coarse_after > max(coarse_before * 1.5, 500.0):
             print(f"  WARNING: Pre-correction worsened offset "
                   f"({coarse_before:.0f}m -> {coarse_after:.0f}m), reverting")
             state.precorrection_applied = False

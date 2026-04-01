@@ -17,6 +17,9 @@ FLOW_SOFT_SIGMA = 6.0
 # Coastline
 COAST_MAX_DIM = 4096
 
+# DINO feature extraction
+DINO_MAX_DIM = 4096
+
 # Grid optimizer default pyramid levels: (grid_size, iters)
 DEFAULT_PYRAMID_LEVELS = [(8, 300), (24, 300), (64, 500)]
 
