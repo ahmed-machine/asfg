@@ -43,7 +43,7 @@ CLAHE_CLIP_LIMIT = 3.0
 
 # RoMa tiled matching
 ROMA_TILE_SIZE = 1024
-ROMA_TILE_OVERLAP = 256
+ROMA_TILE_OVERLAP = 512
 ROMA_SIZE = 640  # 16 * 40, multiple of 16 for DINOv3 backbone
 ROMA_NUM_CORRESP = 600
 
@@ -51,7 +51,7 @@ ROMA_NUM_CORRESP = 600
 LAND_MASK_FRAC_MIN = 0.30
 
 # Joint land fraction: reject tiles where BOTH ref and off have < this land fraction
-TILE_JOINT_LAND_MIN = 0.08
+TILE_JOINT_LAND_MIN = 0.03
 
 # Post-collection grid quota: cap matches per spatial cell for even distribution
 MATCH_QUOTA_GRID_M = 2000   # cell size in projected metres
@@ -74,18 +74,3 @@ SCALE_MIN_VALID_FRAC = 0.30
 
 # Output CRS
 OUTPUT_CRS_EPSG = 3857
-
-
-def reload_from_profile(profile_name: str = "_base") -> None:
-    """Overwrite module-level constants from a named profile.
-
-    All existing ``from .constants import X`` statements continue to see
-    the values that were current at import time.  This function updates
-    the *module* globals so that any code doing ``constants.X`` (attribute
-    access) picks up the new values.  For a full sync (including already-
-    imported names), use ``align.params.set_profile()`` which calls this
-    internally.
-    """
-    from .params import load_profile, _sync_constants
-    p = load_profile(profile_name)
-    _sync_constants(p)

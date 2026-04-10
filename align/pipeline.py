@@ -4,15 +4,13 @@ import copy
 import multiprocessing as mp
 import os
 import subprocess
-import sys
 import tempfile
 import time
 import traceback
 import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -33,16 +31,14 @@ from .geo import (
     generate_boundary_gcps,
     get_metric_crs,
     get_native_resolution_m,
-    get_torch_device,
     open_pair,
-    read_overlap_pair,
     read_overlap_region,
     work_shift_to_dataset_shift,
 )
-from .global_localization import localize_to_reference, translate_input_to_hypothesis
+from .coarse import localize_to_reference, translate_input_to_hypothesis
 from .image import shift_array, to_u8, is_cloudy_patch, make_land_mask, clahe_normalize
 from .metadata_priors import load_metadata_priors
-from .models import ModelCache
+from .models import ModelCache, get_torch_device
 from .coarse import detect_offset_at_resolution
 from .scale import (detect_scale_rotation, detect_local_scales,
                     apply_scale_rotation_precorrection, apply_local_scale_precorrection)
@@ -52,106 +48,19 @@ from .filtering import (matched_pairs_sufficient, refine_matches_phase_correlati
                         correct_reference_offset, select_best_gcps,
                         iterative_outlier_removal,
                         detect_and_correct_reference_offset,
-                        local_consistency_filter)
+                        local_consistency_filter,
+                        filter_by_tin_tarr, optimize_fpps_accuracy)
 from .errors import (AlignmentError, AlreadyAlignedError, CoarseOffsetError,
                      InsufficientDataError, UserAbortError, WarpError)
 from .flow_refine import apply_flow_refinement_to_file
-from .tin_filter import filter_by_tin_tarr, optimize_fpps_accuracy
 from .profiler import PipelineProfiler, _NullProfiler
 from .warp import apply_warp
 from .checkpoint import save_checkpoint
-from .qa import evaluate_alignment_quality_paths, generate_debug_image
-from .qa_runner import build_candidate_report, split_holdout_pairs, write_qa_report
-from .types import BBox, GCP, GlobalHypothesis, MaskProvider, MatchPair, MetadataPrior, QaReport
-
-
-# ---------------------------------------------------------------------------
-# State container
-# ---------------------------------------------------------------------------
-
-@dataclass
-class AlignState:
-    """Explicit state passed between pipeline steps."""
-    input_path: str
-    reference_path: str
-    output_path: str
-    work_crs: Optional[CRS] = None
-    overlap: Optional[BBox] = None
-    anchors_path: Optional[str] = None
-    best: bool = True
-    match_res: float = 5.0
-    coarse_pass: int = 0
-    yes: bool = False
-
-    # Populated during setup
-    offset_res_m: float = 0.0
-    ref_res_m: float = 0.0
-    expected_scale: float = 1.0
-
-    # Updated during pipeline
-    current_input: str = ""
-    coarse_dx: float = 0.0
-    coarse_dy: float = 0.0
-    coarse_total: float = 0.0
-    coarse_corr: float = 0.0
-    precorrection_applied: bool = False
-    precorrection_tmp: Optional[str] = None
-    needs_scale_rotation: bool = False
-
-    # Scale/rotation detection quality (populated by step_scale_rotation)
-    scale_valid_patches: int = 0
-    scale_total_patches: int = 0
-    scale_x_spread: float = 0.0
-    scale_y_spread: float = 0.0
-
-    matched_pairs: list[MatchPair] = field(default_factory=list)
-    gcps: list[GCP] = field(default_factory=list)
-    match_weights: Optional[np.ndarray] = None  # per-GCP precision weights from RoMa
-    ransac_survivor_count: int = 0  # auto matches surviving geographic RANSAC
-    match_quality_residual: float = float('inf')  # affine residual from quality check
-    boundary_gcps: list[GCP] = field(default_factory=list)
-    geo_residuals: list[float] = field(default_factory=list)
-    mean_residual: float = float('inf')
-    max_residual: float = float('inf')
-    gcp_coverage: float = 1.0
-    used_neural: bool = False
-    use_sift_refinement: bool = False
-
-    was_corrected: bool = False
-    needs_ortho: bool = False             # deferred orthorectification pending
-    rough_georef_path: Optional[str] = None  # path to rough georef for ortho
-    correction_outliers: List[str] = field(default_factory=list)
-
-    M_geo: Optional[np.ndarray] = None
-    cv_mean: Optional[float] = None
-    model_cache: Optional[ModelCache] = None
-    tin_tarr_thresh: float = 1.5
-    skip_fpp: bool = False
-    matcher_anchor: str = "roma"
-    matcher_dense: str = "roma"
-    grid_size: int = 20
-    grid_iters: int = 300
-    arap_weight: float = 1.0
-    mask_provider: MaskProvider = MaskProvider.COASTAL_OBIA
-    global_search: bool = True
-    global_search_res: float = 40.0
-    global_search_top_k: int = 3
-    force_global: bool = False
-    reference_window: Optional[tuple] = None
-    metadata_prior_paths: List[str] = field(default_factory=list)
-    metadata_priors: List[MetadataPrior] = field(default_factory=list)
-    global_hypotheses: List[GlobalHypothesis] = field(default_factory=list)
-    chosen_hypothesis: Optional[GlobalHypothesis] = None
-    reference_bounds_work: Optional[tuple] = None
-    target_bounds_work: Optional[tuple] = None
-    qa_holdout_pairs: list[MatchPair] = field(default_factory=list)
-    qa_reports: List[QaReport] = field(default_factory=list)
-    qa_json_path: Optional[str] = None
-    diagnostics_dir: Optional[str] = None
-    allow_abstain: bool = False
-    tps_fallback: bool = False
-    abstained: bool = False
-    temp_paths: List[str] = field(default_factory=list)
+from .qa import (evaluate_alignment_quality_paths, generate_debug_image,
+                 build_candidate_report, split_holdout_pairs, write_qa_report)
+from .params import get_params as _get_params
+from .state import AlignState
+from .types import BBox, GCP, GlobalHypothesis, MaskProvider, MatchPair, QaReport
 
 
 # ---------------------------------------------------------------------------
@@ -222,53 +131,42 @@ def _orthorectify_against_reference(rough_georef_path: str, reference_path: str,
           f"px shift {shift_px_x:+d},{shift_py_y:+d})...",
           flush=True)
 
-    src_off = rasterio.open(rough_georef_path)
-    src_ref = rasterio.open(reference_path)
+    with rasterio.open(rough_georef_path) as src_off, rasterio.open(reference_path) as src_ref:
+        try:
+            arr_off, off_transform = read_overlap_region(
+                src_off, overlap, work_crs, ortho_res)
+            arr_ref, ref_transform = read_overlap_region(
+                src_ref, overlap, work_crs, ortho_res)
+        except Exception as e:
+            print(f"  [Orthorectify] Failed to read overlap: {e}", flush=True)
+            return None
 
-    try:
-        arr_off, off_transform = read_overlap_region(
-            src_off, overlap, work_crs, ortho_res)
-        arr_ref, ref_transform = read_overlap_region(
-            src_ref, overlap, work_crs, ortho_res)
-    except Exception as e:
-        print(f"  [Orthorectify] Failed to read overlap: {e}", flush=True)
-        src_off.close()
-        src_ref.close()
-        return None
+        # Apply coarse shift to offset array so it overlaps with reference
+        if shift_px_x != 0 or shift_py_y != 0:
+            arr_off = shift_array(arr_off, -shift_px_x, -shift_py_y)
 
-    # Apply coarse shift to offset array so it overlaps with reference
-    if shift_px_x != 0 or shift_py_y != 0:
-        arr_off = shift_array(arr_off, -shift_px_x, -shift_py_y)
+        valid_off = float(np.mean(arr_off > 0))
+        valid_ref = float(np.mean(arr_ref > 0))
+        if valid_off < 0.05 or valid_ref < 0.05:
+            print(f"  [Orthorectify] Insufficient overlap "
+                  f"(off={valid_off:.0%}, ref={valid_ref:.0%})", flush=True)
+            return None
 
-    valid_off = float(np.mean(arr_off > 0))
-    valid_ref = float(np.mean(arr_ref > 0))
-    if valid_off < 0.05 or valid_ref < 0.05:
-        print(f"  [Orthorectify] Insufficient overlap "
-              f"(off={valid_off:.0%}, ref={valid_ref:.0%})", flush=True)
-        src_off.close()
-        src_ref.close()
-        return None
+        # Use shared model cache or create a temporary one
+        cache = model_cache if model_cache is not None else ModelCache(get_torch_device())
 
-    # Use shared model cache or create a temporary one
-    cache = model_cache if model_cache is not None else ModelCache(get_torch_device())
-
-    # Run RoMa matching — pass shifted arrays and coarse pixel shifts
-    try:
-        matches = match_with_roma(
-            arr_ref, arr_off, ref_transform, off_transform,
-            shift_px_x=shift_px_x, shift_py_y=shift_py_y,
-            neural_res=ortho_res,
-            model_cache=cache,
-            src_offset=src_off, work_crs=work_crs,
-        )
-    except Exception as e:
-        print(f"  [Orthorectify] RoMa matching failed: {e}", flush=True)
-        src_off.close()
-        src_ref.close()
-        return None
-
-    src_off.close()
-    src_ref.close()
+        # Run RoMa matching — pass shifted arrays and coarse pixel shifts
+        try:
+            matches = match_with_roma(
+                arr_ref, arr_off, ref_transform, off_transform,
+                shift_px_x=shift_px_x, shift_py_y=shift_py_y,
+                neural_res=ortho_res,
+                model_cache=cache,
+                src_offset=src_off, work_crs=work_crs,
+            )
+        except Exception as e:
+            print(f"  [Orthorectify] RoMa matching failed: {e}", flush=True)
+            return None
 
     print(f"  [Orthorectify] RoMa found {len(matches)} matches", flush=True)
 
@@ -282,15 +180,15 @@ def _orthorectify_against_reference(rough_georef_path: str, reference_path: str,
                        dtype=np.float32).reshape(-1, 1, 2)
     dst_pts = np.array([(m.ref_x, m.ref_y) for m in matches],
                        dtype=np.float32).reshape(-1, 1, 2)
-    _, inliers = cv2.estimateAffine2D(
-        src_pts, dst_pts, method=cv2.RANSAC,
-        ransacReprojThreshold=30.0, confidence=0.95)
+    from .geo import ransac_affine
+    _est_method = _get_params().matching.estimation_method
+    _, inliers = ransac_affine(src_pts, dst_pts, threshold=30.0, method=_est_method)
     if inliers is None:
-        print(f"  [Orthorectify] RANSAC failed", flush=True)
+        print(f"  [Orthorectify] Estimation failed", flush=True)
         return None
-    inlier_mask = inliers.ravel().astype(bool)
+    inlier_mask = inliers
     inlier_matches = [m for m, k in zip(matches, inlier_mask) if k]
-    print(f"  [Orthorectify] {len(inlier_matches)}/{len(matches)} RANSAC inliers",
+    print(f"  [Orthorectify] {len(inlier_matches)}/{len(matches)} inliers ({_est_method})",
           flush=True)
 
     if len(inlier_matches) < min_matches:
@@ -304,20 +202,25 @@ def _orthorectify_against_reference(rough_georef_path: str, reference_path: str,
     from rasterio.warp import transform as _transform
     ref_xs = [m.ref_x for m in inlier_matches]
     ref_ys = [m.ref_y for m in inlier_matches]
-    # Transform reference coords from work_crs to EPSG:4326 for GCP targets
-    ref_lons, ref_lats = _transform(work_crs, WGS84, ref_xs, ref_ys)
 
     with rasterio.open(rough_georef_path) as src:
         rough_transform = src.transform
+        rough_crs = src.crs
+
+    with rasterio.open(reference_path) as ref:
+        ref_crs = ref.crs
+        ref_res_x = abs(ref.transform.a)
+        ref_res_y = abs(ref.transform.e)
+
+    # Transform reference coords from work_crs to the reference CRS for GCP targets
+    ref_gx, ref_gy = _transform(work_crs, ref_crs, ref_xs, ref_ys)
 
     gcp_list = []
     for i, m in enumerate(inlier_matches):
         # Convert offset work_crs coords to pixel coords in the rough georef
-        # First transform from work_crs to the rough georef CRS (EPSG:4326)
-        off_lons, off_lats = _transform(work_crs, WGS84,
-                                        [m.off_x], [m.off_y])
-        px_col, px_row = ~rough_transform * (off_lons[0], off_lats[0])
-        gcp_list.append(gdal.GCP(ref_lons[i], ref_lats[i], 0,
+        off_gx, off_gy = _transform(work_crs, rough_crs, [m.off_x], [m.off_y])
+        px_col, px_row = ~rough_transform * (off_gx[0], off_gy[0])
+        gcp_list.append(gdal.GCP(ref_gx[i], ref_gy[i], 0,
                                  float(px_col), float(px_row)))
 
     # TPS warp — follow the pattern from apply_scale_rotation_precorrection():
@@ -330,20 +233,16 @@ def _orthorectify_against_reference(rough_georef_path: str, reference_path: str,
 
     ds_in = gdal.Open(rough_georef_path)
     ds_gcp = gdal.Translate(tmp_gcp_path, ds_in, GCPs=gcp_list,
-                            outputSRS="EPSG:4326")
+                            outputSRS=ref_crs.to_string())
     ds_gcp = None
     ds_in = None
 
-    # Use reference pixel size so the ortho output has consistent scale
-    with rasterio.open(reference_path) as ref:
-        ref_res = abs(ref.transform.a)  # degrees per pixel
-
     warp_kwargs = {
-        "dstSRS": "EPSG:4326",
+        "dstSRS": ref_crs.to_string(),
         "format": "GTiff",
         "tps": True,
-        "xRes": ref_res,
-        "yRes": ref_res,
+        "xRes": ref_res_x,
+        "yRes": ref_res_y,
         "resampleAlg": "bilinear",
         "multithread": True,
         "creationOptions": ["COMPRESS=LZW", "TILED=YES", "PREDICTOR=2",
@@ -551,11 +450,16 @@ def step_global_localization(state: AlignState, args) -> AlignState:
     """Add a coarse localization stage before overlap-dependent matching."""
 
     if state.overlap is not None and not state.force_global:
+        overlap_source = "rough_georef_overlap"
+        hypothesis_id = "rough_overlap"
+        if state.reference_window is not None and state.anchors_path:
+            overlap_source = "preprocessed_crop_overlap"
+            hypothesis_id = "preprocessed_overlap"
         state.global_hypotheses = [
             GlobalHypothesis(
-                hypothesis_id="rough_overlap",
+                hypothesis_id=hypothesis_id,
                 score=1.0,
-                source="rough_georef_overlap",
+                source=overlap_source,
                 left=state.overlap.left,
                 bottom=state.overlap.bottom,
                 right=state.overlap.right,
@@ -613,7 +517,7 @@ def step_global_localization(state: AlignState, args) -> AlignState:
     return state
 
 
-def _grayscale_ncc_crosscheck(state: AlignState, src_ref, src_offset) -> None:
+def _verify_mask_match_with_grayscale_ncc(state: AlignState, src_ref, src_offset) -> None:
     """Pass 3: Independent CLAHE-grayscale NCC cross-check at 5m/px.
 
     The land-mask based estimates can be biased by mask disagreements
@@ -694,12 +598,27 @@ def step_coarse_offset(state: AlignState, profiler=None) -> AlignState:
     _p = profiler or _NullProfiler()
     if state.overlap is None or state.work_crs is None:
         raise ValueError("Coarse offset requires an established work region")
+
+    # When auto-anchors are available and the image was already coarse-cropped
+    # close to its target position (E2E pipeline), skip the expensive template
+    # matching (~20 min for large KH-4 frames). Only skip when the hypothesis
+    # came from preprocessing (not just a rough georef overlap).
+    if (state.anchors_path and state.chosen_hypothesis is not None
+            and state.chosen_hypothesis.source not in ("rough_georef_overlap",)):
+        print("Step 1: Skipping coarse offset — auto-anchors available", flush=True)
+        state.coarse_dx = 0.0
+        state.coarse_dy = 0.0
+        state.coarse_total = 0.0
+        if state.diagnostics_dir:
+            save_checkpoint(state, "post_coarse",
+                            os.path.join(state.diagnostics_dir, "checkpoints"))
+        return state
+
     print("Step 1: Coarse offset detection via land mask matching", flush=True)
 
     src_offset = rasterio.open(state.current_input)
     src_ref = rasterio.open(state.reference_path)
 
-    from .params import get_params as _get_params  # noqa: used in multiple functions
     _coarse_p = _get_params().coarse
     print(f"  Pass 1: coarse scan at {_C.COARSE_RES} m/px...", flush=True)
     with _p.section("pass1"):
@@ -779,7 +698,7 @@ def step_coarse_offset(state: AlignState, profiler=None) -> AlignState:
         state.coarse_dx, state.coarse_dy = dx_c_f, dy_c_f
         state.coarse_corr = float(corr_c)
 
-    _grayscale_ncc_crosscheck(state, src_ref, src_offset)
+    _verify_mask_match_with_grayscale_ncc(state, src_ref, src_offset)
 
     src_offset.close()
     src_ref.close()
@@ -797,6 +716,10 @@ def step_coarse_offset(state: AlignState, profiler=None) -> AlignState:
             print(f"  WARNING: Coarse offset {state.coarse_total:.0f}m exceeds "
                   f"half the overlap extent ({max_reasonable:.0f}m) "
                   f"— estimate may be unreliable")
+            if state.allow_abstain:
+                state.abstained = True
+                print(f"  ABSTAIN: Unreliable coarse offset — skipping alignment")
+                return state
 
     print()
 
@@ -807,6 +730,93 @@ def step_coarse_offset(state: AlignState, profiler=None) -> AlignState:
     return state
 
 
+def _try_asp_opticalbar_correction(state: AlignState) -> str | None:
+    """Attempt ASP OpticalBar pre-correction if camera profile supports it.
+
+    Uses cam_gen + mapproject to physically model panoramic distortion.
+    Returns path to corrected image, or None if unavailable/unsupported.
+    """
+    params = _get_params()
+    if not params.camera.is_panoramic:
+        return None
+
+    # Need corner coordinates from metadata priors
+    corners = None
+    if state.metadata_priors:
+        for prior in state.metadata_priors:
+            prior_corners = getattr(prior, "corners", None)
+            if prior_corners:
+                corners = {
+                    str(k).lower(): (float(v[0]), float(v[1]))
+                    for k, v in prior_corners.items()
+                    if isinstance(v, (list, tuple)) and len(v) >= 2
+                }
+                if all(k in corners for k in ("nw", "ne", "se", "sw")):
+                    break
+            w = getattr(prior, "west", None)
+            e = getattr(prior, "east", None)
+            s = getattr(prior, "south", None)
+            n = getattr(prior, "north", None)
+            if w is not None and e is not None and s is not None and n is not None:
+                # Construct corners from bounding box (approximate)
+                corners = {
+                    "nw": (n, w), "ne": (n, e),
+                    "se": (s, e), "sw": (s, w),
+                }
+                break
+
+    if corners is None:
+        # Try to extract from current georeferenced bounds
+        try:
+            import rasterio
+            with rasterio.open(state.current_input) as src:
+                if src.crs is not None:
+                    from rasterio.warp import transform_bounds
+                    from rasterio.crs import CRS
+                    b = transform_bounds(src.crs, CRS.from_epsg(4326), *src.bounds)
+                    corners = {
+                        "nw": (b[3], b[0]), "ne": (b[3], b[2]),
+                        "se": (b[1], b[2]), "sw": (b[1], b[0]),
+                    }
+        except Exception:
+            pass
+
+    if corners is None:
+        print("  [Orthorectify] No corner coordinates for OpticalBar model")
+        return None
+
+    try:
+        from preprocess.camera_model import opticalbar_precorrect
+    except ImportError:
+        return None
+
+    # Fetch DEM for terrain parallax correction
+    dem_path = None
+    try:
+        from preprocess.dem import fetch_and_prepare_dem
+        # Get bounding box from corners
+        lats = [c[0] for c in corners.values()]
+        lons = [c[1] for c in corners.values()]
+        dem_path = fetch_and_prepare_dem(
+            west=min(lons) - 0.1, south=min(lats) - 0.1,
+            east=max(lons) + 0.1, north=max(lats) + 0.1,
+        )
+        if dem_path:
+            print(f"  [Orthorectify] DEM available for terrain correction")
+    except Exception as e:
+        print(f"  [Orthorectify] DEM fetch failed ({e}), continuing without")
+
+    print("  [Orthorectify] Attempting ASP OpticalBar panoramic correction...")
+    result = opticalbar_precorrect(
+        state.current_input,
+        params.camera.to_dict(),
+        corners,
+        dem_path=dem_path,
+        t_srs="EPSG:3857",
+    )
+    return result
+
+
 def step_orthorectify(state: AlignState) -> AlignState:
     """Step 1.25: Deferred orthorectification using coarse offset.
 
@@ -814,6 +824,10 @@ def step_orthorectify(state: AlignState) -> AlignState:
     from metadata priors (needs_ortho=True).  Now that coarse_dx/coarse_dy are
     known, the neural matcher can receive properly-shifted patches and find
     dense correspondences for TPS warping.
+
+    If the camera profile includes OpticalBar parameters and ASP is available,
+    uses cam_gen + mapproject for physically correct panoramic distortion
+    removal (CORONA Atlas approach). Falls back to neural matching otherwise.
     """
     if not state.needs_ortho:
         return state
@@ -824,15 +838,20 @@ def step_orthorectify(state: AlignState) -> AlignState:
 
     print("Step 1.25: Deferred orthorectification (post coarse offset)", flush=True)
 
-    ortho_path = _orthorectify_against_reference(
-        state.current_input,
-        state.reference_path,
-        state.work_crs,
-        state.overlap.as_tuple(),
-        coarse_dx=state.coarse_dx,
-        coarse_dy=state.coarse_dy,
-        model_cache=state.model_cache,
-    )
+    # Try ASP OpticalBar correction first (physically correct panoramic model)
+    ortho_path = _try_asp_opticalbar_correction(state)
+
+    # Fall back to neural matching-based orthorectification
+    if ortho_path is None:
+        ortho_path = _orthorectify_against_reference(
+            state.current_input,
+            state.reference_path,
+            state.work_crs,
+            state.overlap.as_tuple(),
+            coarse_dx=state.coarse_dx,
+            coarse_dy=state.coarse_dy,
+            model_cache=state.model_cache,
+        )
 
     if ortho_path is not None:
         state.current_input = ortho_path
@@ -950,7 +969,6 @@ def step_handle_large_offset(state: AlignState, args) -> AlignState:
 
 def step_scale_rotation(state: AlignState, args, profiler=None) -> AlignState:
     """Step 1.5: Scale and rotation detection and pre-correction."""
-    from .params import get_params as _get_params
     _p = profiler or _NullProfiler()
     if state.overlap is None or state.work_crs is None:
         raise ValueError("Scale/rotation detection requires an established work region")
@@ -983,14 +1001,14 @@ def step_scale_rotation(state: AlignState, args, profiler=None) -> AlignState:
 
     if local_patches is not None:
         with _p.section("apply_precorrection"):
-            state = _apply_local_precorrection(state, local_patches)
+            state = _apply_local_scale_rotation_correction(state, local_patches)
     else:
         print("  Local scale detection returned None")
 
     # --- Global fallback ---
     if local_patches is None and not state.precorrection_applied:
         with _p.section("global_scale_rotation"):
-            state = _apply_global_precorrection(state, args)
+            state = _apply_global_scale_rotation_correction(state, args)
 
     # Invalidate overlap cache after precorrection changes
     if state.precorrection_applied:
@@ -1009,7 +1027,7 @@ def _weighted_median(values, weights):
     return float(arr[idx][cum >= cum[-1] / 2.0][0])
 
 
-def _apply_local_precorrection(state: AlignState, local_patches) -> AlignState:
+def _apply_local_scale_rotation_correction(state: AlignState, local_patches) -> AlignState:
     """Apply local scale/rotation pre-correction from patch results."""
     valid_patches = [p for p in local_patches
                      if p['status'] in ('ok', 'filled-neighbor', 'filled-global')]
@@ -1064,7 +1082,7 @@ def _apply_local_precorrection(state: AlignState, local_patches) -> AlignState:
     return state
 
 
-def _apply_global_precorrection(state: AlignState, args) -> AlignState:
+def _apply_global_scale_rotation_correction(state: AlignState, args) -> AlignState:
     """Fallback global scale/rotation detection and pre-correction."""
     print("  Falling back to global scale/rotation detection...")
     src_offset = rasterio.open(state.current_input)
@@ -1220,7 +1238,6 @@ def _apply_global_precorrection(state: AlignState, args) -> AlignState:
 
 def _redetect_coarse_after_precorrection(state: AlignState) -> AlignState:
     """Re-detect coarse offset on pre-corrected image."""
-    from .params import get_params as _get_params
     coarse_before = np.sqrt(state.coarse_dx ** 2 + state.coarse_dy ** 2)
     print("  Re-detecting coarse offset on pre-corrected image...")
     src_offset = rasterio.open(state.current_input)
@@ -1369,55 +1386,67 @@ def _save_match_debug_image(arr_ref, arr_off, ref_transform, off_transform,
         print(f"  WARNING: Could not save feature match diagnostic: {e}")
 
 
-def step_feature_matching(state: AlignState, args, profiler=None) -> AlignState:
-    """Step 2: Feature matching (neural cascade -> NCC fallback)."""
-    from .params import get_params as _get_params
-    _p = profiler or _NullProfiler()
-    if state.overlap is None or state.work_crs is None:
-        raise ValueError("Feature matching requires an established work region")
-    state.use_sift_refinement = state.coarse_total < 200
+@dataclass
+class _MatchingWorkspace:
+    """Intermediate arrays and shifts held across the feature-matching substeps."""
+    neural_res: float
+    fine_res: float
+    arr_ref_neural: np.ndarray
+    arr_off_neural: np.ndarray
+    arr_off_neural_shifted: np.ndarray
+    ref_neural_transform: object
+    off_neural_transform: object
+    shift_px_x_neural: int
+    shift_py_y_neural: int
+    arr_ref_fine: np.ndarray | None = None
+    arr_off_fine_shifted: np.ndarray | None = None
+    ref_fine_transform: object | None = None
+    off_fine_transform: object | None = None
+    shift_px_x_fine: int = 0
+    shift_py_y_fine: int = 0
 
-    src_offset = rasterio.open(state.current_input)
-    src_ref = rasterio.open(state.reference_path)
-    state.matched_pairs = []
-    state.used_neural = False
 
-    if state.best:
-        print("  --best mode: running all methods at maximum quality")
+_MATCH_MEM_CAP_BYTES = 24 * 1024 ** 3
+_MATCH_BYTES_PER_PIXEL = 28  # empirical: all matching arrays combined, both images
 
+
+def _safe_matching_resolution(res: float, overlap_w: float, overlap_h: float,
+                              label: str) -> float:
+    """Bump resolution up if the estimated array footprint exceeds the cap.
+
+    Matching creates ~28 bytes per pixel across both images (float32 overlap
+    cache, uint8 CLAHE, masks, Sobel gradients, weight maps). The cap leaves
+    headroom for models + OS.
+    """
+    npx = (overlap_w / res) * (overlap_h / res)
+    mem = npx * _MATCH_BYTES_PER_PIXEL
+    if mem <= _MATCH_MEM_CAP_BYTES:
+        return res
+    min_res = (overlap_w * overlap_h * _MATCH_BYTES_PER_PIXEL / _MATCH_MEM_CAP_BYTES) ** 0.5
+    min_res = max(min_res, 1.0)
+    min_res = round(min_res * 2 + 0.49) / 2  # round up to nearest 0.5
+    print(f"  Memory safeguard: {label} bumped {res:.1f} -> {min_res:.1f}m/px "
+          f"({mem / 1024 ** 3:.1f}GB est. for {overlap_w:.0f}x{overlap_h:.0f}m overlap)")
+    return min_res
+
+
+def _select_matching_resolutions(state: AlignState) -> tuple[float, float]:
+    """Return (neural_res, fine_res) clamped to safe memory footprint."""
     neural_res_floor = 1.0 if state.best else 2.0
-    neural_res = max(state.offset_res_m, state.ref_res_m, neural_res_floor)
     fine_res_floor = 0.5 if state.best else 1.0
+    neural_res = max(state.offset_res_m, state.ref_res_m, neural_res_floor)
     fine_res = max(state.offset_res_m, state.ref_res_m, fine_res_floor)
-
-    # Memory safeguard — matching creates ~28 bytes per pixel across both images
-    # (2× float32 overlap cache, 2× uint8 CLAHE, masks, Sobel gradients, weight maps).
-    # Cap total array footprint at ~24 GB to leave headroom for models + OS.
     overlap_w = state.overlap.right - state.overlap.left
     overlap_h = state.overlap.top - state.overlap.bottom
-    BYTES_PER_PIXEL = 28  # empirical: all arrays combined, both images
-    MEM_CAP_BYTES = 24 * 1024 ** 3
+    neural_res = _safe_matching_resolution(neural_res, overlap_w, overlap_h, "neural_res")
+    fine_res = _safe_matching_resolution(fine_res, overlap_w, overlap_h, "fine_res")
+    return neural_res, fine_res
 
-    def _safe_res(res, label):
-        npx = (overlap_w / res) * (overlap_h / res)
-        mem = npx * BYTES_PER_PIXEL
-        if mem > MEM_CAP_BYTES:
-            min_res = (overlap_w * overlap_h * BYTES_PER_PIXEL / MEM_CAP_BYTES) ** 0.5
-            min_res = max(min_res, 1.0)
-            # Round up to nearest 0.5
-            min_res = round(min_res * 2 + 0.49) / 2
-            print(f"  Memory safeguard: {label} bumped {res:.1f} -> {min_res:.1f}m/px "
-                  f"({mem / 1024**3:.1f}GB est. for {overlap_w:.0f}x{overlap_h:.0f}m overlap)")
-            return min_res
-        return res
 
-    neural_res = _safe_res(neural_res, "neural_res")
-    fine_res = _safe_res(fine_res, "fine_res")
-
+def _prepare_matching_workspace(state: AlignState, src_offset, src_ref) -> _MatchingWorkspace:
+    """Read both overlaps at the neural resolution and align the offset image to the coarse shift."""
+    neural_res, fine_res = _select_matching_resolutions(state)
     print(f"  Neural resolution: {neural_res:.1f}m/px, Fine resolution: {fine_res:.1f}m/px")
-
-    # Neural feature matching
-    print("Step 2: Neural feature matching cascade", flush=True)
 
     print(f"  Reading reference overlap at {neural_res}m/px...")
     arr_ref_neural, ref_neural_transform = read_overlap_region(
@@ -1429,212 +1458,273 @@ def step_feature_matching(state: AlignState, args, profiler=None) -> AlignState:
     h_neural, w_neural = arr_ref_neural.shape
     print(f"  Image size: {w_neural} x {h_neural} px at {neural_res}m/px")
 
-    shift_px_x_neural = int(round(state.coarse_dx / neural_res))
-    shift_py_y_neural = int(round(state.coarse_dy / neural_res))
-    if shift_px_x_neural == 0 and shift_py_y_neural == 0:
+    shift_px_x = int(round(state.coarse_dx / neural_res))
+    shift_px_y = int(round(state.coarse_dy / neural_res))
+    if shift_px_x == 0 and shift_px_y == 0:
         arr_off_neural_shifted = arr_off_neural
     else:
-        arr_off_neural_shifted = shift_array(
-            arr_off_neural, -shift_px_x_neural, -shift_py_y_neural)
+        arr_off_neural_shifted = shift_array(arr_off_neural, -shift_px_x, -shift_px_y)
 
-    # 2a: Anchor GCPs
-    if state.anchors_path:
-        print(f"  2a: Locating anchor GCPs from {os.path.basename(state.anchors_path)}...", flush=True)
-        with _p.section("anchors"):
-            try:
-                anchor_pairs, anchor_meta = locate_anchors(
-                    state.anchors_path, src_ref, src_offset, state.overlap.as_tuple(), state.work_crs,
-                    ref_neural_transform, off_neural_transform,
-                    arr_ref_neural, arr_off_neural_shifted,
-                    shift_px_x_neural, shift_py_y_neural, neural_res,
-                    model_cache=state.model_cache,
-                    arr_off_unshifted=arr_off_neural,
-                    matcher_type=state.matcher_anchor,
-                    diagnostics_dir=state.diagnostics_dir)
-                state.matched_pairs.extend(anchor_pairs)
-                print(f"    {len(anchor_pairs)} anchor GCPs located")
-            except Exception as e:
-                print(f"    Anchor GCP loading failed: {e}")
+    return _MatchingWorkspace(
+        neural_res=neural_res,
+        fine_res=fine_res,
+        arr_ref_neural=arr_ref_neural,
+        arr_off_neural=arr_off_neural,
+        arr_off_neural_shifted=arr_off_neural_shifted,
+        ref_neural_transform=ref_neural_transform,
+        off_neural_transform=off_neural_transform,
+        shift_px_x_neural=shift_px_x,
+        shift_py_y_neural=shift_px_y,
+    )
 
-    # 2b: Dense matching (LoFTR or RoMa)
+
+def _locate_anchor_matches(state: AlignState, ws: _MatchingWorkspace,
+                           src_ref, src_offset, profiler) -> None:
+    if not state.anchors_path:
+        return
+    print(f"  2a: Locating anchor GCPs from {os.path.basename(state.anchors_path)}...", flush=True)
+    with profiler.section("anchors"):
+        try:
+            anchor_pairs, _anchor_meta = locate_anchors(
+                state.anchors_path, src_ref, src_offset, state.overlap.as_tuple(), state.work_crs,
+                ws.ref_neural_transform, ws.off_neural_transform,
+                ws.arr_ref_neural, ws.arr_off_neural_shifted,
+                ws.shift_px_x_neural, ws.shift_py_y_neural, ws.neural_res,
+                model_cache=state.model_cache,
+                arr_off_unshifted=ws.arr_off_neural,
+                matcher_type=state.matcher_anchor,
+                diagnostics_dir=state.diagnostics_dir,
+            )
+            state.matched_pairs.extend(anchor_pairs)
+            print(f"    {len(anchor_pairs)} anchor GCPs located")
+        except Exception as e:
+            print(f"    Anchor GCP loading failed: {e}")
+
+
+def _run_dense_neural_matching(state: AlignState, ws: _MatchingWorkspace,
+                               src_offset, profiler) -> None:
     target = 200 if state.best else 25
-    if not matched_pairs_sufficient(state.matched_pairs, target=target):
-        print(f"  2b: {state.matcher_dense.upper()} tiled dense matching...", flush=True)
-        with _p.section("roma_dense"):
-            try:
-                matcher_fn = _get_dense_matcher(state.matcher_dense)
+    if matched_pairs_sufficient(state.matched_pairs, target=target):
+        return
+    matcher_name = state.matcher_dense.upper()
+    print(f"  2b: {matcher_name} tiled dense matching...", flush=True)
+    with profiler.section("roma_dense"):
+        try:
+            matcher_fn = _get_dense_matcher(state.matcher_dense)
+            dense_pairs = matcher_fn(
+                ws.arr_ref_neural, ws.arr_off_neural_shifted,
+                ws.ref_neural_transform, ws.off_neural_transform,
+                ws.shift_px_x_neural, ws.shift_py_y_neural,
+                neural_res=ws.neural_res,
+                model_cache=state.model_cache,
+                existing_anchors=state.matched_pairs,
+                src_offset=src_offset,
+                work_crs=state.work_crs,
+                mask_mode=state.mask_provider,
+            )
+            state.matched_pairs.extend(dense_pairs)
+            print(f"    {matcher_name}: {len(dense_pairs)} matches")
+            if dense_pairs:
+                state.used_neural = True
+        except Exception as e:
+            print(f"    {matcher_name} dense matching failed: {e}")
 
-                dense_pairs = matcher_fn(
-                    arr_ref_neural, arr_off_neural_shifted,
-                    ref_neural_transform, off_neural_transform,
-                    shift_px_x_neural, shift_py_y_neural,
-                    neural_res=neural_res,
-                    model_cache=state.model_cache,
-                    existing_anchors=state.matched_pairs,
-                    src_offset=src_offset,
-                    work_crs=state.work_crs,
-                    mask_mode=state.mask_provider)
-                state.matched_pairs.extend(dense_pairs)
-                print(f"    {state.matcher_dense.upper()}: {len(dense_pairs)} matches")
-                if dense_pairs:
-                    state.used_neural = True
-            except Exception as e:
-                print(f"    {state.matcher_dense.upper()} dense matching failed: {e}")
 
-    # Phase correlation refinement
-    arr_ref_fine = arr_off_fine_shifted = ref_fine_transform = off_fine_transform = None
-    shift_px_x_fine = shift_py_y_fine = 0
-    if state.used_neural and state.matched_pairs:
-        print(f"  Refining {len(state.matched_pairs)} neural matches with phase correlation "
-              f"at {fine_res}m/px...")
-        with _p.section("phase_correlation"):
-            print(f"    Reading reference overlap at {fine_res}m/px...")
-            arr_ref_fine, ref_fine_transform = read_overlap_region(
-                src_ref, state.overlap.as_tuple(), state.work_crs, fine_res)
-            print(f"    Reading offset overlap at {fine_res}m/px...")
-            arr_off_fine, off_fine_transform = read_overlap_region(
-                src_offset, state.overlap.as_tuple(), state.work_crs, fine_res)
-            shift_px_x_fine = int(round(state.coarse_dx / fine_res))
-            shift_py_y_fine = int(round(state.coarse_dy / fine_res))
-            if shift_px_x_fine == 0 and shift_py_y_fine == 0:
-                arr_off_fine_shifted = arr_off_fine
-            else:
-                arr_off_fine_shifted = shift_array(
-                    arr_off_fine, -shift_px_x_fine, -shift_py_y_fine)
-            state.matched_pairs = refine_matches_phase_correlation(
-                state.matched_pairs, arr_ref_fine, arr_off_fine_shifted,
-                ref_fine_transform, off_fine_transform,
-                shift_px_x_fine, shift_py_y_fine, fine_res)
-            print(f"    Refined to {len(state.matched_pairs)} matches")
+def _refine_matches_with_phase_correlation(state: AlignState, ws: _MatchingWorkspace,
+                                           src_ref, src_offset, profiler) -> None:
+    """Read the fine-resolution overlap and run sub-pixel phase correlation on all neural matches."""
+    if not (state.used_neural and state.matched_pairs):
+        return
+    print(f"  Refining {len(state.matched_pairs)} neural matches with phase correlation "
+          f"at {ws.fine_res}m/px...")
+    with profiler.section("phase_correlation"):
+        print(f"    Reading reference overlap at {ws.fine_res}m/px...")
+        ws.arr_ref_fine, ws.ref_fine_transform = read_overlap_region(
+            src_ref, state.overlap.as_tuple(), state.work_crs, ws.fine_res)
+        print(f"    Reading offset overlap at {ws.fine_res}m/px...")
+        arr_off_fine, ws.off_fine_transform = read_overlap_region(
+            src_offset, state.overlap.as_tuple(), state.work_crs, ws.fine_res)
+        ws.shift_px_x_fine = int(round(state.coarse_dx / ws.fine_res))
+        ws.shift_py_y_fine = int(round(state.coarse_dy / ws.fine_res))
+        if ws.shift_px_x_fine == 0 and ws.shift_py_y_fine == 0:
+            ws.arr_off_fine_shifted = arr_off_fine
+        else:
+            ws.arr_off_fine_shifted = shift_array(
+                arr_off_fine, -ws.shift_px_x_fine, -ws.shift_py_y_fine)
+        state.matched_pairs = refine_matches_phase_correlation(
+            state.matched_pairs, ws.arr_ref_fine, ws.arr_off_fine_shifted,
+            ws.ref_fine_transform, ws.off_fine_transform,
+            ws.shift_px_x_fine, ws.shift_py_y_fine, ws.fine_res,
+        )
+        print(f"    Refined to {len(state.matched_pairs)} matches")
 
-    # Geographic RANSAC (auto-detected only, preserve anchors)
-    with _p.section("ransac"):
+
+def _filter_matches_geographic_ransac(state: AlignState, neural_res: float, profiler) -> None:
+    """Drop auto-matches whose geographic offset disagrees with an affine fit. Anchors are preserved."""
+    with profiler.section("ransac"):
         anchor_pairs = [m for m in state.matched_pairs if m.is_anchor]
         auto_pairs = [m for m in state.matched_pairs if not m.is_anchor]
-        if len(auto_pairs) >= 6:
-            geo_src = np.array([m.ref_coords() for m in auto_pairs],
-                               dtype=np.float32).reshape(-1, 1, 2)
-            geo_dst = np.array([m.off_coords() for m in auto_pairs],
-                               dtype=np.float32).reshape(-1, 1, 2)
-            _match_p = _get_params().matching
-            geo_ransac_thresh = max(_match_p.ransac_reproj_threshold * neural_res, 20.0)
-            _, geo_inliers = cv2.estimateAffine2D(
-                geo_src, geo_dst, method=cv2.RANSAC,
-                ransacReprojThreshold=geo_ransac_thresh)
-            if geo_inliers is not None:
-                geo_mask = geo_inliers.ravel().astype(bool)
-                n_before = len(auto_pairs)
-                auto_pairs = [m for m, k in zip(auto_pairs, geo_mask) if k]
-                print(f"  Geographic RANSAC (auto only): {n_before} -> {len(auto_pairs)} "
-                      f"({geo_ransac_thresh:.0f}m threshold)")
-            state.matched_pairs = anchor_pairs + auto_pairs
-            state.ransac_survivor_count = len(auto_pairs)
-            if anchor_pairs:
-                print(f"  Anchors preserved: {len(anchor_pairs)} "
-                      f"({', '.join(m.name.replace('anchor:', '') for m in anchor_pairs)})")
+        if len(auto_pairs) < 6:
+            return
+        geo_src = np.array([m.ref_coords() for m in auto_pairs], dtype=np.float32).reshape(-1, 1, 2)
+        geo_dst = np.array([m.off_coords() for m in auto_pairs], dtype=np.float32).reshape(-1, 1, 2)
+        match_params = _get_params().matching
+        ransac_thresh = max(match_params.ransac_reproj_threshold * neural_res, 20.0)
+        from .geo import ransac_affine
+        _, geo_inliers = ransac_affine(
+            geo_src, geo_dst, threshold=ransac_thresh, method=match_params.estimation_method,
+        )
+        if geo_inliers is not None:
+            n_before = len(auto_pairs)
+            auto_pairs = [m for m, k in zip(auto_pairs, geo_inliers) if k]
+            print(f"  Geographic {match_params.estimation_method.upper()} (auto only): "
+                  f"{n_before} -> {len(auto_pairs)} ({ransac_thresh:.0f}m threshold)")
+        state.matched_pairs = anchor_pairs + auto_pairs
+        state.ransac_survivor_count = len(auto_pairs)
+        if anchor_pairs:
+            print(f"  Anchors preserved: {len(anchor_pairs)} "
+                  f"({', '.join(m.name.replace('anchor:', '') for m in anchor_pairs)})")
 
-    # Confidence floor: reject low-quality auto matches (water-based, low certainty)
+
+def _filter_matches_by_confidence_and_consistency(state: AlignState) -> None:
+    """Apply the confidence floor and local-neighborhood displacement consistency filters."""
+    anchor_pairs = [m for m in state.matched_pairs if m.is_anchor]
+    auto_pairs = [m for m in state.matched_pairs if not m.is_anchor]
+
     if len(auto_pairs) >= 10:
         quality_floor = 0.25
-        n_before_qf = len(auto_pairs)
+        n_before = len(auto_pairs)
         auto_pairs = [m for m in auto_pairs if m.confidence >= quality_floor]
-        n_qf_rejected = n_before_qf - len(auto_pairs)
-        if n_qf_rejected > 0:
-            print(f"  Confidence floor: {n_before_qf} -> {len(auto_pairs)} "
-                  f"({n_qf_rejected} below quality {quality_floor})")
+        dropped = n_before - len(auto_pairs)
+        if dropped > 0:
+            print(f"  Confidence floor: {n_before} -> {len(auto_pairs)} "
+                  f"({dropped} below quality {quality_floor})")
         state.matched_pairs = anchor_pairs + auto_pairs
 
-    # Local displacement consistency: reject auto matches whose offset
-    # disagrees with their spatial neighbors (catches isolated outliers)
     if len(auto_pairs) >= 10:
-        n_before_lc = len(auto_pairs)
+        n_before = len(auto_pairs)
         auto_pairs = local_consistency_filter(
             auto_pairs, anchor_pairs + auto_pairs,
-            threshold_m=50.0, k_neighbors=5, search_radius=5000.0)
-        n_lc_rejected = n_before_lc - len(auto_pairs)
-        if n_lc_rejected > 0:
-            print(f"  Local consistency filter: {n_before_lc} -> {len(auto_pairs)} "
-                  f"({n_lc_rejected} spatially inconsistent)")
+            threshold_m=50.0, k_neighbors=5, search_radius=5000.0,
+        )
+        dropped = n_before - len(auto_pairs)
+        if dropped > 0:
+            print(f"  Local consistency filter: {n_before} -> {len(auto_pairs)} "
+                  f"({dropped} spatially inconsistent)")
         state.matched_pairs = anchor_pairs + auto_pairs
 
-    # Save feature match debug image (post-RANSAC, pre-GCP-selection)
+
+def _save_matching_debug_image(state: AlignState, ws: _MatchingWorkspace) -> None:
     if state.diagnostics_dir and state.matched_pairs:
         _save_match_debug_image(
-            arr_ref_neural, arr_off_neural_shifted,
-            ref_neural_transform, off_neural_transform,
-            state.matched_pairs, state.diagnostics_dir)
+            ws.arr_ref_neural, ws.arr_off_neural_shifted,
+            ws.ref_neural_transform, ws.off_neural_transform,
+            state.matched_pairs, state.diagnostics_dir,
+        )
 
-    # Quality check
-    neural_quality_ok = False
+
+def _neural_match_quality_is_acceptable(state: AlignState) -> bool:
+    """Check mean affine residual on auto matches; drop them if too noisy."""
     auto_only = [p for p in state.matched_pairs if not p.is_anchor]
-    if len(auto_only) >= 6:
-        q_src = np.array([p.off_coords() for p in auto_only])
-        q_dst = np.array([p.ref_coords() for p in auto_only])
-        _, q_residuals = fit_affine_from_gcps(q_src, q_dst)
-        q_mean = np.mean(q_residuals)
-        state.match_quality_residual = float(q_mean)
-        print(f"  Neural match quality check: {len(auto_only)} matches, "
-              f"mean affine residual={q_mean:.1f}m")
-        if q_mean < 50:
-            neural_quality_ok = True
-        else:
-            print(f"  Discarding {len(auto_only)} neural matches, keeping anchors")
-            state.matched_pairs = [p for p in state.matched_pairs
-                                   if p.is_anchor]
-            state.used_neural = False
+    if len(auto_only) < 6:
+        return False
+    q_src = np.array([p.off_coords() for p in auto_only])
+    q_dst = np.array([p.ref_coords() for p in auto_only])
+    _, q_residuals = fit_affine_from_gcps(q_src, q_dst)
+    q_mean = float(np.mean(q_residuals))
+    state.match_quality_residual = q_mean
+    print(f"  Neural match quality check: {len(auto_only)} matches, "
+          f"mean affine residual={q_mean:.1f}m")
+    if q_mean < 50:
+        return True
+    print(f"  Discarding {len(auto_only)} neural matches, keeping anchors")
+    state.matched_pairs = [p for p in state.matched_pairs if p.is_anchor]
+    state.used_neural = False
+    return False
 
-    if neural_quality_ok and matched_pairs_sufficient(
-            state.matched_pairs, target=10 if state.best else 15):
-        # Correct reference offset before GCP selection so the anchor-truth
-        # filter doesn't reject well-matched features on the island interior.
-        state.matched_pairs, state.was_corrected, state.correction_outliers = \
-            correct_reference_offset(state.matched_pairs)
-        train_pairs, holdout_pairs = split_holdout_pairs(
-            state.matched_pairs,
-            holdout_fraction=0.15 if state.best else 0.20,
+
+def _select_gcps_and_holdout(state: AlignState, ws: _MatchingWorkspace, profiler) -> None:
+    """Correct the reference offset, split a holdout, and pick the best-covered GCP subset."""
+    state.matched_pairs, state.was_corrected, state.correction_outliers = \
+        correct_reference_offset(state.matched_pairs)
+    train_pairs, holdout_pairs = split_holdout_pairs(
+        state.matched_pairs,
+        holdout_fraction=0.15 if state.best else 0.20,
+    )
+    state.qa_holdout_pairs = holdout_pairs
+    print(
+        f"  Selecting best GCPs from {len(train_pairs)} training matches"
+        + (f" (+ {len(holdout_pairs)} holdout)" if holdout_pairs else "")
+        + "..."
+    )
+    with profiler.section("gcp_selection"):
+        state.matched_pairs, state.gcp_coverage = select_best_gcps(
+            train_pairs, state.overlap.as_tuple(),
+            target_count=60 if state.best else 40,
+            correction_outliers=state.correction_outliers,
+            arr_ref=ws.arr_ref_fine,
+            ref_transform=ws.ref_fine_transform,
+            shoreline_quota=0.25,
         )
-        state.qa_holdout_pairs = holdout_pairs
-        print(
-            f"  Selecting best GCPs from {len(train_pairs)} training matches"
-            + (f" (+ {len(holdout_pairs)} holdout)" if holdout_pairs else "")
-            + "..."
-        )
-        with _p.section("gcp_selection"):
-            state.matched_pairs, state.gcp_coverage = select_best_gcps(
-                train_pairs, state.overlap.as_tuple(),
-                target_count=60 if state.best else 40,
-                correction_outliers=state.correction_outliers,
-                arr_ref=arr_ref_fine,
-                ref_transform=ref_fine_transform,
-                shoreline_quota=0.25)
-        print(f"    Selected {len(state.matched_pairs)} GCPs "
-              f"(spatial coverage: {state.gcp_coverage:.0%})")
+    print(f"    Selected {len(state.matched_pairs)} GCPs "
+          f"(spatial coverage: {state.gcp_coverage:.0%})")
 
-    # Second neural pass at coarser resolution (--best mode, low coverage)
-    if (state.best and state.used_neural and neural_quality_ok
-            and state.gcp_coverage < 0.30
-            and arr_ref_fine is not None):
-        with _p.section("second_neural_pass"):
-            _second_neural_pass(
-                state, src_ref, src_offset, neural_res, fine_res,
-                arr_ref_fine, arr_off_fine_shifted,
-                ref_fine_transform, off_fine_transform,
-                shift_px_x_fine, shift_py_y_fine)
 
-    # 2d: NCC fallback
-    if not matched_pairs_sufficient(state.matched_pairs, target=10 if state.best else 15):
-        with _p.section("ncc_fallback"):
-            _ncc_fallback(state, src_ref, src_offset, neural_res)
+def _should_run_second_neural_pass(state: AlignState, ws: _MatchingWorkspace,
+                                   neural_quality_ok: bool) -> bool:
+    coverage_weak = (state.best and state.gcp_coverage < 0.30) or state.gcp_coverage < 0.20
+    return (coverage_weak and state.used_neural and neural_quality_ok
+            and ws.arr_ref_fine is not None)
+
+
+def step_feature_matching(state: AlignState, args, profiler=None) -> AlignState:
+    """Step 2: Feature matching — neural cascade → filters → GCP selection → NCC fallback."""
+    _p = profiler or _NullProfiler()
+    if state.overlap is None or state.work_crs is None:
+        raise ValueError("Feature matching requires an established work region")
+    state.use_sift_refinement = state.coarse_total < 200
+    state.matched_pairs = []
+    state.used_neural = False
+    if state.best:
+        print("  --best mode: running all methods at maximum quality")
+    print("Step 2: Neural feature matching cascade", flush=True)
+
+    src_offset = rasterio.open(state.current_input)
+    src_ref = rasterio.open(state.reference_path)
+    try:
+        ws = _prepare_matching_workspace(state, src_offset, src_ref)
+        _locate_anchor_matches(state, ws, src_ref, src_offset, _p)
+        _run_dense_neural_matching(state, ws, src_offset, _p)
+        _refine_matches_with_phase_correlation(state, ws, src_ref, src_offset, _p)
+        _filter_matches_geographic_ransac(state, ws.neural_res, _p)
+        _filter_matches_by_confidence_and_consistency(state)
+        _save_matching_debug_image(state, ws)
+
+        neural_quality_ok = _neural_match_quality_is_acceptable(state)
+        if neural_quality_ok and matched_pairs_sufficient(
+                state.matched_pairs, target=10 if state.best else 15):
+            _select_gcps_and_holdout(state, ws, _p)
+
+        if _should_run_second_neural_pass(state, ws, neural_quality_ok):
+            with _p.section("second_neural_pass"):
+                _second_neural_pass(
+                    state, src_ref, src_offset, ws.neural_res, ws.fine_res,
+                    ws.arr_ref_fine, ws.arr_off_fine_shifted,
+                    ws.ref_fine_transform, ws.off_fine_transform,
+                    ws.shift_px_x_fine, ws.shift_py_y_fine,
+                )
+
+        if not matched_pairs_sufficient(state.matched_pairs, target=10 if state.best else 15):
+            with _p.section("ncc_fallback"):
+                _fallback_to_ncc_matching(state, src_ref, src_offset, ws.neural_res)
+    finally:
+        src_offset.close()
+        src_ref.close()
 
     print()
-
-    src_offset.close()
-    src_ref.close()
-
     if state.diagnostics_dir:
         save_checkpoint(state, "post_match",
                         os.path.join(state.diagnostics_dir, "checkpoints"))
-
     return state
 
 
@@ -1765,7 +1855,8 @@ def _land_match_worker(args):
     off_c = center_c + dx_px + shift_px_x
     off_r = center_r + dy_px + shift_py_y
     off_gx, off_gy = rasterio.transform.xy(offset_match_transform, off_r, off_c)
-    return (ref_gx, ref_gy, off_gx, off_gy, sharpness * max_val, f"tm_{idx}")
+    return MatchPair(ref_x=ref_gx, ref_y=ref_gy, off_x=off_gx, off_y=off_gy,
+                     confidence=sharpness * max_val, name=f"tm_{idx}")
 
 
 def _second_neural_pass(state, src_ref, src_offset, neural_res, fine_res,
@@ -1839,7 +1930,7 @@ def _second_neural_pass(state, src_ref, src_offset, neural_res, fine_res,
         print(f"    Second neural pass failed: {e}")
 
 
-def _ncc_fallback(state: AlignState, src_ref, src_offset, neural_res):
+def _fallback_to_ncc_matching(state: AlignState, src_ref, src_offset, neural_res):
     """NCC / land mask template matching fallback."""
     global _worker_data
     if state.matched_pairs:
@@ -1992,13 +2083,11 @@ def _cross_validate_and_robust_refit(state: AlignState) -> None:
         train_ref = np.array([p.ref_coords() for p in train_pairs])
         train_weights = np.array([p.confidence for p in train_pairs])
         M_cv, _ = fit_affine_from_gcps(train_offset, train_ref, weights=train_weights)
-        for i in test_idx:
-            mp_i = state.matched_pairs[i]
-            ogx, ogy = mp_i.off_x, mp_i.off_y
-            rgx, rgy = mp_i.ref_x, mp_i.ref_y
-            pred_x = M_cv[0, 0] * ogx + M_cv[0, 1] * ogy + M_cv[0, 2]
-            pred_y = M_cv[1, 0] * ogx + M_cv[1, 1] * ogy + M_cv[1, 2]
-            cv_errors.append(np.sqrt((pred_x - rgx) ** 2 + (pred_y - rgy) ** 2))
+        test_off = np.array([state.matched_pairs[i].off_coords() for i in test_idx])
+        test_ref = np.array([state.matched_pairs[i].ref_coords() for i in test_idx])
+        pred_x = M_cv[0, 0] * test_off[:, 0] + M_cv[0, 1] * test_off[:, 1] + M_cv[0, 2]
+        pred_y = M_cv[1, 0] * test_off[:, 0] + M_cv[1, 1] * test_off[:, 1] + M_cv[1, 2]
+        cv_errors.extend(np.sqrt((pred_x - test_ref[:, 0]) ** 2 + (pred_y - test_ref[:, 1]) ** 2).tolist())
 
     state.cv_mean = float(np.mean(cv_errors))
     print(f"  Cross-validation ({k_folds}-fold, n={len(state.matched_pairs)}): "
@@ -2039,14 +2128,9 @@ def _cross_validate_and_robust_refit(state: AlignState) -> None:
 
     if robust_mean < state.cv_mean * 0.5:
         state.M_geo = M_robust
-        cv_errors_robust = []
-        for i in range(n_pts):
-            mp_i = state.matched_pairs[i]
-            ogx, ogy = mp_i.off_x, mp_i.off_y
-            rgx, rgy = mp_i.ref_x, mp_i.ref_y
-            pred_x = M_robust[0, 0] * ogx + M_robust[0, 1] * ogy + M_robust[0, 2]
-            pred_y = M_robust[1, 0] * ogx + M_robust[1, 1] * ogy + M_robust[1, 2]
-            cv_errors_robust.append(np.sqrt((pred_x - rgx) ** 2 + (pred_y - rgy) ** 2))
+        pred_x = M_robust[0, 0] * all_offset[:, 0] + M_robust[0, 1] * all_offset[:, 1] + M_robust[0, 2]
+        pred_y = M_robust[1, 0] * all_offset[:, 0] + M_robust[1, 1] * all_offset[:, 1] + M_robust[1, 2]
+        cv_errors_robust = np.sqrt((pred_x - all_ref[:, 0]) ** 2 + (pred_y - all_ref[:, 1]) ** 2)
         state.cv_mean = float(np.mean(cv_errors_robust))
         print(f"  Robust M_geo refit: {best_inliers}/{n_pts} inliers, "
               f"mean residual={robust_mean:.1f}m, CV={state.cv_mean:.1f}m")
@@ -2214,14 +2298,9 @@ def step_validate_and_filter(state: AlignState) -> AlignState:
             boundary_spacing = 3200
         if len(state.gcps) < 30:
             boundary_spacing = 3800
-        raw_boundary = generate_boundary_gcps(
+        state.boundary_gcps = generate_boundary_gcps(
             state.gcps, state.M_geo,
             src_offset.width, src_offset.height, spacing_px=boundary_spacing)
-        state.boundary_gcps = [
-            GCP(col=bg[0], row=bg[1], gx=bg[2], gy=bg[3],
-                synthetic=True, source="boundary")
-            for bg in raw_boundary
-        ]
 
         max_boundary = int(max(16, 1.25 * max(1, len(state.gcps))))
         if len(state.boundary_gcps) > max_boundary:
@@ -2435,206 +2514,345 @@ def _qa_label(qa) -> str:
             f"score={qa['score']:.0f}")
 
 
-def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
-    """Step 5: Select warp mode and apply correction."""
-    _p = profiler or _NullProfiler()
-    if state.overlap is None or state.work_crs is None:
-        raise ValueError("Warp selection requires an established work region")
-    if not state.yes:
-        response = input("Apply this correction? [y/N] ")
-        if response.lower() not in ("y", "yes"):
-            if state.precorrection_tmp and os.path.exists(state.precorrection_tmp):
-                os.remove(state.precorrection_tmp)
-            raise UserAbortError("User declined warp application")
+def _affine_warp_gcps(input_path: str, output_path: str, gcps, work_crs, output_crs,
+                      output_bounds, output_res: float) -> bool:
+    """GDAL first-order polynomial warp using the fitted GCP set."""
+    gdal.UseExceptions()
+    tmp_gcp = f"/vsimem/{uuid.uuid4().hex}_affine_gcps.tif"
+    needs_reproject = output_crs is not None and str(output_crs) != str(work_crs)
+    tmp_work = output_path + ".affine_work.tif" if needs_reproject else output_path
+    left, bottom, right, top = output_bounds
+    try:
+        if os.path.exists(tmp_work):
+            os.remove(tmp_work)
+        if os.path.exists(output_path):
+            os.remove(output_path)
 
-    # Output in Web Mercator for web overlay
-    output_crs = WEB_MERCATOR
-    qa_eval_res = max(2.0, min(6.0, max(state.offset_res_m, state.ref_res_m)))
+        gcp_list = [gdal.GCP(float(g.gx), float(g.gy), 0.0, float(g.col), float(g.row)) for g in gcps]
+        ds = gdal.Open(input_path)
+        if ds is None:
+            return False
+        tmp_ds = gdal.Translate(tmp_gcp, ds, GCPs=gcp_list, outputSRS=str(work_crs))
+        ds = None
+        if tmp_ds is None:
+            return False
+        tmp_ds = None
 
-    all_gcps = list(state.gcps) + list(state.boundary_gcps)
-    print(f"Step 5: Grid Optimization Warp ({len(state.gcps)} GCPs "
-          f"+ {len(state.boundary_gcps)} boundary = {len(all_gcps)} total)", flush=True)
-    # Close model_cache before apply_warp to free GPU memory
+        warp_ds = gdal.Warp(
+            tmp_work, tmp_gcp,
+            polynomialOrder=1,
+            dstSRS=str(work_crs),
+            outputBounds=(left, bottom, right, top),
+            xRes=output_res, yRes=output_res,
+            resampleAlg=gdal.GRA_Bilinear,
+            multithread=True,
+            warpOptions=['NUM_THREADS=ALL_CPUS'],
+            creationOptions=['COMPRESS=LZW', 'PREDICTOR=2', 'TILED=YES',
+                             'NUM_THREADS=ALL_CPUS', 'BIGTIFF=YES'],
+            warpMemoryLimit=2048 * 1024 * 1024,
+        )
+        if warp_ds is None:
+            return False
+        warp_ds = None
+
+        if needs_reproject:
+            reproject_ds = gdal.Warp(
+                output_path, tmp_work,
+                dstSRS=str(output_crs),
+                resampleAlg=gdal.GRA_Bilinear,
+                multithread=True,
+                warpOptions=['NUM_THREADS=ALL_CPUS'],
+                creationOptions=['COMPRESS=LZW', 'PREDICTOR=2', 'TILED=YES',
+                                 'NUM_THREADS=ALL_CPUS', 'BIGTIFF=YES'],
+                warpMemoryLimit=2048 * 1024 * 1024,
+            )
+            if reproject_ds is None:
+                return False
+            reproject_ds = None
+
+        return os.path.exists(output_path)
+    except Exception as e:
+        print(f"  Affine fallback error: {e}", flush=True)
+        return False
+    finally:
+        try:
+            gdal.Unlink(tmp_gcp)
+        except Exception:
+            pass
+        if needs_reproject and os.path.exists(tmp_work):
+            try:
+                os.remove(tmp_work)
+            except Exception:
+                pass
+
+
+def _candidate_sort_key(report: QaReport) -> tuple[int, float, float]:
+    return (0 if report.accepted else 1, report.total_score, -report.confidence)
+
+
+@dataclass
+class _WarpCandidate:
+    """Per-candidate state used by the warp selection pipeline."""
+    name: str                         # "grid", "affine", "tps"
+    output_path: str                  # temp path (affine/tps) or state.output_path (grid)
+    produced: bool = False            # whether the warp actually wrote a file
+    image_metrics: dict | None = None
+    report: QaReport | None = None
+
+
+def _confirm_user_consent(state: AlignState) -> None:
+    if state.yes:
+        return
+    response = input("Apply this correction? [y/N] ")
+    if response.lower() in ("y", "yes"):
+        return
+    if state.precorrection_tmp and os.path.exists(state.precorrection_tmp):
+        os.remove(state.precorrection_tmp)
+    raise UserAbortError("User declined warp application")
+
+
+def _release_model_cache(state: AlignState) -> None:
+    """Free GPU memory before running the grid warp."""
     if state.model_cache is not None:
         state.model_cache.close()
         state.model_cache = None
-    with _p.section("apply_warp"):
-        apply_warp(state.current_input, state.output_path, state.reference_path, all_gcps,
-                   state.work_crs,
-                   output_bounds=state.overlap.as_tuple(),
-                   output_res=state.offset_res_m,
-                   output_crs=output_crs,
-                   grid_size=state.grid_size,
-                   grid_iters=state.grid_iters,
-                   arap_weight=state.arap_weight,
-                   n_real_gcps_in=len(state.gcps),
-                   match_weights=state.match_weights,
-                   diagnostics_dir=state.diagnostics_dir,
-                   profiler=_p,
-                   model_cache=state.model_cache)
 
-    # ------------------------------------------------------------------
-    # QA + TPS fallback gate
-    # Compute QA on the grid result, then run a GDAL TPS warp of the
-    # same GCPs.  Keep whichever scores better.  This guarantees output
-    # is never worse than plain TPS.
-    # ------------------------------------------------------------------
-    qa_grid = None
-    with _p.section("qa_eval"):
+
+def _apply_grid_warp(state: AlignState, gcps, output_crs, profiler) -> _WarpCandidate:
+    """Run the PyTorch grid optimizer directly into state.output_path."""
+    candidate = _WarpCandidate(name="grid", output_path=state.output_path)
+    with profiler.section("apply_warp"):
+        apply_warp(
+            state.current_input, state.output_path, state.reference_path, gcps,
+            state.work_crs,
+            output_bounds=state.overlap.as_tuple(),
+            output_res=state.offset_res_m,
+            output_crs=output_crs,
+            grid_size=state.grid_size,
+            grid_iters=state.grid_iters,
+            arap_weight=state.arap_weight,
+            n_real_gcps_in=len(state.gcps),
+            match_weights=state.match_weights,
+            diagnostics_dir=state.diagnostics_dir,
+            profiler=profiler,
+            model_cache=state.model_cache,
+        )
+    candidate.produced = os.path.exists(state.output_path)
+    return candidate
+
+
+def _apply_affine_warp(state: AlignState, gcps, output_crs, profiler) -> _WarpCandidate:
+    """Run the GDAL first-order polynomial baseline into a sibling temp file."""
+    tmp_path = state.output_path.replace('.tif', '_affine_fallback.tif')
+    candidate = _WarpCandidate(name="affine", output_path=tmp_path)
+    with profiler.section("affine_fallback"):
         try:
-            qa_grid = evaluate_alignment_quality_paths(
-                state.output_path,
+            print("  Running affine baseline warp for comparison...", flush=True)
+            candidate.produced = _affine_warp_gcps(
+                state.current_input, tmp_path, gcps,
+                state.work_crs, output_crs,
+                state.overlap.as_tuple(), state.offset_res_m,
+            )
+        except Exception as e:
+            print(f"  Affine baseline failed: {e}", flush=True)
+    return candidate
+
+
+def _apply_tps_warp(state: AlignState, gcps, output_crs, profiler) -> _WarpCandidate:
+    """Run the GDAL TPS warp + optional flow refinement into a sibling temp file."""
+    tmp_path = state.output_path.replace('.tif', '_tps_fallback.tif')
+    candidate = _WarpCandidate(name="tps", output_path=tmp_path)
+    with profiler.section("tps_fallback"):
+        try:
+            print("  Running TPS fallback warp for comparison...", flush=True)
+            candidate.produced = _tps_warp_gcps(
+                state.current_input, tmp_path, gcps,
+                state.work_crs, output_crs,
+                state.overlap.as_tuple(), state.offset_res_m,
+            )
+            if not candidate.produced:
+                return candidate
+            try:
+                if apply_flow_refinement_to_file(
+                    tmp_path, state.reference_path,
+                    state.work_crs, state.overlap.as_tuple(), state.offset_res_m,
+                ):
+                    print("  [FlowRefine-TPS] Applied flow refinement to TPS result", flush=True)
+            except Exception as e:
+                print(f"  [FlowRefine-TPS] Skipped ({e})", flush=True)
+        except Exception as e:
+            print(f"  TPS fallback failed: {e}", flush=True)
+            candidate.produced = False
+    return candidate
+
+
+def _evaluate_candidate_image_quality(candidate: _WarpCandidate, state: AlignState,
+                                      qa_eval_res: float, profiler) -> None:
+    """Populate ``candidate.image_metrics`` via the dense image-space QA scorer."""
+    if not candidate.produced:
+        return
+    section = "qa_eval" if candidate.name == "grid" else f"qa_eval_{candidate.name}"
+    with profiler.section(section):
+        try:
+            candidate.image_metrics = evaluate_alignment_quality_paths(
+                candidate.output_path,
                 state.reference_path,
                 state.overlap.as_tuple(),
                 state.work_crs,
                 eval_res=qa_eval_res,
                 mask_mode=state.mask_provider,
             )
-            if qa_grid is not None:
-                print(f"  Grid warp QA: {_qa_label(qa_grid)}", flush=True)
+            if candidate.image_metrics is not None:
+                print(f"  {candidate.name.capitalize()} warp QA: "
+                      f"{_qa_label(candidate.image_metrics)}", flush=True)
         except Exception as e:
-            print(f"  Grid QA failed: {e}", flush=True)
+            print(f"  {candidate.name.capitalize()} QA failed: {e}", flush=True)
 
-    # TPS fallback — only run when --tps-fallback is set
-    tps_tmp = state.output_path.replace('.tif', '_tps_fallback.tif')
-    tps_ok = False
-    qa_tps = None
-    if state.tps_fallback:
-        with _p.section("tps_fallback"):
-            try:
-                print("  Running TPS fallback warp for comparison...", flush=True)
-                tps_ok = _tps_warp_gcps(
-                    state.current_input, tps_tmp,
-                    all_gcps, state.work_crs, output_crs,
-                    state.overlap.as_tuple(), state.offset_res_m,
-                )
-                if tps_ok:
-                    try:
-                        flow_applied = apply_flow_refinement_to_file(
-                            tps_tmp, state.reference_path,
-                            state.work_crs, state.overlap.as_tuple(),
-                            state.offset_res_m,
-                        )
-                        if flow_applied:
-                            print("  [FlowRefine-TPS] Applied flow refinement to TPS result", flush=True)
-                    except Exception as e:
-                        print(f"  [FlowRefine-TPS] Skipped ({e})", flush=True)
-                    qa_tps = evaluate_alignment_quality_paths(
-                        tps_tmp,
-                        state.reference_path,
-                        state.overlap.as_tuple(),
-                        state.work_crs,
-                        eval_res=qa_eval_res,
-                        mask_mode=state.mask_provider,
-                    )
-                    print(f"  TPS fallback QA:  {_qa_label(qa_tps)}", flush=True)
-            except Exception as e:
-                print(f"  TPS fallback failed: {e}", flush=True)
 
-    state.qa_reports = []
-    with _p.section("qa_report"):
-        report_grid = build_candidate_report(
-            "grid",
-            state.output_path,
-            state.reference_path,
-            state.overlap.as_tuple(),
-            state.work_crs,
-            holdout_pairs=state.qa_holdout_pairs,
-            M_geo=state.M_geo,
-            coverage=state.gcp_coverage,
-            cv_mean_m=state.cv_mean,
-            hypothesis_id=state.chosen_hypothesis.hypothesis_id if state.chosen_hypothesis else "",
-            eval_res=qa_eval_res,
-            image_metrics=qa_grid,
-        )
-        state.qa_reports.append(report_grid)
+def _build_candidate_qa_report(candidate: _WarpCandidate, state: AlignState,
+                               qa_eval_res: float) -> None:
+    """Build the independent holdout QA report for a candidate that produced output."""
+    if not candidate.produced or not os.path.exists(candidate.output_path):
+        return
+    candidate.report = build_candidate_report(
+        candidate.name,
+        candidate.output_path,
+        state.reference_path,
+        state.overlap.as_tuple(),
+        state.work_crs,
+        holdout_pairs=state.qa_holdout_pairs,
+        M_geo=state.M_geo,
+        coverage=state.gcp_coverage,
+        cv_mean_m=state.cv_mean,
+        hypothesis_id=state.chosen_hypothesis.hypothesis_id if state.chosen_hypothesis else "",
+        eval_res=qa_eval_res,
+        image_metrics=candidate.image_metrics,
+    )
+    print(
+        f"  {candidate.name.capitalize()} independent QA: "
+        f"total={candidate.report.total_score:.0f}, "
+        f"confidence={candidate.report.confidence:.2f}, "
+        f"accepted={candidate.report.accepted}"
+    )
+
+
+def _rank_warp_candidates(candidates: list[_WarpCandidate]) -> _WarpCandidate | None:
+    """Pick the best candidate by (accepted, total_score, -confidence)."""
+    with_reports = [c for c in candidates if c.report is not None]
+    if not with_reports:
+        return None
+    return min(with_reports, key=lambda c: _candidate_sort_key(c.report))
+
+
+def _promote_selected_candidate(state: AlignState, selected: _WarpCandidate | None,
+                                candidates: list[_WarpCandidate]) -> str:
+    """Move the selected warp to state.output_path and clean up the losers."""
+    selected_name = selected.name if selected is not None else "grid"
+
+    if selected_name != "grid":
+        # Grid already wrote state.output_path directly; losing affine/tps need to be promoted.
+        for c in candidates:
+            if c.name == selected_name and c.produced and os.path.exists(c.output_path):
+                print(f"  {c.name.capitalize()} baseline wins — keeping {c.name} result.", flush=True)
+                os.replace(c.output_path, state.output_path)
+                break
+    else:
+        print("  Grid optimizer wins.", flush=True)
+
+    for c in candidates:
+        if c.name == "grid":
+            continue
+        if c.produced and os.path.exists(c.output_path) and c.name != selected_name:
+            os.remove(c.output_path)
+
+    if selected is not None:
         print(
-            f"  Grid independent QA: total={report_grid.total_score:.0f}, "
-            f"confidence={report_grid.confidence:.2f}, accepted={report_grid.accepted}"
+            f"  Selected candidate confidence={selected.report.confidence:.2f} "
+            f"accepted={selected.report.accepted}"
         )
+    return selected_name
 
-        report_tps = None
-        if state.tps_fallback and tps_ok and os.path.exists(tps_tmp):
-            report_tps = build_candidate_report(
-                "tps",
-                tps_tmp,
-                state.reference_path,
-                state.overlap.as_tuple(),
-                state.work_crs,
-                holdout_pairs=state.qa_holdout_pairs,
-                M_geo=state.M_geo,
-                coverage=state.gcp_coverage,
-                cv_mean_m=state.cv_mean,
-                hypothesis_id=state.chosen_hypothesis.hypothesis_id if state.chosen_hypothesis else "",
-                eval_res=qa_eval_res,
-            )
-            state.qa_reports.append(report_tps)
-            print(
-                f"  TPS independent QA:  total={report_tps.total_score:.0f}, "
-                f"confidence={report_tps.confidence:.2f}, accepted={report_tps.accepted}"
-            )
 
-    # Decide which result to keep
-    selected_candidate = "grid"
-    if state.tps_fallback:
-        grid_score = report_grid.total_score
-        tps_score = report_tps.total_score if report_tps is not None else float('inf')
-        if tps_ok and tps_score < grid_score * 0.97:
-            print(f"  TPS fallback is better (score {tps_score:.0f} vs grid {grid_score:.0f}) "
-                  f"— using TPS result.", flush=True)
-            os.replace(tps_tmp, state.output_path)
-            selected_candidate = "tps"
-        else:
-            if grid_score < float('inf'):
-                print(f"  Grid optimizer wins (score {grid_score:.0f} vs TPS {tps_score:.0f}).",
-                      flush=True)
-            if tps_ok and os.path.exists(tps_tmp):
-                os.remove(tps_tmp)
-
-    selected_report = report_grid if selected_candidate == "grid" else report_tps
-    if selected_report is not None:
-        print(
-            f"  Selected candidate confidence={selected_report.confidence:.2f} "
-            f"accepted={selected_report.accepted}"
-        )
-
+def _write_qa_report_to_disk(state: AlignState, selected_name: str) -> None:
     qa_json_path = state.qa_json_path
     if not qa_json_path and (state.allow_abstain or state.diagnostics_dir):
         qa_json_path = state.output_path.replace('.tif', '_qa.json')
-    if qa_json_path:
-        write_qa_report(
-            qa_json_path,
-            state.qa_reports,
-            selected_candidate=selected_candidate,
-            metadata={
-                "input_path": state.input_path,
-                "current_input": state.current_input,
-                "reference_path": state.reference_path,
-                "gcp_count": len(state.gcps),
-                "holdout_count": len(state.qa_holdout_pairs),
-                "global_hypotheses": [hyp.to_dict() for hyp in state.global_hypotheses],
-            },
-        )
-        print(f"  QA report written to: {qa_json_path}")
+    if not qa_json_path:
+        return
+    write_qa_report(
+        qa_json_path,
+        state.qa_reports,
+        selected_candidate=selected_name,
+        metadata={
+            "input_path": state.input_path,
+            "current_input": state.current_input,
+            "reference_path": state.reference_path,
+            "gcp_count": len(state.gcps),
+            "holdout_count": len(state.qa_holdout_pairs),
+            "global_hypotheses": [hyp.to_dict() for hyp in state.global_hypotheses],
+        },
+    )
+    print(f"  QA report written to: {qa_json_path}")
 
-    if selected_report is not None and state.allow_abstain and (
-        not selected_report.accepted or selected_report.confidence < 0.35
-    ):
-        state.abstained = True
-        if state.precorrection_tmp and os.path.exists(state.precorrection_tmp):
-            os.remove(state.precorrection_tmp)
-        if os.path.exists(state.output_path):
-            os.remove(state.output_path)
-        print(
-            "\nAlignment abstained: independent QA marked this result as low confidence."
-        )
+
+def _should_abstain(state: AlignState, selected: _WarpCandidate | None) -> bool:
+    if not state.allow_abstain or selected is None or selected.report is None:
+        return False
+    report = selected.report
+    return (not report.accepted) or (report.confidence < 0.35)
+
+
+def _abstain_and_cleanup(state: AlignState) -> None:
+    state.abstained = True
+    if state.precorrection_tmp and os.path.exists(state.precorrection_tmp):
+        os.remove(state.precorrection_tmp)
+    if os.path.exists(state.output_path):
+        os.remove(state.output_path)
+    print("\nAlignment abstained: independent QA marked this result as low confidence.")
+
+
+def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
+    """Step 5: Run grid/affine/(optional TPS) warps, score them, keep the best."""
+    _p = profiler or _NullProfiler()
+    if state.overlap is None or state.work_crs is None:
+        raise ValueError("Warp selection requires an established work region")
+    _confirm_user_consent(state)
+
+    output_crs = WEB_MERCATOR  # web overlay default
+    qa_eval_res = max(2.0, min(6.0, max(state.offset_res_m, state.ref_res_m)))
+    all_gcps = list(state.gcps) + list(state.boundary_gcps)
+    print(f"Step 5: Grid Optimization Warp ({len(state.gcps)} GCPs "
+          f"+ {len(state.boundary_gcps)} boundary = {len(all_gcps)} total)", flush=True)
+    _release_model_cache(state)
+
+    candidates: list[_WarpCandidate] = [
+        _apply_grid_warp(state, all_gcps, output_crs, _p),
+        _apply_affine_warp(state, all_gcps, output_crs, _p),
+    ]
+    if state.tps_fallback:
+        candidates.append(_apply_tps_warp(state, all_gcps, output_crs, _p))
+
+    for candidate in candidates:
+        _evaluate_candidate_image_quality(candidate, state, qa_eval_res, _p)
+
+    state.qa_reports = []
+    with _p.section("qa_report"):
+        for candidate in candidates:
+            _build_candidate_qa_report(candidate, state, qa_eval_res)
+            if candidate.report is not None:
+                state.qa_reports.append(candidate.report)
+
+    selected = _rank_warp_candidates(candidates)
+    selected_name = _promote_selected_candidate(state, selected, candidates)
+    _write_qa_report_to_disk(state, selected_name)
+
+    if _should_abstain(state, selected):
+        _abstain_and_cleanup(state)
         return state
 
     if state.precorrection_tmp and os.path.exists(state.precorrection_tmp):
         os.remove(state.precorrection_tmp)
-
     print(f"\nAligned image written to: {state.output_path}")
-
     return state
 
 
@@ -2676,20 +2894,23 @@ def run(args, model_cache=None, profile=True) -> str:
                             os.path.join(state.diagnostics_dir, "checkpoints"))
         with profiler.section("coarse_offset"):
             state = step_coarse_offset(state, profiler=profiler)
-        with profiler.section("orthorectify"):
-            state = step_orthorectify(state)
-        with profiler.section("handle_large_offset"):
-            state = step_handle_large_offset(state, args)
-        with profiler.section("scale_rotation"):
-            state = step_scale_rotation(state, args, profiler=profiler)
-        with profiler.section("feature_matching"):
-            state = step_feature_matching(state, args, profiler=profiler)
-        with profiler.section("validate_and_filter"):
-            state = step_validate_and_filter(state)
-        with profiler.section("select_warp_and_apply"):
-            state = step_select_warp_and_apply(state, profiler=profiler)
-        with profiler.section("post_refinement"):
-            step_post_refinement(state)
+        if state.abstained:
+            print("\nNo output retained because the run abstained on coarse offset grounds.")
+        else:
+            with profiler.section("orthorectify"):
+                state = step_orthorectify(state)
+            with profiler.section("handle_large_offset"):
+                state = step_handle_large_offset(state, args)
+            with profiler.section("scale_rotation"):
+                state = step_scale_rotation(state, args, profiler=profiler)
+            with profiler.section("feature_matching"):
+                state = step_feature_matching(state, args, profiler=profiler)
+            with profiler.section("validate_and_filter"):
+                state = step_validate_and_filter(state)
+            with profiler.section("select_warp_and_apply"):
+                state = step_select_warp_and_apply(state, profiler=profiler)
+            with profiler.section("post_refinement"):
+                step_post_refinement(state)
     except AlreadyAlignedError as e:
         print(f"\n  {e}", flush=True)
     except UserAbortError as e:

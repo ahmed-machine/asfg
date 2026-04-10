@@ -2,8 +2,36 @@ inherits: _base
 
 meta:
   name: kh9
-  description: KH-9 Hexagon (1971-1984), mapping camera — tuned March 2026
-  cameras: [KH-9]
+  description: KH-9 Hexagon Panoramic Camera (D3C, 1973-1984) — Fore/Aft stereo pairs
+  cameras: [KH-9 PC]
+
+# KH-9 Panoramic Camera: rotating-lens system similar to KH-4 but with longer
+# focal length and wider scan arc. D3C entity prefix = USGS Declass-3 dataset.
+# Parameters sourced from public NRO documentation and the 2OC paper framework
+# (Hou et al. 2023, Remote Sensing 15(21):5116) — apply the same physics.
+camera:
+  type: opticalbar
+  focal_length: 1.524          # metres (60 in — KH-9 panoramic camera)
+  pixel_pitch: 7.0e-6          # metres (7 μm USGS scan)
+  scan_time: 0.5               # seconds — nominal; refine via --solve-intrinsics
+  speed: 7800                  # m/s orbital velocity (~170 km altitude)
+  forward_tilt: 0.1745         # 10° for Fore/Aft stereo pairs (sign flipped by process.py based on A/F designation)
+  scan_dir: right
+  motion_compensation_factor: 1.0
+  # Physical scan arc is ~120° but align/grid_optim.py set_panoramic_prior
+  # uses a 1/cos²(θ) approximation that breaks at wide arcs (peak edge
+  # displacement > 1.0 normalised at 120°). ASP mapproject already corrects
+  # the true bow-tie distortion before grid_optim runs, so we disable the
+  # in-house prior by setting scan_arc_deg: 0.0. Revisit if ASP is bypassed.
+  scan_arc_deg: 0.0
+  # 2OC paper adaptive focal length fit. KH-9 PC nominal 1.524 m may drift
+  # ~0.1% across sub-images; let ASP bundle_adjust float it.
+  bundle_adjust_solve_intrinsics: true
+  # 2OC §3.1: orthorectify each USGS sub-frame independently with its own
+  # OpticalBar camera model, then gdalbuildvrt the results into a single
+  # target mosaic. Avoids leaking per-segment offsets into a single-camera
+  # fit — consumed by preprocess/camera_model.py::opticalbar_per_segment_precorrect.
+  per_segment_ortho: true
 
 coarse:
   coarse_res: 10.0
@@ -17,27 +45,42 @@ scale_rotation:
   min_valid_frac: 0.42
 
 matching:
-  roma_size: 616
-  roma_num_corresp: 900
-  ransac_reproj_threshold: 2.31
-  land_mask_frac_min: 0.19
+  roma_size: 784
+  roma_num_corresp: 1000
+  ransac_reproj_threshold: 2.86
+  land_mask_frac_min: 0.33
+  tile_joint_land_min: 0.08
+  match_quota_per_cell: 40
+  estimation_method: magsac
 
 validation:
   anchor_inlier_threshold: 7
   cv_refit_threshold_m: 77.0
 
 grid_optim:
-  early_stop_threshold: 0.001
-  lr: 0.0018
-  w_data: 1.05
-  w_chamfer: 0.36
-  w_arap: 1.18
-  w_laplacian: 0.49
-  w_disp: 0.073
-  level_w_data_scale: [1.0, 2.89, 3.86]
-  level_w_disp_scale: [1.0, 0.96, 0.63]
-  level_reg_scale: [1.0, 1.01, 1.01]
-  level_chamfer_scale: [1.0, 0.95, 0.26]
+  early_stop_threshold: 0.000106
+  lr: 0.00946
+  w_data: 0.509
+  w_chamfer: 0.795
+  w_arap: 1.133
+  w_laplacian: 0.992
+  w_disp: 0.081
+  w_pixel: 3.93
+  pixel_ncc_res: 2.77
+  pixel_ncc_window: 5
+  pixel_ncc_cadence: 3
+  w_feat: 0.0025
+  feat_extract_res: 7.43
+  feat_coverage_gate: false
+  feat_scale_factor: 1.665
+  feat_mid_ratio: 0.359
+  feat_lncc_window: 5
+  level_w_data_scale: [1.0, 1.607, 1.963]
+  level_w_disp_scale: [1.0, 0.441, 0.301]
+  level_reg_scale: [1.0, 1.410, 1.684]
+  level_chamfer_scale: [1.0, 0.393, 0.515]
+  level_w_pixel_scale: [0.0, 0.724, 1.637]
+  level_w_feat_scale: [0.0, 1.523, 0.961]
 
 qa:
   accept_image_score_max: 120.0

@@ -26,9 +26,218 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.paths_config import get_target, get_reference
 
-TARGET = get_target("bahrain_1977")
 REFERENCE = get_reference("kh9_dzb1212")
 ANCHORS = str(PROJECT_ROOT / "data" / "bahrain_anchor_gcps.json")
+
+# Shared preprocessing cache (downloads/extracted/stitched/georef/ortho).
+# Re-used across run_test.py and run_e2e_test.py so frames don't re-download.
+CACHE_DIR = PROJECT_ROOT / "output"
+E2E_CONFIG = PROJECT_ROOT / "scripts" / "test" / "e2e_configs" / "bahrain_kh9_pc_1977.yaml"
+ENTITY_ID = "D3C1213-200346A003"  # Bahrain KH-9 PC Aft scene
+
+
+def ensure_target_built() -> str:
+    """Materialize the per-segment orthorectified target for the Bahrain KH-9
+    PC scene and return its path. Runs process.py --skip-align --skip-mosaic
+    against the shared output/ cache, so downloads/extracted/georef stages
+    short-circuit on mtime checks. Set DECLASS_USE_PRESTITCHED=1 to fall back
+    to the legacy pre-stitched Dropbox TIFF for A/B comparison.
+    """
+    if os.environ.get("DECLASS_USE_PRESTITCHED"):
+        legacy = get_target("bahrain_1977")
+        print(f"  [ensure_target_built] DECLASS_USE_PRESTITCHED set — using {legacy}")
+        return legacy
+
+    import yaml
+
+    with open(E2E_CONFIG) as f:
+        cfg = yaml.safe_load(f)
+    ref_path = get_reference(cfg["reference"])
+    boundary_path = str(PROJECT_ROOT / cfg["boundary"])
+    catalogs = [str(PROJECT_ROOT / c) for c in cfg["catalogs"]]
+
+    # Candidate output paths (see paths.py :: ortho_path, ortho_segments_dir
+    # and preprocess/camera_model.py line ~474 for the VRT filename).
+    ortho_tif = CACHE_DIR / "ortho" / f"{ENTITY_ID}_ortho.tif"
+    ortho_vrt_dir = CACHE_DIR / "ortho" / f"{ENTITY_ID}_segments"
+    existing_vrts = sorted(ortho_vrt_dir.glob("*_per_segment.vrt")) if ortho_vrt_dir.exists() else []
+
+    def _resolve_existing() -> str | None:
+        if existing_vrts:
+            return str(existing_vrts[-1])
+        if ortho_tif.exists():
+            return str(ortho_tif)
+        return None
+
+    # Fast path: a per-segment VRT already exists. Prefer it over any
+    # single-image _ortho.tif because per-segment is what we're trying to
+    # produce now. Still crop to the reference overlap before returning.
+    if existing_vrts:
+        print(f"  [ensure_target_built] Using cached per-segment VRT: {existing_vrts[-1]}")
+        cropped = _crop_ortho_to_reference(str(existing_vrts[-1]), ref_path, ortho_vrt_dir)
+        print(f"  [ensure_target_built] Cropped target: {cropped}")
+        return cropped
+
+    # Stale single-image ortho sitting in the cache would short-circuit
+    # process.py's _path_is_stale check and block per-segment regeneration.
+    # Remove it so process.py regenerates using the freshly-enabled
+    # per_segment_ortho profile flag.
+    if ortho_tif.exists():
+        print(f"  [ensure_target_built] Removing stale single-image ortho to force per-segment rebuild: {ortho_tif}")
+        ortho_tif.unlink()
+
+    # Also clear the asp_ortho_path key from the scene metadata so
+    # _ensure_scene_asp_ortho doesn't short-circuit on the old single-image
+    # path. Keep the rest of the georef metadata intact.
+    metadata_path = CACHE_DIR / "georef" / f"{ENTITY_ID}_metadata.json"
+    if metadata_path.exists():
+        try:
+            meta = json.loads(metadata_path.read_text())
+        except Exception:
+            meta = None
+        if isinstance(meta, dict) and "asp_ortho_path" in meta:
+            meta.pop("asp_ortho_path", None)
+            metadata_path.write_text(json.dumps(meta, indent=2))
+            print(f"  [ensure_target_built] Cleared asp_ortho_path from {metadata_path}")
+
+    cmd = [
+        sys.executable, str(PROJECT_ROOT / "process.py"),
+        "--csv", *catalogs,
+        "--reference", ref_path,
+        "--boundary", boundary_path,
+        "--entities", ENTITY_ID,
+        "--cache-dir", str(CACHE_DIR),
+        "--output-dir", str(CACHE_DIR / "preprocess_run"),
+        "--skip-align",
+        "--skip-mosaic",
+    ]
+    if cfg.get("prefer_camera"):
+        cmd.extend(["--prefer-camera", cfg["prefer_camera"]])
+
+    print("=== run_test.py: Preprocessing target via process.py ===")
+    print(f"  cmd: {' '.join(cmd[:6])}...")
+    subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT))
+
+    # Re-scan after preprocessing.
+    existing_vrts = sorted(ortho_vrt_dir.glob("*_per_segment.vrt")) if ortho_vrt_dir.exists() else []
+    resolved = _resolve_existing()
+    if not resolved:
+        raise RuntimeError(
+            f"Preprocessing did not produce an ortho under {ortho_vrt_dir} or at {ortho_tif}"
+        )
+
+    # The per-segment VRT spans the full ~200 km KH-9 strip, but the
+    # reference only covers ~60 km (Bahrain). Crop the VRT to the
+    # reference's footprint plus ~5 km margin so coarse offset detection
+    # and feature matching don't waste effort on regions with no reference
+    # coverage. The pre-stitched v173 target was already cropped this way.
+    cropped = _crop_ortho_to_reference(resolved, ref_path, ortho_vrt_dir)
+    print(f"  [ensure_target_built] Cropped target: {cropped}")
+    return cropped
+
+
+def _crop_ortho_to_reference(ortho_path: str, reference_path: str,
+                             output_dir) -> str:
+    """Crop a full-strip ortho to its overlap with the reference, plus margin.
+
+    KH-9 panoramic strips are ~200 km long and cross the reference image
+    diagonally, so each segment's y-range covers only a fraction of the
+    reference's y-range. The correct crop is the intersection of:
+
+      1. the reference image's bounds (plus ~5 km margin), and
+      2. the union of segments that actually overlap the reference
+
+    Cropping to the reference bounds alone leaves huge empty regions north
+    and south of the actual strip data (which breaks coarse offset
+    detection — see v175). Cropping to the segment union alone may leak
+    strip content well outside Bahrain. The intersection gives us a tight
+    bbox matching v173's pre-stitched extent.
+    """
+    import rasterio
+    from rasterio.warp import transform_bounds
+
+    MARGIN_M = 5000.0
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cropped_vrt = out_dir / f"{ENTITY_ID}_cropped.vrt"
+
+    # Determine target CRS from the ortho VRT.
+    with rasterio.open(ortho_path) as ortho_src:
+        target_crs = ortho_src.crs.to_string() if ortho_src.crs else "EPSG:3857"
+
+    # Reference bounds in the ortho's CRS.
+    with rasterio.open(reference_path) as ref_src:
+        ref_bounds_native = ref_src.bounds
+        ref_crs = ref_src.crs.to_string() if ref_src.crs else "EPSG:4326"
+    ref_left, ref_bottom, ref_right, ref_top = transform_bounds(
+        ref_crs, target_crs,
+        ref_bounds_native.left, ref_bounds_native.bottom,
+        ref_bounds_native.right, ref_bounds_native.top,
+    )
+
+    # Enumerate sub-segment tifs (siblings of the VRT) and compute the
+    # union of segment bounds that intersect the reference bounds.
+    seg_dir = Path(ortho_path).parent
+    seg_tifs = sorted(seg_dir.glob("*_seg*_ortho.tif"))
+    if not seg_tifs:
+        # Fall back to the whole ortho's bounds if no per-segment tifs found.
+        with rasterio.open(ortho_path) as src:
+            src_bounds = src.bounds
+        seg_union = (src_bounds.left, src_bounds.bottom,
+                     src_bounds.right, src_bounds.top)
+    else:
+        lefts, bottoms, rights, tops = [], [], [], []
+        for tif in seg_tifs:
+            with rasterio.open(tif) as s:
+                b = s.bounds
+            # Does this segment overlap the reference bounds?
+            if (b.right < ref_left or b.left > ref_right or
+                    b.top < ref_bottom or b.bottom > ref_top):
+                continue
+            lefts.append(b.left)
+            bottoms.append(b.bottom)
+            rights.append(b.right)
+            tops.append(b.top)
+        if not lefts:
+            print(f"  [crop] No segments overlap reference — using full VRT extent")
+            with rasterio.open(ortho_path) as src:
+                src_bounds = src.bounds
+            seg_union = (src_bounds.left, src_bounds.bottom,
+                         src_bounds.right, src_bounds.top)
+        else:
+            seg_union = (min(lefts), min(bottoms), max(rights), max(tops))
+
+    # Intersection of reference bounds with the overlapping-segments union.
+    west = max(seg_union[0], ref_left) - MARGIN_M
+    south = max(seg_union[1], ref_bottom) - MARGIN_M
+    east = min(seg_union[2], ref_right) + MARGIN_M
+    north = min(seg_union[3], ref_top) + MARGIN_M
+
+    if east <= west or north <= south:
+        print(f"  [crop] Empty intersection (ref={ref_left:.0f},{ref_bottom:.0f},"
+              f"{ref_right:.0f},{ref_top:.0f} segs={seg_union}) — using VRT as-is")
+        return ortho_path
+
+    # Reuse existing cropped VRT if it's newer than the source.
+    try:
+        if cropped_vrt.exists() and cropped_vrt.stat().st_mtime > Path(ortho_path).stat().st_mtime:
+            return str(cropped_vrt)
+    except OSError:
+        pass
+
+    cmd = [
+        "gdalbuildvrt", "-overwrite",
+        "-te", f"{west}", f"{south}", f"{east}", f"{north}",
+        str(cropped_vrt), ortho_path,
+    ]
+    print(f"  [crop] gdalbuildvrt -te {west:.1f} {south:.1f} {east:.1f} {north:.1f} "
+          f"(width={east-west:.0f}m height={north-south:.0f}m)")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not cropped_vrt.exists():
+        print(f"  [crop] gdalbuildvrt failed: {result.stderr[:400]}")
+        return ortho_path
+
+    return str(cropped_vrt)
 
 
 def detect_next_version():
@@ -554,9 +763,26 @@ def run_pipeline(version, timeout):
     # Snapshot git state
     snapshot_git_state(run_dir / "code_state.txt")
 
+    # Build (or reuse cached) per-segment ortho target before running the
+    # alignment. Falls back to legacy pre-stitched TIFF if DECLASS_USE_PRESTITCHED=1.
+    target_path = ensure_target_built()
+
+    # Pre-flight: confirm target + reference actually decode to non-NoData
+    # pixels. This catches the ASP image_mosaic "silent unfinalized TIFF"
+    # failure mode (zeroed TileOffsets → everything decodes as NoData) and
+    # similar broken caches before we burn 20-40 min on a doomed alignment.
+    from preprocess.stitch import verify_tiff_decodes_nonempty
+    if not verify_tiff_decodes_nonempty(target_path, label="run_test TARGET"):
+        print(f"\nERROR: target {target_path} is not readable. Delete it "
+              f"(and any cached siblings) and re-run.", file=sys.stderr)
+        sys.exit(2)
+    if not verify_tiff_decodes_nonempty(REFERENCE, label="run_test REFERENCE"):
+        print(f"\nERROR: reference {REFERENCE} is not readable.", file=sys.stderr)
+        sys.exit(2)
+
     cmd = [
         sys.executable, str(PROJECT_ROOT / "auto-align.py"),
-        TARGET,
+        target_path,
         "-r", REFERENCE,
         "--anchors", ANCHORS,
         "-y", "--best",

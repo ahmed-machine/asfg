@@ -5,6 +5,21 @@ meta:
   description: KH-4 Corona (1962-1972), higher film grain
   cameras: [KH-4, KH-4A, KH-4B]
 
+camera:
+  type: opticalbar
+  focal_length: 0.6096         # metres (609.6mm Petzval lens)
+  pixel_pitch: 7.0e-6          # metres (7 micron USGS scan)
+  scan_time: 0.5               # seconds (lens rotation period)
+  speed: 7700                  # m/s (orbital velocity)
+  forward_tilt: 0.2618         # radians (15° for forward camera)
+  scan_dir: right
+  motion_compensation_factor: 1.0
+  scan_arc_deg: 70.0
+  # 2OC (Hou et al. 2023, Table 6) reports fitted f drifting 0.6025-0.6096 m
+  # across sub-images of the same strip — ~30-45% of their accuracy gain
+  # came from this adaptive fit. Let ASP bundle_adjust float focal_length.
+  bundle_adjust_solve_intrinsics: true
+
 coarse:
   min_ncc: 0.08
   search_margin_m: 5000           # KH-4 USGS corners can be 20km+ off; need wide refinement window

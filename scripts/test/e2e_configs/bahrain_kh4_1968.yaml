@@ -1,0 +1,7 @@
+# End-to-end test: Bahrain coverage from KH-4 1968 mission 1104-1
+name: bahrain_kh4_1968
+boundary: data/bahrain_boundary.geojson
+reference: kh9_dzb1212
+catalogs:
+  - data/available/corona2_69b17d89ee62ff28.csv
+prefer_camera: A

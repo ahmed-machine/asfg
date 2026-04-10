@@ -20,7 +20,8 @@ from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 import torch
 
 from . import constants as _C
-from .geo import get_torch_device, read_overlap_region
+from .geo import read_overlap_region
+from .models import get_torch_device
 from .image import shift_array, make_land_mask, clahe_normalize, sobel_gradient
 
 # ---------------------------------------------------------------------------
@@ -92,10 +93,14 @@ def _solve_scale_affine(kpts0, kpts1):
     src_pts = kpts0.reshape(-1, 1, 2)
     dst_pts = kpts1.reshape(-1, 1, 2)
 
-    # RANSAC
+    # Robust affine estimation (method from profile)
     try:
-        M, inliers = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC,
-                                           ransacReprojThreshold=_C.RANSAC_REPROJ_THRESHOLD)
+        from .geo import ransac_affine
+        from .params import get_params
+        _est_method = get_params().matching.estimation_method
+        M, inliers = ransac_affine(src_pts, dst_pts,
+                                    threshold=_C.RANSAC_REPROJ_THRESHOLD,
+                                    method=_est_method)
     except Exception:
         return None
 
@@ -433,6 +438,16 @@ def detect_scale_rotation(src_offset, src_ref, overlap, work_crs,
     """
     detection_res = 5.0
 
+    # Cap detection resolution to stay within OpenCV's SHRT_MAX (32767px) limit
+    left, bottom, right, top = overlap
+    raw_w = int(round((right - left) / detection_res))
+    raw_h = int(round((top - bottom) / detection_res))
+    if raw_w > 30000 or raw_h > 30000:
+        scale_factor = max(raw_w, raw_h) / 30000
+        detection_res = detection_res * scale_factor
+        print(f"  Capping detection resolution to {detection_res:.1f}m/px "
+              f"(overlap {raw_w}x{raw_h}px exceeds OpenCV limit)")
+
     arr_ref, _ = read_overlap_region(src_ref, overlap, work_crs, detection_res)
     arr_off, _ = read_overlap_region(src_offset, overlap, work_crs, detection_res)
 
@@ -755,6 +770,155 @@ def detect_local_scales(src_offset, src_ref, overlap, work_crs,
 # Pre-correction application (global and local)
 # ---------------------------------------------------------------------------
 
+def _fast_tps_warp(input_path, gcps, src_crs, coarse_step=64):
+    """Apply a TPS warp using coarse-grid evaluation + cv2.remap.
+
+    Instead of GDAL's per-pixel TPS evaluation (single-threaded, O(n²) per pixel),
+    this evaluates the TPS transform on a coarse grid and interpolates to full
+    resolution, then remaps pixels with cv2.remap (multi-threaded, SIMD-optimised).
+
+    Args:
+        input_path: Input GeoTIFF path.
+        gcps: List of (pixel_col, pixel_row, geo_x, geo_y) tuples.
+        src_crs: Source/destination CRS (string or CRS object).
+        coarse_step: Evaluate TPS every N pixels (default 64).
+
+    Returns:
+        Path to warped temporary TIF, or None on failure.
+    """
+    from osgeo import gdal
+    gdal.UseExceptions()
+
+    ds = gdal.Open(input_path)
+    if ds is None:
+        raise RuntimeError(f"Could not open {input_path}")
+
+    width = ds.RasterXSize
+    height = ds.RasterYSize
+    n_bands = ds.RasterCount
+    gt = ds.GetGeoTransform()
+
+    # Build source (pixel) and destination (geo) point arrays
+    src_pts = np.array([(col, row) for col, row, _, _ in gcps], dtype=np.float32)
+    dst_pts = np.array([(gx, gy) for _, _, gx, gy in gcps], dtype=np.float32)
+
+    # Convert destination geo coords to pixel coords using the geotransform
+    # pixel_col = (gx - gt[0]) / gt[1], pixel_row = (gy - gt[3]) / gt[5]
+    dst_px = np.column_stack([
+        (dst_pts[:, 0] - gt[0]) / gt[1],
+        (dst_pts[:, 1] - gt[3]) / gt[5],
+    ]).astype(np.float32)
+
+    # Build TPS model: maps destination pixels -> source pixels (inverse warp)
+    tps = cv2.createThinPlateSplineShapeTransformer()
+    matches = [cv2.DMatch(i, i, 0) for i in range(len(gcps))]
+    tps.estimateTransformation(
+        dst_px.reshape(1, -1, 2),
+        src_pts.reshape(1, -1, 2),
+        matches,
+    )
+
+    # Evaluate TPS on a coarse grid
+    coarse_cols = np.arange(0, width, coarse_step, dtype=np.float32)
+    coarse_rows = np.arange(0, height, coarse_step, dtype=np.float32)
+    cc, rr = np.meshgrid(coarse_cols, coarse_rows)
+    coarse_pts = np.column_stack([cc.ravel(), rr.ravel()]).astype(np.float32)
+
+    # TPS transform: for each destination pixel, find the source pixel
+    _, transformed = tps.applyTransformation(coarse_pts.reshape(1, -1, 2))
+    transformed = transformed.reshape(-1, 2)
+
+    # Reshape to coarse grid and compute displacement
+    ch, cw = len(coarse_rows), len(coarse_cols)
+    map_x_coarse = transformed[:, 0].reshape(ch, cw)
+    map_y_coarse = transformed[:, 1].reshape(ch, cw)
+
+    # Interpolate coarse map to full resolution and remap in 2D tiles
+    # to stay within OpenCV's SHRT_MAX (32767px) limit per dimension.
+    MAX_TILE = 16384  # conservative limit per tile dimension
+
+    # Create output file
+    tmp_fd, tmp_warped = tempfile.mkstemp(suffix=".tif")
+    os.close(tmp_fd)
+
+    driver = gdal.GetDriverByName("GTiff")
+    out_ds = driver.Create(
+        tmp_warped, width, height, n_bands,
+        ds.GetRasterBand(1).DataType,
+        ["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES",
+         "NUM_THREADS=ALL_CPUS", "BIGTIFF=YES"],
+    )
+    out_ds.SetGeoTransform(gt)
+    out_ds.SetProjection(ds.GetProjection())
+
+    tile_h = min(MAX_TILE, height)
+    tile_w = min(MAX_TILE, width)
+
+    for band_idx in range(1, n_bands + 1):
+        src_band = ds.GetRasterBand(band_idx)
+        out_band = out_ds.GetRasterBand(band_idx)
+
+        for y0 in range(0, height, tile_h):
+            y1 = min(y0 + tile_h, height)
+            th = y1 - y0
+            for x0 in range(0, width, tile_w):
+                x1 = min(x0 + tile_w, width)
+                tw = x1 - x0
+
+                # Interpolate coarse map for this tile only
+                # Find coarse grid indices covering this tile (with 1-cell padding)
+                c_y0 = max(0, int(y0 / coarse_step) - 1)
+                c_y1 = min(ch, int(np.ceil(y1 / coarse_step)) + 2)
+                c_x0 = max(0, int(x0 / coarse_step) - 1)
+                c_x1 = min(cw, int(np.ceil(x1 / coarse_step)) + 2)
+
+                tile_coarse_x = map_x_coarse[c_y0:c_y1, c_x0:c_x1]
+                tile_coarse_y = map_y_coarse[c_y0:c_y1, c_x0:c_x1]
+
+                # Resize this coarse patch to tile dimensions
+                tile_map_x = cv2.resize(tile_coarse_x, (tw, th),
+                                        interpolation=cv2.INTER_LINEAR)
+                tile_map_y = cv2.resize(tile_coarse_y, (tw, th),
+                                        interpolation=cv2.INTER_LINEAR)
+
+                # Determine source region needed
+                src_y_min = max(0, int(np.floor(tile_map_y.min())) - 1)
+                src_y_max = min(height, int(np.ceil(tile_map_y.max())) + 2)
+                src_x_min = max(0, int(np.floor(tile_map_x.min())) - 1)
+                src_x_max = min(width, int(np.ceil(tile_map_x.max())) + 2)
+                src_w = src_x_max - src_x_min
+                src_h = src_y_max - src_y_min
+
+                if src_w <= 0 or src_h <= 0:
+                    continue
+
+                src_data = src_band.ReadAsArray(
+                    xoff=src_x_min, yoff=src_y_min,
+                    win_xsize=src_w, win_ysize=src_h,
+                )
+                if src_data is None:
+                    continue
+
+                # Adjust remap coordinates to local source region
+                local_map_x = (tile_map_x - src_x_min).astype(np.float32)
+                local_map_y = (tile_map_y - src_y_min).astype(np.float32)
+
+                # Remap this tile (multi-threaded, SIMD-optimised)
+                remapped = cv2.remap(
+                    src_data, local_map_x, local_map_y,
+                    cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+
+                out_band.WriteArray(remapped, xoff=x0, yoff=y0)
+
+    out_ds.FlushCache()
+    out_ds = None
+    ds = None
+
+    return tmp_warped
+
+
 def apply_scale_rotation_precorrection(input_path, scale, rotation_deg, work_crs,
                                        overlap_center=None, scale_y=None):
     """Apply scale and rotation correction to a GeoTIFF using synthetic GCPs.
@@ -783,7 +947,7 @@ def apply_scale_rotation_precorrection(input_path, scale, rotation_deg, work_crs
     if scale_y is not None and abs(scale - scale_y) > 0.01:
         print(f"  Anisotropic correction: scale_x={scale:.4f}, scale_y={scale_y:.4f}")
 
-    n_grid = 7
+    n_grid = 11
     cols = np.linspace(0, width - 1, n_grid)
     rows = np.linspace(0, height - 1, n_grid)
 
@@ -815,54 +979,12 @@ def apply_scale_rotation_precorrection(input_path, scale, rotation_deg, work_crs
 
             gcps.append((float(col), float(row), corr_gx, corr_gy))
 
-    tmp_fd2, tmp_warped = tempfile.mkstemp(suffix=".tif")
-    os.close(tmp_fd2)
-
-    import uuid
-    from osgeo import gdal
-
-    tmp_id = uuid.uuid4().hex
-    tmp_gcp = f"/vsimem/tmp_gcp_{tmp_id}.tif"
-
-    gdal.UseExceptions()
     try:
-        gcp_list = [gdal.GCP(gx, gy, 0, px, py) for px, py, gx, gy in gcps]
-
-        ds = gdal.Open(input_path)
-        if ds is None:
-            raise RuntimeError(f"Could not open {input_path}")
-
-        tmp_ds = gdal.Translate(tmp_gcp, ds, GCPs=gcp_list)
-        if tmp_ds is None:
-            raise RuntimeError("gdal.Translate failed")
-
-        warp_kwargs = {
-            'multithread': True,
-            'warpOptions': ['NUM_THREADS=ALL_CPUS'],
-            'resampleAlg': gdal.GRA_Bilinear,
-            'dstSRS': str(src_crs),
-            'creationOptions': ['COMPRESS=LZW', 'PREDICTOR=2', 'TILED=YES',
-                                'NUM_THREADS=ALL_CPUS', 'BIGTIFF=YES'],
-            'warpMemoryLimit': 2048 * 1024 * 1024,
-            'tps': True
-        }
-
-        out_ds = gdal.Warp(tmp_warped, tmp_ds, **warp_kwargs)
-        if out_ds is None:
-            raise RuntimeError("gdal.Warp failed")
-
-        out_ds = None
-        tmp_ds = None
-        ds = None
-
-        return tmp_warped
+        result = _fast_tps_warp(input_path, gcps, str(src_crs))
+        return result
     except Exception as e:
         print(f"  ERROR: Pre-correction failed: {e}")
-        if os.path.exists(tmp_warped):
-            os.remove(tmp_warped)
         return None
-    finally:
-        gdal.Unlink(tmp_gcp)
 
 
 def apply_local_scale_precorrection(input_path, patch_results, work_crs,
@@ -949,51 +1071,9 @@ def apply_local_scale_precorrection(input_path, patch_results, work_crs,
 
     print(f"  Generated {len(gcps)} GCPs ({n_grid}x{n_grid} grid)")
 
-    tmp_fd2, tmp_warped = tempfile.mkstemp(suffix=".tif")
-    os.close(tmp_fd2)
-
-    import uuid
-    from osgeo import gdal
-
-    tmp_id = uuid.uuid4().hex
-    tmp_gcp = f"/vsimem/tmp_gcp_local_{tmp_id}.tif"
-
-    gdal.UseExceptions()
     try:
-        gcp_list = [gdal.GCP(gx, gy, 0, px, py) for px, py, gx, gy in gcps]
-
-        ds = gdal.Open(input_path)
-        if ds is None:
-            raise RuntimeError(f"Could not open {input_path}")
-
-        tmp_ds = gdal.Translate(tmp_gcp, ds, GCPs=gcp_list)
-        if tmp_ds is None:
-            raise RuntimeError("gdal.Translate failed")
-
-        warp_kwargs = {
-            'multithread': True,
-            'warpOptions': ['NUM_THREADS=ALL_CPUS'],
-            'resampleAlg': gdal.GRA_Bilinear,
-            'dstSRS': str(src_crs),
-            'creationOptions': ['COMPRESS=LZW', 'PREDICTOR=2', 'TILED=YES',
-                                'NUM_THREADS=ALL_CPUS', 'BIGTIFF=YES'],
-            'warpMemoryLimit': 2048 * 1024 * 1024,
-            'tps': True
-        }
-
-        out_ds = gdal.Warp(tmp_warped, tmp_ds, **warp_kwargs)
-        if out_ds is None:
-            raise RuntimeError("gdal.Warp failed")
-
-        out_ds = None
-        tmp_ds = None
-        ds = None
-
-        return tmp_warped
+        result = _fast_tps_warp(input_path, gcps, str(src_crs))
+        return result
     except Exception as e:
         print(f"  ERROR: Local pre-correction failed: {e}")
-        if os.path.exists(tmp_warped):
-            os.remove(tmp_warped)
         return None
-    finally:
-        gdal.Unlink(tmp_gcp)

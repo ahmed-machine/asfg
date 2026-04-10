@@ -293,3 +293,191 @@ def filter_scenes(scenes: list, entity_ids: list = None,
     if download_only:
         filtered = [s for s in filtered if s.download_available]
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# Geographic coverage selection
+# ---------------------------------------------------------------------------
+
+def _rasterize_quad(corners: dict, grid_shape: tuple, bbox: tuple):
+    """Rasterize a 4-corner quadrilateral onto a boolean grid.
+
+    Args:
+        corners: {"NW": (lat, lon), "NE": ..., "SE": ..., "SW": ...}
+        grid_shape: (rows, cols) of the output grid
+        bbox: (west, south, east, north) in decimal degrees
+
+    Returns:
+        Boolean numpy array of shape grid_shape, True inside the quad.
+    """
+    import numpy as np
+
+    rows, cols = grid_shape
+    west, south, east, north = bbox
+
+    # Quad vertices in (lon, lat) order: NW → NE → SE → SW
+    verts = [
+        (corners["NW"][1], corners["NW"][0]),
+        (corners["NE"][1], corners["NE"][0]),
+        (corners["SE"][1], corners["SE"][0]),
+        (corners["SW"][1], corners["SW"][0]),
+    ]
+    n_verts = len(verts)
+
+    # Grid cell centres
+    cx = np.linspace(west, east, cols, endpoint=False) + (east - west) / (2 * cols)
+    cy = np.linspace(south, north, rows, endpoint=False) + (north - south) / (2 * rows)
+    gx, gy = np.meshgrid(cx, cy)
+    px = gx.ravel()
+    py = gy.ravel()
+
+    # Ray-casting point-in-polygon (vectorised)
+    inside = np.zeros(len(px), dtype=bool)
+    for i in range(n_verts):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n_verts]
+        cond = ((y1 > py) != (y2 > py)) & (px < (x2 - x1) * (py - y1) / (y2 - y1 + 1e-30) + x1)
+        inside ^= cond
+
+    return inside.reshape(grid_shape)
+
+
+def _combined_coverage(scenes: list, target_bbox: tuple, grid_size: int = 500) -> float:
+    """Compute fraction of target_bbox covered by union of scenes' footprints."""
+    import numpy as np
+
+    grid_shape = (grid_size, grid_size)
+    covered = np.zeros(grid_shape, dtype=bool)
+    for scene in scenes:
+        covered |= _rasterize_quad(scene.corners, grid_shape, target_bbox)
+    return float(covered.sum()) / (grid_size * grid_size)
+
+
+def select_best_mission_coverage(
+    scenes: list,
+    target_bbox: tuple,
+    min_scene_coverage: float = 0.01,
+    camera_systems: list = None,
+    prefer_camera: str = None,
+) -> tuple:
+    """Select the best single-mission+date group of scenes for target bbox coverage.
+
+    Scenes are grouped by (mission, acquisition_date), then sub-grouped by camera
+    designation. The group with the highest combined coverage is selected. Frames
+    adding less than min_scene_coverage marginal contribution are dropped.
+
+    Args:
+        scenes: All candidate scenes (should already be filtered for download_available).
+        target_bbox: (west, south, east, north) in decimal degrees.
+        min_scene_coverage: Drop frames adding less than this fraction of marginal coverage.
+        camera_systems: Optional list of CameraSystem to restrict to.
+        prefer_camera: Optional camera designation preference ("A"/"F").
+
+    Returns:
+        (selected_scenes, coverage_fraction, metadata_dict)
+    """
+    import numpy as np
+
+    # Pre-filter
+    candidates = scenes
+    if camera_systems:
+        sys_set = set(cs.name for cs in camera_systems) if hasattr(camera_systems[0], 'name') else set(camera_systems)
+        candidates = [s for s in candidates if s.camera_system.name in sys_set or s.camera_system in sys_set]
+    candidates = [s for s in candidates if s.download_available]
+
+    # Quick bbox overlap filter
+    west, south, east, north = target_bbox
+    filtered = []
+    for s in candidates:
+        lats = [c[0] for c in s.corners.values()]
+        lons = [c[1] for c in s.corners.values()]
+        s_west, s_east = min(lons), max(lons)
+        s_south, s_north = min(lats), max(lats)
+        if s_east > west and s_west < east and s_north > south and s_south < north:
+            filtered.append(s)
+
+    if not filtered:
+        print("  WARNING: No scenes overlap the target bbox")
+        return [], 0.0, {}
+
+    # Group by (mission, date)
+    mission_groups = defaultdict(list)
+    for s in filtered:
+        key = (s.mission, s.acquisition_date)
+        mission_groups[key].append(s)
+
+    # For each mission+date, sub-group by camera designation and evaluate
+    grid_size = 500
+    grid_shape = (grid_size, grid_size)
+    best_scenes = []
+    best_coverage = 0.0
+    best_meta = {}
+
+    for (mission, date), group_scenes in mission_groups.items():
+        camera_system = group_scenes[0].camera_system
+
+        # Sub-group by camera designation
+        cam_subgroups = defaultdict(list)
+        for s in group_scenes:
+            cam_des = _camera_designation(s.entity_id, s.camera_type, s.camera_system)
+            cam_subgroups[cam_des].append(s)
+
+        # Evaluate each camera sub-group
+        for cam_des, cam_scenes in cam_subgroups.items():
+            if prefer_camera and cam_des != prefer_camera.upper():
+                # Still evaluate but only pick if nothing better
+                pass
+
+            coverage = _combined_coverage(cam_scenes, target_bbox, grid_size)
+
+            # Prefer the requested camera when coverage is comparable (within 5%)
+            is_preferred = prefer_camera and cam_des == prefer_camera.upper()
+            effective_coverage = coverage + (0.05 if is_preferred else 0.0)
+
+            if effective_coverage > best_coverage or (
+                effective_coverage == best_coverage and len(cam_scenes) < len(best_scenes)
+            ):
+                best_coverage = effective_coverage
+                best_scenes = cam_scenes
+                best_meta = {
+                    "mission": mission,
+                    "date": date,
+                    "camera_system": camera_system.name,
+                    "camera_designation": cam_des,
+                }
+
+    if not best_scenes:
+        return [], 0.0, {}
+
+    # Within best group, drop frames with negligible marginal contribution
+    # Sort by individual coverage (descending) for greedy selection
+    scene_coverages = []
+    for s in best_scenes:
+        mask = _rasterize_quad(s.corners, grid_shape, target_bbox)
+        scene_coverages.append((s, mask))
+    scene_coverages.sort(key=lambda x: -x[1].sum())
+
+    selected = []
+    covered = np.zeros(grid_shape, dtype=bool)
+    total_cells = grid_size * grid_size
+
+    for scene, mask in scene_coverages:
+        marginal = float((mask & ~covered).sum()) / total_cells
+        if marginal >= min_scene_coverage:
+            selected.append(scene)
+            covered |= mask
+
+    # Sort selected by frame number for consistent ordering
+    selected.sort(key=lambda s: s.frame)
+    final_coverage = float(covered.sum()) / total_cells
+
+    best_meta["scenes_selected"] = len(selected)
+    best_meta["predicted_coverage"] = round(final_coverage, 3)
+
+    print(f"  Selected {len(selected)} scenes from {best_meta['camera_system']} "
+          f"mission {best_meta['mission']} ({best_meta['date']}) "
+          f"cam={best_meta['camera_designation']} — {final_coverage*100:.1f}% coverage")
+    for s in selected:
+        print(f"    {s.entity_id} frame={s.frame}")
+
+    return selected, final_coverage, best_meta

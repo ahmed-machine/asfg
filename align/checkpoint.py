@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from .pipeline import AlignState
+    from .state import AlignState
 
 # Schema version — bump when checkpoint format changes
 _SCHEMA_VERSION = 1
@@ -65,7 +65,7 @@ def save_checkpoint(state: "AlignState", phase_id: str, checkpoint_dir: str) -> 
 
 def load_checkpoint(phase_id: str, checkpoint_dir: str) -> "AlignState":
     """Restore an AlignState from a saved checkpoint."""
-    from .pipeline import AlignState
+    from .state import AlignState
     from .types import (QaReport, GlobalHypothesis, MetadataPrior, MatchPair, GCP)
 
     json_path = os.path.join(checkpoint_dir, f"{phase_id}.json")

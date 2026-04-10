@@ -84,7 +84,7 @@ def test_profile_loading():
 
     kh9 = load_profile("kh9")
     _check("KH-9 loads", kh9 is not None)
-    _check("KH-9 uses base roma_size", kh9.matching.roma_size == 640)
+    _check("KH-9 roma_size override", kh9.matching.roma_size == 784)
 
     # set_profile sets the singleton
     p = set_profile("kh4")
@@ -140,7 +140,7 @@ def test_profile_yaml_update():
             f.write(original)
 
     restored = load_profile("kh9")
-    _check("Restored original after test", restored.matching.roma_size == 640)
+    _check("Restored original after test", restored.matching.roma_size == 784)
 
 
 # -----------------------------------------------------------------------
@@ -230,61 +230,6 @@ def test_score_extraction():
 
 
 # -----------------------------------------------------------------------
-# 7. Score aggregation
-# -----------------------------------------------------------------------
-
-def test_score_aggregation():
-    print("\n=== Score Aggregation ===")
-    from scripts.tune.tune_multi import aggregate_scores
-
-    cases = {
-        "a": {"weight": 1.0},
-        "b": {"weight": 2.0},
-        "c": {"weight": 0.5},
-    }
-
-    scores = {"a": 60.0, "b": 80.0, "c": 70.0}
-    agg = aggregate_scores(scores, cases)
-    expected = (1.0*60 + 2.0*80 + 0.5*70) / (1.0 + 2.0 + 0.5)
-    _check("Weighted mean correct", abs(agg - expected) < 0.01,
-           f"got {agg:.2f}, expected {expected:.2f}")
-
-    # Subset
-    agg2 = aggregate_scores(scores, cases, case_ids=["a", "b"])
-    expected2 = (1.0*60 + 2.0*80) / 3.0
-    _check("Subset aggregation", abs(agg2 - expected2) < 0.01)
-
-    # Skip 999.0 scores
-    scores_partial = {"a": 60.0, "b": 999.0}
-    agg3 = aggregate_scores(scores_partial, cases, case_ids=["a", "b"])
-    _check("Skips 999 scores", abs(agg3 - 60.0) < 0.01)
-
-    # All 999 → 999
-    scores_bad = {"a": 999.0, "b": 999.0}
-    agg4 = aggregate_scores(scores_bad, cases, case_ids=["a", "b"])
-    _check("All 999 returns 999", agg4 == 999.0)
-
-
-# -----------------------------------------------------------------------
-# 8. Case grouping
-# -----------------------------------------------------------------------
-
-def test_case_grouping():
-    print("\n=== Case Grouping ===")
-    from scripts.tune.tune_multi import group_cases_by_profile
-
-    cases = {
-        "kh9_a": {"profile": "kh9"},
-        "kh9_b": {"profile": "kh9"},
-        "kh4_a": {"profile": "kh4"},
-    }
-    groups = group_cases_by_profile(cases)
-    _check("Two profiles", len(groups) == 2)
-    _check("kh9 has 2 cases", len(groups["kh9"]) == 2)
-    _check("kh4 has 1 case", len(groups["kh4"]) == 1)
-
-
-# -----------------------------------------------------------------------
 # 9. Checkpoint serialization (numpy types)
 # -----------------------------------------------------------------------
 
@@ -356,38 +301,6 @@ def test_checkpoint_dataclass_reconstruction():
 # 11. Parameter mapping (Optuna → profile keys)
 # -----------------------------------------------------------------------
 
-def test_param_mapping():
-    print("\n=== Parameter Mapping ===")
-    from scripts.tune.tune_multi import _map_params_to_profile
-
-    # Grid optim params
-    optuna_params = {
-        "w_data": 2.0,
-        "w_chamfer": 0.3,
-        "lr": 0.005,
-        "level1_data_scale": 1.5,
-        "level2_data_scale": 2.0,
-        "level1_disp_scale": 0.6,
-        "level2_disp_scale": 0.4,
-        "level1_reg_scale": 1.1,
-        "level2_reg_scale": 1.3,
-        "level1_chamfer_scale": 0.7,
-        "level2_chamfer_scale": 0.5,
-    }
-    mapped = _map_params_to_profile(optuna_params, "grid_optim")
-    _check("w_data mapped", mapped["grid_optim__w_data"] == 2.0)
-    _check("lr mapped", mapped["grid_optim__lr"] == 0.005)
-    _check("level scales assembled",
-           mapped["grid_optim__level_w_data_scale"] == [1.0, 1.5, 2.0])
-    _check("level disp scales assembled",
-           mapped["grid_optim__level_w_disp_scale"] == [1.0, 0.6, 0.4])
-
-    # Matching params
-    match_params = {"roma_size": 784, "roma_num_corresp": 400}
-    mapped2 = _map_params_to_profile(match_params, "matching")
-    _check("roma_size mapped", mapped2["matching__roma_size"] == 784)
-
-
 # -----------------------------------------------------------------------
 # 12. Plateau detection
 # -----------------------------------------------------------------------
@@ -436,8 +349,8 @@ def test_phase_checkpoint_ids():
     print("\n=== Phase Checkpoint IDs ===")
     from scripts.tune.tune import _phase_checkpoint_id
 
-    _check("matching → post_coarse",
-           _phase_checkpoint_id("matching") == "post_coarse")
+    _check("matching → post_scale_rotation",
+           _phase_checkpoint_id("matching") == "post_scale_rotation")
     _check("validation → post_match",
            _phase_checkpoint_id("validation") == "post_match")
     _check("grid_optim → post_validate",
@@ -495,25 +408,6 @@ def test_auto_align_profile_arg():
 
 
 # -----------------------------------------------------------------------
-# 16. tune_multi.py CLI parses
-# -----------------------------------------------------------------------
-
-def test_tune_multi_cli():
-    print("\n=== tune_multi.py CLI ===")
-    import subprocess
-    result = subprocess.run(
-        [sys.executable, str(PROJECT_ROOT / "scripts" / "tune_multi.py"), "--help"],
-        capture_output=True, text=True,
-    )
-    _check("--mode in help", "--mode" in result.stdout)
-    _check("--config in help", "--config" in result.stdout)
-    _check("--apply-best in help", "--apply-best" in result.stdout)
-    _check("--validate in help", "--validate" in result.stdout)
-    _check("per-profile mode", "per-profile" in result.stdout)
-    _check("cross-profile mode", "cross-profile" in result.stdout)
-
-
-# -----------------------------------------------------------------------
 # 17. tune.py --case CLI parses
 # -----------------------------------------------------------------------
 
@@ -521,7 +415,7 @@ def test_tune_case_cli():
     print("\n=== tune.py --case ===")
     import subprocess
     result = subprocess.run(
-        [sys.executable, str(PROJECT_ROOT / "scripts" / "tune.py"), "--help"],
+        [sys.executable, str(PROJECT_ROOT / "scripts" / "tune" / "tune.py"), "--help"],
         capture_output=True, text=True,
     )
     _check("--case in help", "--case" in result.stdout)
@@ -536,7 +430,7 @@ def test_tune_case_cli():
 
 def test_checkpoint_round_trip():
     print("\n=== Checkpoint Round-Trip ===")
-    from align.pipeline import AlignState
+    from align.state import AlignState
     from align.types import GlobalHypothesis, MetadataPrior
     from align.checkpoint import save_checkpoint, load_checkpoint
 
@@ -613,7 +507,7 @@ def test_checkpoint_round_trip():
 
 def test_stale_temp_path_fallback():
     print("\n=== Stale Temp Path Fallback ===")
-    from align.pipeline import AlignState
+    from align.state import AlignState
     from align.checkpoint import save_checkpoint, load_checkpoint
 
     with tempfile.TemporaryDirectory() as td:
@@ -902,16 +796,12 @@ if __name__ == "__main__":
     test_profile_yaml_update()
     test_tune_cases_config()
     test_score_extraction()
-    test_score_aggregation()
-    test_case_grouping()
     test_checkpoint_numpy_encoder()
     test_checkpoint_dataclass_reconstruction()
-    test_param_mapping()
     test_plateau_detection()
     test_phase_checkpoint_ids()
     test_no_crs_resolution()
     test_auto_align_profile_arg()
-    test_tune_multi_cli()
     test_tune_case_cli()
     test_checkpoint_round_trip()
     test_stale_temp_path_fallback()

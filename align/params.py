@@ -47,14 +47,15 @@ class ScaleRotationParams:
 @dataclass
 class MatchingParams:
     roma_tile_size: int = 1024
-    roma_tile_overlap: int = 256
+    roma_tile_overlap: int = 512
     roma_size: int = 640
     roma_num_corresp: int = 600
     land_mask_frac_min: float = 0.30
-    tile_joint_land_min: float = 0.08
+    tile_joint_land_min: float = 0.03
     match_quota_grid_m: int = 2000
     match_quota_per_cell: int = 30
     ransac_reproj_threshold: float = 5.0
+    estimation_method: str = "ransac"  # "ransac", "lmeds", "magsac"
 
 
 @dataclass
@@ -131,6 +132,48 @@ class QaParams:
 
 
 @dataclass
+class CameraParams:
+    """Physical camera model parameters for OpticalBar pre-correction."""
+    type: str = ""                          # "opticalbar" or empty (no correction)
+    focal_length: float = 0.0              # metres
+    pixel_pitch: float = 0.0               # metres (scan resolution)
+    scan_time: float = 0.0                 # seconds
+    speed: float = 0.0                     # m/s orbital velocity
+    forward_tilt: float = 0.0             # radians (positive=forward, negative=aft)
+    scan_dir: str = "right"               # "right" or "left"
+    motion_compensation_factor: float = 1.0
+    scan_arc_deg: float = 70.0            # total scan arc in degrees
+    # When True, ASP bundle_adjust is called with --solve-intrinsics
+    # --intrinsics-to-float focal_length. 2OC (Hou et al. 2023, Table 6)
+    # reports fitted focal lengths drifting ~0.1% from nominal across
+    # sub-images of the same strip; this per-strip adaptive fit is
+    # responsible for ~30-45% of the paper's reported accuracy gain.
+    bundle_adjust_solve_intrinsics: bool = False
+    # When True, _maybe_generate_asp_ortho processes each USGS sub-image
+    # (a, b, c, d for KH-4; a..g for KH-9 PC) independently — separate
+    # cam_gen + mapproject per sub-frame, then a gdalbuildvrt mosaic of
+    # the resulting orthos. 2OC §3.1: stitching first leaks per-segment
+    # offsets into the single-camera fit. Default false; gate per profile.
+    per_segment_ortho: bool = False
+
+    @property
+    def is_panoramic(self) -> bool:
+        return self.type == "opticalbar" and self.focal_length > 0
+
+    def to_dict(self) -> dict:
+        """Convert to dict for preprocess.camera_model functions."""
+        return {
+            "focal_length": self.focal_length,
+            "pixel_pitch": self.pixel_pitch,
+            "scan_time": self.scan_time,
+            "speed": self.speed,
+            "forward_tilt": self.forward_tilt,
+            "scan_dir": self.scan_dir,
+            "motion_compensation_factor": self.motion_compensation_factor,
+        }
+
+
+@dataclass
 class MetaParams:
     name: str = "base"
     description: str = ""
@@ -145,6 +188,7 @@ class MetaParams:
 class AlignParams:
     """All tunable parameters, loaded from YAML profile."""
     meta: MetaParams = field(default_factory=MetaParams)
+    camera: CameraParams = field(default_factory=CameraParams)
     coarse: CoarseParams = field(default_factory=CoarseParams)
     scale_rotation: ScaleRotationParams = field(default_factory=ScaleRotationParams)
     matching: MatchingParams = field(default_factory=MatchingParams)
@@ -221,6 +265,7 @@ def _dict_to_params(d: dict) -> AlignParams:
     p = AlignParams()
     section_map = {
         "meta": (MetaParams, "meta"),
+        "camera": (CameraParams, "camera"),
         "coarse": (CoarseParams, "coarse"),
         "scale_rotation": (ScaleRotationParams, "scale_rotation"),
         "matching": (MatchingParams, "matching"),
@@ -273,9 +318,6 @@ def override(**kwargs):
     Keys use dotted notation: ``override(grid_optim__w_data=2.0)``
     maps to ``params.grid_optim.w_data = 2.0``.  Double-underscore
     separates section from field.
-
-    Also calls ``reload_from_profile()`` so that module-level constants
-    in ``align.constants`` stay in sync.
     """
     global _active
     params = get_params()

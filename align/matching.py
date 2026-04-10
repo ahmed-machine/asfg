@@ -1,5 +1,6 @@
 """Dense feature matching: RoMa tiled."""
 
+import os
 import numpy as np
 import cv2
 import rasterio
@@ -8,7 +9,7 @@ import rasterio.transform
 import torch
 
 from . import constants as _C
-from .geo import get_torch_device
+from .models import clear_torch_cache, get_torch_device
 from .image import clahe_normalize, wallis_match, build_semantic_masks
 from .types import MatchPair
 
@@ -32,6 +33,7 @@ def match_with_roma(arr_ref, arr_off_shifted, ref_transform, off_transform,
     """Match features using RoMa tiled."""
     if model_cache is not None:
         roma = model_cache.roma
+        device = model_cache.device
     else:
         return []
 
@@ -39,7 +41,7 @@ def match_with_roma(arr_ref, arr_off_shifted, ref_transform, off_transform,
         roma, "roma", arr_ref, arr_off_shifted, ref_transform, off_transform,
         shift_px_x, shift_py_y, neural_res, min_valid_frac, skip_ransac,
         batch_size, max_matches, max_tiles, existing_anchors, src_offset, work_crs,
-        mask_mode=mask_mode)
+        mask_mode=mask_mode, device=device)
 
 
 def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transform, off_transform,
@@ -47,9 +49,10 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
                         min_valid_frac=_C.LAND_MASK_FRAC_MIN, skip_ransac=False,
                         batch_size=8, max_matches=5000, max_tiles=300,
                         existing_anchors=None,
-                        src_offset=None, work_crs=None, mask_mode="coastal_obia"):
+                        src_offset=None, work_crs=None, mask_mode="coastal_obia",
+                        device=None):
     """Tiled matching orchestrator for RoMa."""
-    device = get_torch_device()
+    device = device or getattr(model, "device", None) or get_torch_device()
     h, w = arr_ref.shape
 
     from .params import get_params
@@ -88,12 +91,15 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
 
     scene_valid = arr_ref > 0
     scene_land_frac = float(np.mean((stable_mask | land_mask) & scene_valid)) if np.any(scene_valid) else 0.0
+    # Base bump: more tiles from 50% overlap need higher match budget
+    max_matches = max(max_matches, 8000)
+    max_tiles = max(max_tiles, 420)
     if scene_land_frac < 0.35:
-        max_matches = max(max_matches, 7000)
-        max_tiles = max(max_tiles, 420)
-    if scene_land_frac < 0.25:
-        max_matches = max(max_matches, 8500)
+        max_matches = max(max_matches, 10000)
         max_tiles = max(max_tiles, 520)
+    if scene_land_frac < 0.25:
+        max_matches = max(max_matches, 12000)
+        max_tiles = max(max_tiles, 650)
 
     tile_size = _C.ROMA_TILE_SIZE
     overlap_px = _C.ROMA_TILE_OVERLAP
@@ -128,6 +134,28 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
                 continue
 
             # c is post-sigmoid overlap; satast clamps >0.05 to 1.0
+            
+            # --- SSD EXTRACTION HOOK ---
+            # If the environment variable SSD_EXTRACT_DIR is set, dump the raw un-thresholded 
+            # neural correspondences to disk for Simple Self-Distillation training.
+            ssd_dir = os.environ.get("SSD_EXTRACT_DIR", None)
+            if ssd_dir:
+                import torch
+                os.makedirs(ssd_dir, exist_ok=True)
+                ext_id = os.environ.get("SSD_EXTRACT_ID", "default")
+                tile_idx = it.get('tile_idx', 0)
+                pt_path = os.path.join(ssd_dir, f"roma_raw_{ext_id}_{tile_idx}.pt")
+                torch.save({
+                    'm': m, 
+                    'c': c, 
+                    'prec_trace': prec_trace,
+                    'tile_meta': {
+                        'r0': it['r0'], 'c0': it['c0'], 
+                        'h': it['ref'].shape[0], 'w': it['ref'].shape[1]
+                    }
+                }, pt_path)
+            # ---------------------------
+
             mask = c > 0.55
             m = m[mask]
             c = c[mask]
@@ -188,13 +216,16 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
         try:
             with torch.no_grad():
                 model.apply_setting("satast")
-                return model.match(b_ref, b_off)
+                correspondences = model.match(b_ref, b_off)
+                return correspondences
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if "out of memory" not in str(e).lower() and "MPS" not in str(e): raise
             del b_ref, b_off
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-            elif hasattr(torch, 'mps') and torch.backends.mps.is_available(): torch.mps.empty_cache()
+            clear_torch_cache(device)
             return None
+        finally:
+            ref_tensors.clear()
+            off_tensors.clear()
 
     def _process_batch(batch_data):
         """Process a batch with iterative halving on OOM (avoids stack overflow)."""
@@ -205,6 +236,8 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
             correspondences = _run_batch(chunk)
             if correspondences is not None:
                 _collect_matches(correspondences, chunk)
+                del correspondences
+                clear_torch_cache(device)
             else:
                 half = len(chunk) // 2
                 if half >= 1:
@@ -230,28 +263,70 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
     tile_candidates = []
     rng = np.random.default_rng(seed=42)
     tile_idx = 0
-    for r0 in range(0, h - tile_size // 2, step):
-        for c0 in range(0, w - tile_size // 2, step):
-            r1, c1 = min(r0 + tile_size, h), min(c0 + tile_size, w)
-            if r1 - r0 < tile_size // 2 or c1 - c0 < tile_size // 2: continue
-            ref_tile, off_tile = ref_u8[r0:r1, c0:c1], off_u8[r0:r1, c0:c1]
-            rv, ov = np.mean(ref_tile > 0), np.mean(off_tile > 0)
-            if rv < min_valid_frac or ov < min_valid_frac:
-                tile_idx += 1; continue
-            is_anc = any(c0 <= ac <= c0 + tile_size and r0 <= ar <= r0 + tile_size for ac, ar in anchor_px)
-            land_frac = float(np.mean(land_mask[r0:r1, c0:c1]))
-            off_land_frac_tile = float(np.mean(off_land_mask[r0:r1, c0:c1]))
-            joint_land = min(land_frac, off_land_frac_tile)
-            if joint_land < _C.TILE_JOINT_LAND_MIN:
-                tile_idx += 1; continue
-            stable_frac = float(np.mean(stable_mask[r0:r1, c0:c1]))
-            weight_frac = float(np.mean(weight_map[r0:r1, c0:c1]))
-            tex = float(np.percentile(grad_mag[r0:r1, c0:c1], 75))
-            tex_n = float(np.clip(tex / 64.0, 0.0, 1.0))
-            anc_bonus = 1.0 if is_anc else 0.0
-            score = (1.6 * weight_frac) + (1.0 * stable_frac) + (0.8 * tex_n) + (0.5 * anc_bonus) + (0.3 * joint_land)
-            tile_candidates.append((-score, float(rng.random()), r0, c0, tile_idx, joint_land))
-            tile_idx += 1
+
+    def _gen_tiles(row_start, col_start):
+        """Generate tile candidates from a grid starting at (row_start, col_start).
+
+        Land filtering is done per 4x4 sub-cell (consistent with the
+        downstream quota allocation): a tile is accepted if ANY of its
+        sub-cells has joint-land coverage >= SUB_LAND_MIN. This prevents
+        the old tile-level TILE_JOINT_LAND_MIN gate from dropping entire
+        tiles that contain a small island or a narrow land spit.
+        """
+        nonlocal tile_idx
+        SUB = 4
+        SUB_LAND_MIN = 0.15
+        for r0 in range(row_start, h - tile_size // 2, step):
+            for c0 in range(col_start, w - tile_size // 2, step):
+                r1, c1 = min(r0 + tile_size, h), min(c0 + tile_size, w)
+                if r1 - r0 < tile_size // 2 or c1 - c0 < tile_size // 2: continue
+                ref_tile, off_tile = ref_u8[r0:r1, c0:c1], off_u8[r0:r1, c0:c1]
+                rv, ov = np.mean(ref_tile > 0), np.mean(off_tile > 0)
+                if rv < min_valid_frac or ov < min_valid_frac:
+                    tile_idx += 1; continue
+                is_anc = any(c0 <= ac <= c0 + tile_size and r0 <= ar <= r0 + tile_size for ac, ar in anchor_px)
+
+                # Per-sub-cell land evaluation (4x4 grid over the tile).
+                ref_tile_land = land_mask[r0:r1, c0:c1]
+                off_tile_land = off_land_mask[r0:r1, c0:c1]
+                th, tw = ref_tile_land.shape
+                sub_h, sub_w = max(1, th // SUB), max(1, tw // SUB)
+                any_land = False
+                max_sub_joint = 0.0
+                for si in range(SUB):
+                    sr0 = si * sub_h
+                    sr1 = (si + 1) * sub_h if si < SUB - 1 else th
+                    for sj in range(SUB):
+                        sc0 = sj * sub_w
+                        sc1 = (sj + 1) * sub_w if sj < SUB - 1 else tw
+                        rl = float(np.mean(ref_tile_land[sr0:sr1, sc0:sc1]))
+                        ol = float(np.mean(off_tile_land[sr0:sr1, sc0:sc1]))
+                        j = min(rl, ol)
+                        if j > max_sub_joint:
+                            max_sub_joint = j
+                        if j >= SUB_LAND_MIN:
+                            any_land = True
+                if not any_land:
+                    tile_idx += 1; continue
+
+                stable_frac = float(np.mean(stable_mask[r0:r1, c0:c1]))
+                weight_frac = float(np.mean(weight_map[r0:r1, c0:c1]))
+                tex = float(np.percentile(grad_mag[r0:r1, c0:c1], 75))
+                tex_n = float(np.clip(tex / 64.0, 0.0, 1.0))
+                anc_bonus = 1.0 if is_anc else 0.0
+                # Score with max-sub-joint so tiles with strong land sub-cells
+                # rank well even when overall tile land fraction is low.
+                score = (1.6 * weight_frac) + (1.0 * stable_frac) + (0.8 * tex_n) + (0.5 * anc_bonus) + (0.3 * max_sub_joint)
+                tile_candidates.append((-score, float(rng.random()), r0, c0, tile_idx, max_sub_joint))
+                tile_idx += 1
+
+    # Primary grid
+    _gen_tiles(0, 0)
+    # Offset grid: shifted by half a step so primary-grid edges become offset-grid centers.
+    # RoMa hard-zeros confidence near tile edges (romav2.py:431), so the offset grid
+    # produces full-confidence matches exactly where the primary grid has gaps.
+    offset = step // 2
+    _gen_tiles(offset, offset)
 
     tile_candidates.sort(key=lambda x: (x[0], x[1]))
     n_land_tiles = sum(1 for t in tile_candidates if t[5] > 0.05)
@@ -301,42 +376,86 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
             print(f"    WARNING: {_tile_fail_count[0]}/{_tile_total_count[0]} tiles "
                   f"({fail_pct:.0f}%) failed during RoMa sampling")
 
-    # De-duplicate (spatial hash grid) and RANSAC
+    # De-duplicate (spatial hash grid) with coverage rescue
     if len(all_matches) > 1:
         all_matches.sort(key=lambda m: -m.confidence)
         occupied = set()
         kept = []
+        discarded = []
         for m in all_matches:
             bx, by = int(m.ref_x / 50), int(m.ref_y / 50)
             if not any((bx + di, by + dj) in occupied for di in (-1, 0, 1) for dj in (-1, 0, 1)):
                 kept.append(m)
                 occupied.add((bx, by))
+            else:
+                discarded.append(m)
+
+        # Coverage rescue: for empty 2km cells, rescue the best discarded match
+        cell_m = _C.MATCH_QUOTA_GRID_M
+        kept_cells = set()
+        for m in kept:
+            kept_cells.add((int(m.ref_x / cell_m), int(m.ref_y / cell_m)))
+        rescued = 0
+        rescue_cells = set()
+        for m in discarded:
+            cell = (int(m.ref_x / cell_m), int(m.ref_y / cell_m))
+            if cell not in kept_cells and cell not in rescue_cells:
+                kept.append(m)
+                rescue_cells.add(cell)
+                rescued += 1
+        if rescued > 0:
+            print(f"    De-dup coverage rescue: {rescued} matches in empty cells")
         all_matches = kept
 
-    # Grid-cell match quotas for spatial diversity
+    # Sub-cell spatial distribution quota: inside each 2km cell, group matches
+    # by 500m sub-cell (4x4 grid) and keep only the top-2 highest-confidence
+    # matches per sub-cell. This trades raw match count for spatial uniformity
+    # and quality, so low-confidence regions still get sampled while the global
+    # total stays small enough that downstream GCP selection gets better picks.
     if len(all_matches) > 100:
-        cell_buckets = {}
+        cell_m = _C.MATCH_QUOTA_GRID_M
+        sub_n = 4  # 4x4 sub-cells per 2km cell (500m each)
+        sub_m = cell_m / sub_n
+        per_subcell_cap = 2  # top-N per sub-cell; fewer, higher-quality matches
+
+        cell_buckets: dict[tuple[int, int], list] = {}
         for m in all_matches:
-            cx, cy = int(m.ref_x / _C.MATCH_QUOTA_GRID_M), int(m.ref_y / _C.MATCH_QUOTA_GRID_M)
+            cx, cy = int(m.ref_x / cell_m), int(m.ref_y / cell_m)
             cell_buckets.setdefault((cx, cy), []).append(m)
+
         quota_kept = []
         n_capped = 0
         for cell_matches in cell_buckets.values():
-            cell_matches.sort(key=lambda m: -m.confidence)
-            if len(cell_matches) > _C.MATCH_QUOTA_PER_CELL:
+            # Group by sub-cell, then keep top-N by confidence inside each.
+            sub_groups: dict[tuple[int, int], list] = {}
+            for m in cell_matches:
+                sx = int(m.ref_x / sub_m) % sub_n
+                sy = int(m.ref_y / sub_m) % sub_n
+                sub_groups.setdefault((sx, sy), []).append(m)
+
+            selected = []
+            for group in sub_groups.values():
+                group.sort(key=lambda mm: -mm.confidence)
+                selected.extend(group[:per_subcell_cap])
+
+            if len(cell_matches) > len(selected):
                 n_capped += 1
-            quota_kept.extend(cell_matches[:_C.MATCH_QUOTA_PER_CELL])
+            quota_kept.extend(selected)
+
         if n_capped > 0:
-            print(f"    Grid quota: {len(all_matches)} -> {len(quota_kept)} ({n_capped} cells capped)")
+            print(f"    Sub-cell quota: {len(all_matches)} -> {len(quota_kept)} "
+                  f"({n_capped} cells capped, {sub_n}x{sub_n} sub-cells × top-{per_subcell_cap})")
         all_matches = quota_kept
 
     if not skip_ransac and len(all_matches) >= 6:
         src_pts = np.array([m.ref_coords() for m in all_matches], dtype=np.float32).reshape(-1, 1, 2)
         dst_pts = np.array([m.off_coords() for m in all_matches], dtype=np.float32).reshape(-1, 1, 2)
-        _, inliers = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC,
-                                           ransacReprojThreshold=max(_C.RANSAC_REPROJ_THRESHOLD * neural_res, 15.0))
+        _thresh = max(_C.RANSAC_REPROJ_THRESHOLD * neural_res, 15.0)
+        from .geo import ransac_affine
+        _est_method = get_params().matching.estimation_method
+        _, inliers = ransac_affine(src_pts, dst_pts, threshold=_thresh, method=_est_method)
         if inliers is not None:
-            all_matches = [m for m, keep in zip(all_matches, inliers.ravel().astype(bool)) if keep]
+            all_matches = [m for m, keep in zip(all_matches, inliers) if keep]
 
     # Stability reweighting (post-RANSAC): down-weight survivors where
     # one or both endpoints fall on water/unstable ground.

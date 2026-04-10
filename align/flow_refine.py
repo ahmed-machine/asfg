@@ -10,6 +10,7 @@ self-consistent but unreliable flow in textureless regions.
 Falls back gracefully if SEA-RAFT is unavailable (no GPU, import failure, etc.).
 """
 
+import os
 import gc
 
 import cv2
@@ -21,6 +22,7 @@ from rasterio.warp import reproject, Resampling
 
 from . import constants as _C
 from .image import chunked_remap, to_u8_percentile
+from .models import use_ssd_weights
 
 # ---------------------------------------------------------------------------
 # SEA-RAFT (uncertainty supplement) → DIS (primary flow engine)
@@ -168,7 +170,16 @@ def _get_raft_model():
         print(f"  [SEA-RAFT] Loading SEA-RAFT-M on {device}...", flush=True)
         model = SEARAFT()  # uses built-in Medium defaults
         ckpt_path = _download_sea_raft_weights()
-        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        # Experimental SSD-finetuned override (see scripts/experimental/ssd/).
+        # Opt-in via DECLASS_EXPERIMENTAL_SSD=1. Default off — downstream
+        # alignment improvement has not been validated.
+        ssd_weights_path = 'align/weights/searaft_ssd.pth'
+        if use_ssd_weights() and os.path.exists(ssd_weights_path):
+            print(f"  [SEA-RAFT] OVERRIDE: Loading SSD-finetuned SEA-RAFT weights from {ssd_weights_path}", flush=True)
+            state_dict = torch.load(ssd_weights_path, map_location="cpu", weights_only=True)
+        else:
+            state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        
         # Strip "module." prefix if checkpoint was saved with DataParallel
         if any(k.startswith("module.") for k in state_dict):
             state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
@@ -501,9 +512,9 @@ def _estimate_uncertainty_raft(ref_gray: np.ndarray, warped_gray: np.ndarray) ->
     (same pattern as _estimate_flow_raft). Tiles are processed sequentially
     (batch_size=1) since uncertainty is supplementary — speed not critical.
     """
+    model, device = _get_raft_model()
     if not _RAFT_IS_SEA:
         return None
-    model, device = _get_raft_model()
     if model is None or not hasattr(model, 'forward_with_uncertainty'):
         return None
 
@@ -594,6 +605,26 @@ def _forward_backward_mask(
 
     # Supplement with SEA-RAFT uncertainty when available
     uncertainty = _estimate_uncertainty_raft(ref_gray, warped_gray)
+    
+    # --- SSD EXTRACTION HOOK ---
+    # Dump raw SEA-RAFT uncertainty and flow to disk
+    ssd_dir = os.environ.get("SSD_EXTRACT_DIR", None)
+    if ssd_dir and uncertainty is not None:
+        import torch
+        os.makedirs(ssd_dir, exist_ok=True)
+        # Use provided ID if available, else generate uuid
+        ext_id = os.environ.get("SSD_EXTRACT_ID", None)
+        if not ext_id:
+            import uuid
+            ext_id = str(uuid.uuid4())[:8]
+        pt_path = os.path.join(ssd_dir, f"searaft_raw_{ext_id}.pt")
+        torch.save({
+            'flow_fwd': flow_fwd,
+            'uncertainty': uncertainty,
+            'err_fwd_bwd': err
+        }, pt_path)
+    # ---------------------------
+
     if uncertainty is not None:
         # Adaptive threshold: median + 2*MAD (robust outlier detection)
         med = np.median(uncertainty)

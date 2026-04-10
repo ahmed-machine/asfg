@@ -954,6 +954,7 @@ def verify_orientation_against_reference(georef_path: str, reference_path: str) 
 
     best_rotation = 0
     best_corr = -1.0
+    corr_by_rot = {}
 
     for rotation, mask in mask_candidates.items():
         mh = min(mask.shape[0], ref_mask.shape[0])
@@ -977,13 +978,26 @@ def verify_orientation_against_reference(georef_path: str, reference_path: str) 
             corr = float(np.sum(m_centered * r_centered) / (m_std * r_std * m.size))
 
         print(f"    Land mask rotation {rotation:>3}: correlation = {corr:.4f}")
+        corr_by_rot[rotation] = corr
         if corr > best_corr:
             best_corr = corr
             best_rotation = rotation
 
+    # Require confident signal before overriding: minimum absolute correlation
+    # AND meaningful margin over the 0° correlation. Without this, weak/noisy
+    # correlations (e.g. 0.08 vs -0.15) cause false 180° flips.
+    MIN_FLIP_CORR = 0.25
+    MIN_FLIP_MARGIN = 0.2
+    corr_at_zero = corr_by_rot.get(0, 0.0)
+
     if best_rotation != 0:
+        margin = best_corr - corr_at_zero
+        if best_corr < MIN_FLIP_CORR or margin < MIN_FLIP_MARGIN:
+            print(f"  Orientation verify (land mask): correlation too weak to flip "
+                  f"(corr={best_corr:.4f}, margin={margin:.4f}), keeping current orientation")
+            return 0
         print(f"  Orientation verify (land mask): best rotation = {best_rotation} "
-              f"(corr={best_corr:.4f})")
+              f"(corr={best_corr:.4f}, margin={margin:.4f})")
     else:
         print(f"  Orientation verify (land mask): current orientation correct "
               f"(corr={best_corr:.4f})")

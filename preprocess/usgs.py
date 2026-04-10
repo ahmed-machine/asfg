@@ -41,6 +41,13 @@ class USGSClient:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
+            # Handle USGS maintenance redirects
+            if e.code in (307, 308):
+                redirect_url = e.headers.get("Location", "")
+                if "maintenance" in redirect_url.lower():
+                    raise RuntimeError(
+                        f"USGS M2M API is down for maintenance (redirecting to {redirect_url}). "
+                        f"Try again later or use --skip-download with cached files.")
             body_text = e.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"M2M API error {e.code} on {endpoint}: {body_text}")
 

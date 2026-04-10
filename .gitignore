@@ -16,3 +16,9 @@ data/*
 !data/bahrain_anchor_gcps.json
 !data/local_paths.yaml.example
 diagnostics/
+*.log
+align/weights/*.pth
+align/weights/*.pt
+.venv-test/
+.venv/
+hypothesis.md

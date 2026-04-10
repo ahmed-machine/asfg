@@ -677,8 +677,70 @@ def stitch_with_asp(frames: list, output_path: str, camera_name: str,
         print(f"  ASP image_mosaic: no output file found")
         return None
 
+    if not verify_tiff_decodes_nonempty(output_path, label="ASP image_mosaic"):
+        # image_mosaic exited with returncode=0 but the output TIFF has
+        # zeroed TileOffsets (known ASP failure mode on wide KH-9
+        # panoramic inputs — phase 2 "Re-writing with blocks of size:
+        # 256 x 256" silently gets skipped). Don't leave a poisoned file
+        # on disk; the cache check would otherwise skip re-stitching.
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        return None
+
     print(f"  ASP stitched: {output_path}")
     return output_path
+
+
+def verify_tiff_decodes_nonempty(path: str, label: str = "TIFF", sample_size: int = 64) -> bool:
+    """Probe a TIFF to confirm it actually decodes to non-NoData pixels.
+
+    ASP's ``image_mosaic`` has been observed to exit with returncode=0 while
+    leaving the output TIFF's ``TileOffsets`` table all-zero (the phase-2
+    "Re-writing with blocks of size: 256 x 256" step silently gets skipped on
+    wide KH-9 panoramic inputs). Such a file passes ``gdal.Open`` and reports
+    dimensions correctly, but every decoded pixel reads as NoData.
+
+    This helper opens the file, reads a small corner window, and returns
+    False if any of: the file fails to open, the probe read returns None, or
+    the probe max is 0. It's deliberately cheap so it can be used as a
+    pre-flight gate on long-running pipelines.
+
+    Parameters
+    ----------
+    path : str
+        Path to the TIFF to probe.
+    label : str
+        Prefix used in warning prints so the caller's context is visible.
+    sample_size : int
+        Edge of the square probe window. Default 64 is enough to detect the
+        all-NoData failure mode without touching more than one tile.
+    """
+    try:
+        from osgeo import gdal
+        gdal.UseExceptions()
+        ds = gdal.Open(path)
+        if ds is None:
+            print(f"  {label}: gdal.Open returned None ({path})")
+            return False
+        band = ds.GetRasterBand(1)
+        w = min(sample_size, ds.RasterXSize)
+        h = min(sample_size, ds.RasterYSize)
+        probe = band.ReadAsArray(0, 0, w, h)
+        ds = None
+    except Exception as e:
+        print(f"  {label}: output not readable: {e} ({path})")
+        return False
+
+    if probe is None:
+        print(f"  {label}: probe read returned None ({path})")
+        return False
+    if int(probe.max()) == 0:
+        print(f"  {label}: decodes as all-zero in sampled corner "
+              f"(likely zeroed TileOffsets / unfinalized TIFF) ({path})")
+        return False
+    return True
 
 
 def stitch_frames(frames: list, output_path: str, output_dir: str,

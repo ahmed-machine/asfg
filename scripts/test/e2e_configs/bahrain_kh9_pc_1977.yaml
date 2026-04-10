@@ -1,0 +1,13 @@
+# End-to-end test: Bahrain coverage from KH-9 Panoramic Camera 1977 mission 1213-2.
+# Entity D3C1213-200346A003 (Aft camera, declassiii/D3C dataset = KH-9 Hexagon PC).
+# This is the primary test case referenced in memory files.
+#
+# Added as part of the 2OC paper follow-up (plan file: greedy-swimming-otter.md)
+# to give us a stable KH-9 PC benchmark now that kh9.yaml has a `camera:` block
+# and ASP OpticalBar pre-correction is enabled for D3C scenes.
+name: bahrain_kh9_pc_1977
+boundary: data/bahrain_boundary.geojson
+reference: kh9_dzb1212        # 1976 KH-9 Mapping Camera — cross-temporal 1-year gap
+catalogs:
+  - data/available/declassiii_69b17de7ab15497e.csv
+prefer_camera: A              # Aft panoramic camera pair (vs F Fore)

@@ -20,7 +20,8 @@ import torch
 from .geo import WGS84
 
 from . import constants as _C
-from .geo import get_torch_device, fit_affine_from_gcps
+from .geo import fit_affine_from_gcps
+from .models import get_torch_device
 from .image import clahe_normalize, to_u8, make_land_mask
 from .types import MatchPair
 
@@ -327,8 +328,20 @@ def match_anchor_roma(ref_patch, off_patch, patch_half, name,
 
     src_pts = mkpts0.astype(np.float32).reshape(-1, 1, 2)
     dst_pts = mkpts1.astype(np.float32).reshape(-1, 1, 2)
-    M, inliers = cv2.estimateAffinePartial2D(
-        src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=_C.RANSAC_REPROJ_THRESHOLD)
+    # Robust affine estimation (method from profile)
+    from .params import get_params as _get_anchor_params
+    _est_method = _get_anchor_params().matching.estimation_method
+    if _est_method == "magsac":
+        from .geo import magsac_partial_affine
+        M, inliers = magsac_partial_affine(
+            src_pts, dst_pts, threshold=_C.RANSAC_REPROJ_THRESHOLD)
+    else:
+        _cv_m = cv2.LMEDS if _est_method == "lmeds" else cv2.RANSAC
+        M, inliers = cv2.estimateAffinePartial2D(
+            src_pts, dst_pts, method=_cv_m,
+            ransacReprojThreshold=_C.RANSAC_REPROJ_THRESHOLD)
+        if inliers is not None:
+            inliers = inliers.ravel().astype(bool)
 
     if M is None or inliers is None:
         return None
@@ -339,6 +352,7 @@ def match_anchor_roma(ref_patch, off_patch, patch_half, name,
     if abs(rot_deg) > 5.0 or abs(scale_x - 1.0) > 0.20 or abs(scale_y - 1.0) > 0.20:
         return None
 
+    inliers = inliers.ravel().astype(bool)
     n_inliers = int(inliers.sum())
     if n_inliers < _C.ANCHOR_INLIER_THRESHOLD:
         return None
@@ -652,11 +666,18 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
         dst_pts = np.column_stack([ref_cols + d_cols, ref_rows + d_rows]).astype(np.float32)
 
         # Fit similarity transform (translation + rotation + uniform scale)
-        # using cv2.estimateAffinePartial2D with RANSAC for robustness
-        M, inliers = cv2.estimateAffinePartial2D(
-            src_pts, dst_pts, method=cv2.RANSAC,
-            ransacReprojThreshold=max(200 / fine_res, 20.0),
-            confidence=0.90)
+        _presearch_thresh = max(200 / fine_res, 20.0)
+        from .params import get_params as _get_anchor_params
+        _est_method = _get_anchor_params().matching.estimation_method
+        if _est_method == "magsac":
+            from .geo import magsac_partial_affine
+            M, inliers = magsac_partial_affine(
+                src_pts, dst_pts, threshold=_presearch_thresh, confidence=0.90)
+        else:
+            _cv_m = cv2.LMEDS if _est_method == "lmeds" else cv2.RANSAC
+            M, inliers = cv2.estimateAffinePartial2D(
+                src_pts, dst_pts, method=_cv_m,
+                ransacReprojThreshold=_presearch_thresh, confidence=0.90)
 
         if M is None or inliers is None:
             print(f"  [Anchor presearch] Rigid fit failed ({len(presearch_pts)} points)", flush=True)
@@ -811,7 +832,7 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                   f"(median residual {fit_med_res:.1f}m > threshold {pass15_threshold:.0f}m "
                   f"for {n_fit} anchors)", flush=True)
             results = _filter_anchor_displacement_outliers(results)
-            return results
+            return results, {"presearch_global_offset_m": _presearch_global_offset}
 
         # Invert to get ref_pos -> offset_pos
         M_3x3 = np.vstack([M_fwd, [0, 0, 1]])

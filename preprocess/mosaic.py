@@ -1547,11 +1547,17 @@ def build_mosaic(aligned_paths: list, output_path: str, feather_margin: int = 50
     return output_path
 
 
-def group_for_mosaic(scenes: list, aligned_dir: str) -> dict:
+def group_for_mosaic(scenes: list, aligned_dir: str,
+                     diagnostics_dir: str = None) -> dict:
     """Group aligned outputs by acquisition date + mission for mosaicking.
+
+    When diagnostics_dir is provided, scenes with QA-rejected alignments
+    are excluded from the mosaic.
 
     Returns dict mapping mosaic_name -> list of aligned file paths.
     """
+    import json as _json
+
     groups = defaultdict(list)
 
     for scene in scenes:
@@ -1560,20 +1566,49 @@ def group_for_mosaic(scenes: list, aligned_dir: str) -> dict:
         camera = scene.camera_system.name
         mosaic_name = f"{date_str}_{camera}_{mission}"
 
-        # Look for aligned output
         aligned_path = os.path.join(aligned_dir, f"{scene.entity_id}_aligned.tif")
-        if os.path.exists(aligned_path):
-            groups[mosaic_name].append(aligned_path)
+        if not os.path.exists(aligned_path):
+            continue
+
+        # Check QA acceptance if diagnostics available
+        if diagnostics_dir:
+            qa_path = os.path.join(diagnostics_dir, scene.entity_id, "qa.json")
+            if not os.path.exists(qa_path):
+                # No QA means alignment didn't complete properly — skip
+                print(f"  [skip mosaic] {scene.entity_id}: no QA report (alignment incomplete)")
+                continue
+            try:
+                with open(qa_path) as f:
+                    qa = _json.load(f)
+                # QA structure: {"reports": [{"candidate": "grid", "accepted": bool, ...}]}
+                # or legacy: {"selected": {"accepted": bool, ...}}
+                accepted = None
+                reports = qa.get("reports", [])
+                if reports:
+                    accepted = any(r.get("accepted") for r in reports)
+                else:
+                    selected = qa.get("selected", {})
+                    accepted = selected.get("accepted")
+                if accepted is False:
+                    score = reports[0].get("total_score") if reports else None
+                    print(f"  [skip mosaic] {scene.entity_id}: QA rejected "
+                          f"(score={score})")
+                    continue
+            except Exception:
+                pass  # Can't read QA — include the scene
+
+        groups[mosaic_name].append(aligned_path)
 
     return dict(groups)
 
 
-def build_all_mosaics(scenes: list, aligned_dir: str, mosaic_dir: str) -> list:
+def build_all_mosaics(scenes: list, aligned_dir: str, mosaic_dir: str,
+                      diagnostics_dir: str = None) -> list:
     """Build all mosaics from aligned outputs, grouped by date/mission.
 
     Returns list of mosaic output paths.
     """
-    groups = group_for_mosaic(scenes, aligned_dir)
+    groups = group_for_mosaic(scenes, aligned_dir, diagnostics_dir=diagnostics_dir)
     mosaic_paths = []
 
     for mosaic_name, aligned_paths in sorted(groups.items()):

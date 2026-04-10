@@ -16,14 +16,15 @@ scale_rotation:
 
 matching:
   roma_tile_size: 1024
-  roma_tile_overlap: 256
+  roma_tile_overlap: 512
   roma_size: 640
   roma_num_corresp: 600
   land_mask_frac_min: 0.30
-  tile_joint_land_min: 0.08
+  tile_joint_land_min: 0.03
   match_quota_grid_m: 2000
   match_quota_per_cell: 30
   ransac_reproj_threshold: 5.0
+  estimation_method: ransac
 
 validation:
   anchor_inlier_threshold: 6

@@ -50,16 +50,63 @@ class GridWarper(nn.Module):
         self.residual = nn.Parameter(torch.zeros(1, 2, H, W))
         # Frozen affine baseline (set after construction via set_affine_baseline)
         self.register_buffer('affine_baseline', torch.zeros(1, 2, H, W))
+        # Frozen panoramic distortion prior (set via set_panoramic_prior)
+        self.register_buffer('panoramic_prior', torch.zeros(1, 2, H, W))
 
     # kept for backward compat with caller that reads .displacements
     @property
     def displacements(self) -> torch.Tensor:
-        return self.affine_baseline + self.residual
+        return self.affine_baseline + self.panoramic_prior + self.residual
 
     def set_affine_baseline(self, baseline: torch.Tensor) -> None:
         """Set the frozen affine baseline.  baseline: (1, 2, H, W)."""
         with torch.no_grad():
             self.affine_baseline.copy_(baseline)
+
+    def set_panoramic_prior(self, scan_arc_deg: float = 70.0,
+                            image_width_px: int = 0) -> None:
+        """Set a frozen bow-tie distortion prior from panoramic camera geometry.
+
+        The KH-4 panoramic camera scans a 70° arc, creating a characteristic
+        bow-tie distortion where the cross-track scale varies as 1/cos²(θ).
+        This prior absorbs the known systematic component so the learnable
+        residual only needs to capture deviations.
+
+        Parameters
+        ----------
+        scan_arc_deg : float
+            Total scan arc in degrees (70° for KH-4).
+        image_width_px : int
+            Image width in pixels (used for scaling). If 0, uses grid width.
+        """
+        import math
+        H, W = self.panoramic_prior.shape[2:]
+        half_arc_rad = math.radians(scan_arc_deg / 2.0)
+
+        # Normalised position along the scan axis (columns)
+        x = torch.linspace(-1, 1, W, device=self.panoramic_prior.device)
+
+        # Scan angle from nadir for each column
+        theta = x * half_arc_rad
+
+        # Bow-tie scale factor: 1/cos²(θ) — cross-track GSD variation
+        # The displacement needed is the integral difference between
+        # the panoramic projection and linear spacing
+        cos_theta = torch.cos(theta)
+        # Normalised displacement: how much each column should shift
+        # relative to linear spacing. At edges, the ground is stretched
+        # more than the film, so geographic coordinates are further out.
+        scale = 1.0 / cos_theta.pow(2)
+        dx = (scale - 1.0) * x * 0.5  # 0.5 = scale to [-1,1] normalised range
+
+        prior = torch.zeros(1, 2, H, W, device=self.panoramic_prior.device)
+        prior[0, 0, :, :] = dx.unsqueeze(0).expand(H, -1)  # x-displacement
+
+        with torch.no_grad():
+            self.panoramic_prior.copy_(prior)
+        peak_disp = float(dx.abs().max())
+        print(f"  [GridOptim] Panoramic prior set: {scan_arc_deg}° arc, "
+              f"peak displacement={peak_disp:.4f} (normalised)")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -69,7 +116,7 @@ class GridWarper(nn.Module):
         """Upsample full displacement (baseline + residual) to target_size.
         Returns (1, 2, H, W)."""
         H, W = target_size
-        full = self.affine_baseline + self.residual
+        full = self.affine_baseline + self.panoramic_prior + self.residual
         return F.interpolate(full, size=(H, W), mode='bicubic', align_corners=True)
 
     def get_dense_grid(self, target_size: Tuple[int, int]) -> torch.Tensor:
@@ -91,7 +138,7 @@ class GridWarper(nn.Module):
         if pts.shape[0] == 0:
             return pts
         grid = pts.view(1, 1, -1, 2)
-        full = self.affine_baseline + self.residual
+        full = self.affine_baseline + self.panoramic_prior + self.residual
         sampled = F.grid_sample(
             full, grid, mode='bilinear',
             padding_mode='border', align_corners=True
@@ -766,8 +813,10 @@ def optimize_grid_hierarchical(
     if levels is None:
         levels = [(8, 300), (24, 300), (64, 500)]
 
-    # CPU is faster than MPS for tiny grid tensors and avoids compatibility issues.
-    device = torch.device('cpu')
+    # CPU for grid optimization — MPS lacks float64 support needed by affine
+    # baseline fitting, and the grid tensors are small enough that CPU is fast.
+    # CUDA supports float64 and benefits from batched chamfer distance.
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f"  [GridOptim] Using device: {device}", flush=True)
     H_s, W_s = src_shape
     H_t, W_t = tgt_shape
@@ -852,18 +901,14 @@ def optimize_grid_hierarchical(
     def _compute_gcp_density_map(gcp_pts_n, grid_size, radius=0.15):
         """Per-grid-node GCP density in [0, 1] for adaptive ARAP."""
         gH = gW = grid_size
-        density = torch.zeros(gH, gW, device=device)
         if gcp_pts_n.shape[0] == 0:
-            return density
+            return torch.zeros(gH, gW, device=device)
         y_g = torch.linspace(-1, 1, gH, device=device)
         x_g = torch.linspace(-1, 1, gW, device=device)
         yy, xx = torch.meshgrid(y_g, x_g, indexing='ij')
-        for i in range(gcp_pts_n.shape[0]):
-            dx = xx - gcp_pts_n[i, 0]
-            dy = yy - gcp_pts_n[i, 1]
-            dist = (dx**2 + dy**2).sqrt()
-            density += (dist < radius).float()
-        # Normalise to [0, 1]
+        grid_coords = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1)  # (gH*gW, 2)
+        dists = torch.cdist(grid_coords, gcp_pts_n)  # (gH*gW, n_gcps)
+        density = (dists < radius).float().sum(dim=1).reshape(gH, gW)
         if density.max() > 0:
             density = density / density.max()
         return density
@@ -920,6 +965,18 @@ def optimize_grid_hierarchical(
             # Per-level scaling from profile (falls back to last entry for
             # levels beyond the array length).
             from .params import get_params as _get_params
+
+            # Apply panoramic distortion prior for KH-4/KH-7 panoramic cameras
+            if level_idx == 0:
+                try:
+                    _cam = _get_params().camera
+                    if _cam.is_panoramic:
+                        warper.set_panoramic_prior(
+                            scan_arc_deg=_cam.scan_arc_deg,
+                            image_width_px=W_t,
+                        )
+                except AttributeError:
+                    pass  # No camera params in profile
             _prof = _get_params().grid_optim
 
             def _lvl_scale(arr, idx, fallback_formula=None):

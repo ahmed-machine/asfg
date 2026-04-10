@@ -17,6 +17,19 @@ torch = "^2.10.0"
 torchvision = "^0.25.0"
 opencv-contrib-python = "^4.13.0.92"
 
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.5"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+  "fast: lightweight unit-scale verification",
+  "process: cached preprocessing and ASP backfill tests",
+  "manifest: manifest generation and alignment-input selection tests",
+  "qa: QA scoring and acceptance tests",
+  "selection: warp-candidate selection and localization tests",
+]
 
 [build-system]
 requires = ["poetry-core"]

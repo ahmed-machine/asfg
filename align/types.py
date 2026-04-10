@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import numpy as np
 
@@ -16,12 +16,6 @@ import numpy as np
 class MatcherType(str, Enum):
     """Dense feature matcher backend."""
     ROMA = "roma"
-
-
-class MaskMode(str, Enum):
-    """Land mask segmentation strategy."""
-    HEURISTIC = "heuristic"
-    COASTAL_OBIA = "coastal_obia"
 
 
 class MaskProvider(str, Enum):
@@ -136,18 +130,6 @@ class MatchPair:
             precision=prec,
         )
 
-    # Backward-compatible indexing (remove once migration complete)
-    _FIELDS = ('ref_x', 'ref_y', 'off_x', 'off_y', 'confidence', 'name', 'precision')
-
-    def __getitem__(self, idx):
-        return getattr(self, self._FIELDS[idx])
-
-    def __len__(self):
-        return 7
-
-    def __iter__(self):
-        return (getattr(self, f) for f in self._FIELDS)
-
 
 @dataclass(slots=True)
 class GCP:
@@ -178,18 +160,6 @@ class GCP:
             source=source,
             name=name,
         )
-
-    # Backward-compatible indexing (remove once migration complete)
-    _FIELDS = ('col', 'row', 'gx', 'gy')
-
-    def __getitem__(self, idx):
-        return getattr(self, self._FIELDS[idx])
-
-    def __len__(self):
-        return 4
-
-    def __iter__(self):
-        return (getattr(self, f) for f in self._FIELDS)
 
 
 @dataclass(slots=True)
@@ -303,18 +273,3 @@ class BlockManifest:
     shared_options: dict[str, Any] = field(default_factory=dict)
 
 
-def ensure_match_pair(value: MatchPair | Sequence[Any]) -> MatchPair:
-    if isinstance(value, MatchPair):
-        return value
-    return MatchPair.from_legacy(value)
-
-
-def ensure_gcp(value: GCP | Sequence[Any], *, synthetic: bool = False,
-               source: str = "match", name: str = "") -> GCP:
-    if isinstance(value, GCP):
-        return value
-    return GCP.from_legacy(value, synthetic=synthetic, source=source, name=name)
-
-
-def match_pairs_from_legacy(values: Iterable[MatchPair | Sequence[Any]]) -> list[MatchPair]:
-    return [ensure_match_pair(v) for v in values]

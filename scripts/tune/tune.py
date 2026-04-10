@@ -375,6 +375,7 @@ def objective_matching(trial, checkpoint_dir: str, args):
     land_mask_frac = trial.suggest_float("land_mask_frac_min", 0.10, 0.50)
     tile_joint = trial.suggest_float("tile_joint_land_min", 0.02, 0.15)
     quota_per_cell = trial.suggest_int("match_quota_per_cell", 10, 60, step=5)
+    estimation_method = trial.suggest_categorical("estimation_method", ["ransac", "lmeds", "magsac"])
 
     overrides = dict(
         matching__roma_size=roma_size_choice,
@@ -383,6 +384,7 @@ def objective_matching(trial, checkpoint_dir: str, args):
         matching__land_mask_frac_min=land_mask_frac,
         matching__tile_joint_land_min=tile_joint,
         matching__match_quota_per_cell=quota_per_cell,
+        matching__estimation_method=estimation_method,
     )
 
     with override(**overrides):
@@ -511,8 +513,8 @@ def _make_trial_state(state, args, trial_num: int):
     state.model_cache = mc  # restore original
     trial_state.model_cache = mc  # share reference
     trial_state.yes = True
-    # Use case_label (case ID or profile) to avoid dir collisions with
-    # tune_multi.py which uses per-case dirs like tune_{case_id}/
+    # Use case_label (case ID or profile) to give each case its own
+    # trial subdir like tune_{case_id}/ so parallel per-case runs don't collide.
     case_label = getattr(args, 'case', None) or args.profile or '_base'
     trial_dir = os.path.join(str(PROJECT_ROOT), "diagnostics",
                              f"tune_{case_label}", f"trial_{trial_num}")
@@ -680,7 +682,7 @@ def _run_flow_and_score(state, args, trial_num: int, grid_cache_path: str) -> fl
     """Run flow+remap+QA from cached grid result (skips grid optim)."""
     from align.warp import load_grid_optim_result, apply_warp_flow_and_remap
     from align.qa import evaluate_alignment_quality_paths
-    from align.qa_runner import build_candidate_report, write_qa_report
+    from align.qa import build_candidate_report, write_qa_report
     from align.profiler import _NullProfiler
 
     trial_state, trial_dir = _make_trial_state(state, args, trial_num)

@@ -2,9 +2,23 @@
 
 from __future__ import annotations
 
+import gc
 import os
 
 import torch
+
+
+def use_ssd_weights() -> bool:
+    """Return True when finetuned SSD weights should override base models.
+
+    SSD (self-supervised distillation) is an experimental research thread
+    (see hypothesis.md Section 7 and scripts/experimental/ssd/). Downstream
+    alignment improvement has not been validated, so weight loading is
+    default-off and requires an explicit opt-in via the
+    DECLASS_EXPERIMENTAL_SSD environment variable.
+    """
+    value = os.environ.get("DECLASS_EXPERIMENTAL_SSD", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def get_torch_device(override: str | None = None) -> str:
@@ -12,11 +26,21 @@ def get_torch_device(override: str | None = None) -> str:
 
     if override and override != "auto":
         return override
-    if torch.backends.mps.is_available():
-        return "mps"
     if torch.cuda.is_available():
         return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
+
+
+def clear_torch_cache(device: str | None = None) -> None:
+    """Release cached allocations for the active torch device."""
+
+    target = device or get_torch_device()
+    if target == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif target == "mps" and hasattr(torch, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 class ELoFTRWrapper:
@@ -136,6 +160,18 @@ class ModelCache:
             print(f"  [ModelCache] Loading RoMa v2 on {self.device}")
             cfg = RoMaV2.Cfg(setting="fast", compile=False)
             self._roma = RoMaV2(cfg)
+            
+            # Experimental SSD-finetuned override (see scripts/experimental/ssd/).
+            # Opt-in via DECLASS_EXPERIMENTAL_SSD=1. Default off — downstream
+            # alignment improvement has not been validated.
+            if use_ssd_weights():
+                ssd_weights_path = 'align/weights/roma_ssd.pth'
+                if os.path.exists(ssd_weights_path):
+                    print(f"  [ModelCache] OVERRIDE: Loading SSD-finetuned RoMa weights from {ssd_weights_path}")
+                    self._roma.load_state_dict(torch.load(ssd_weights_path, map_location=self.device))
+                else:
+                    print(f"  [ModelCache] DECLASS_EXPERIMENTAL_SSD set but {ssd_weights_path} not found; using base RoMa weights")
+                
             print(f"  [ModelCache] RoMa v2 ready")
         return self._roma
 
@@ -157,10 +193,13 @@ class ModelCache:
         return self._eloftr
 
     def close(self) -> None:
+        eloftr = self._eloftr
+        roma = self._roma
         self._eloftr = None
         self._roma = None
-        if self.device != "cpu":
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            elif hasattr(torch, "mps") and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
+        if eloftr is not None:
+            del eloftr
+        if roma is not None:
+            del roma
+        gc.collect()
+        clear_torch_cache(self.device)

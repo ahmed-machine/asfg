@@ -10,7 +10,7 @@ from rasterio.crs import CRS
 from rasterio.warp import Resampling, reproject, transform, transform_bounds
 
 from . import constants as _C
-from .models import ModelCache, get_torch_device
+from .models import ModelCache
 
 # Cached CRS singletons — avoids repeated parsing on every call.
 WGS84 = CRS.from_epsg(4326)
@@ -268,8 +268,15 @@ def compute_affine_residuals(M, src_points, dst_points):
     return list(np.sqrt((pred_x - dst_arr[:, 0]) ** 2 + (pred_y - dst_arr[:, 1]) ** 2))
 
 
-def ransac_affine(src_pts, dst_pts, threshold=None):
-    """RANSAC affine estimation wrapping cv2.estimateAffine2D.
+def ransac_affine(src_pts, dst_pts, threshold=None, method="ransac"):
+    """Robust affine estimation wrapping cv2.estimateAffine2D.
+
+    Parameters
+    ----------
+    method : str
+        "ransac" — classic RANSAC with *threshold* (default, tunable).
+        "lmeds"  — Least-Median-of-Squares (no threshold needed, 50% breakdown).
+        "magsac" — MAGSAC++ (Barath CVPR 2020), marginalizes over noise scales.
 
     Returns (M, inlier_mask) or (None, None) on failure.
     """
@@ -277,11 +284,107 @@ def ransac_affine(src_pts, dst_pts, threshold=None):
         threshold = _C.RANSAC_REPROJ_THRESHOLD
     src = np.asarray(src_pts, dtype=np.float32).reshape(-1, 1, 2)
     dst = np.asarray(dst_pts, dtype=np.float32).reshape(-1, 1, 2)
-    M, inliers = cv2.estimateAffine2D(
-        src, dst, method=cv2.RANSAC, ransacReprojThreshold=threshold)
+
+    if method == "lmeds":
+        M, inliers = cv2.estimateAffine2D(src, dst, method=cv2.LMEDS)
+    elif method == "magsac":
+        M, inliers = cv2.estimateAffine2D(
+            src, dst, method=cv2.USAC_MAGSAC, ransacReprojThreshold=threshold)
+    else:  # ransac (default)
+        M, inliers = cv2.estimateAffine2D(
+            src, dst, method=cv2.RANSAC, ransacReprojThreshold=threshold)
+
     if M is None or inliers is None:
         return None, None
     return M, inliers.ravel().astype(bool)
+
+
+def magsac_partial_affine(src_pts, dst_pts, threshold=None, confidence=0.99):
+    """MAGSAC inlier selection + partial affine (4-DOF) refit.
+
+    cv2.estimateAffinePartial2D doesn't support USAC_MAGSAC (OpenCV #19166).
+    Workaround: use MAGSAC on the 6-DOF affine to identify inliers with
+    soft sigma-consensus, then refit a constrained 4-DOF similarity on
+    just those inliers.
+
+    Returns (M_partial, inlier_mask) or (None, None) on failure.
+    """
+    if threshold is None:
+        threshold = _C.RANSAC_REPROJ_THRESHOLD
+    src = np.asarray(src_pts, dtype=np.float32).reshape(-1, 1, 2)
+    dst = np.asarray(dst_pts, dtype=np.float32).reshape(-1, 1, 2)
+
+    # USAC_MAGSAC's sampler asserts sample_size <= points_size_ (at least
+    # 5 points for affine). Without this guard, a short input raises an
+    # OpenCV exception that propagates out of anchor matching and wipes
+    # every previously-located anchor for the whole run.
+    if len(src) < 5:
+        return None, None
+
+    # Pass 1: MAGSAC on 6-DOF for inlier identification
+    try:
+        _, inliers_6dof = cv2.estimateAffine2D(
+            src, dst, method=cv2.USAC_MAGSAC,
+            ransacReprojThreshold=threshold, confidence=confidence)
+    except cv2.error:
+        return None, None
+    if inliers_6dof is None:
+        return None, None
+
+    mask = inliers_6dof.ravel().astype(bool)
+    if mask.sum() < 3:
+        return None, None
+
+    # Pass 2: refit 4-DOF partial affine on MAGSAC inliers
+    try:
+        M, inliers_4dof = cv2.estimateAffinePartial2D(
+            src[mask], dst[mask], method=cv2.RANSAC,
+            ransacReprojThreshold=threshold, confidence=confidence)
+    except cv2.error:
+        return None, None
+    if M is None or inliers_4dof is None:
+        return None, None
+
+    # Map 4-DOF inlier mask back to original point indices
+    full_mask = np.zeros(len(src), dtype=bool)
+    orig_indices = np.where(mask)[0]
+    refit_mask = inliers_4dof.ravel().astype(bool)
+    full_mask[orig_indices[refit_mask]] = True
+
+    return M, full_mask
+
+
+def _pick_better_affine(M_r, inl_r, M_l, inl_l, src, dst):
+    """Choose between RANSAC and LMedS results.
+
+    Prefers whichever has more inliers; breaks ties by lower median residual.
+    """
+    def _score(M, inl):
+        if M is None or inl is None:
+            return -1, float("inf")
+        mask = inl.ravel().astype(bool)
+        n_inl = int(mask.sum())
+        s = src.reshape(-1, 2)[mask]
+        d = dst.reshape(-1, 2)[mask]
+        pred = (M[:, :2] @ s.T).T + M[:, 2]
+        res = np.sqrt(((pred - d) ** 2).sum(axis=1))
+        return n_inl, float(np.median(res)) if len(res) > 0 else float("inf")
+
+    n_r, med_r = _score(M_r, inl_r)
+    n_l, med_l = _score(M_l, inl_l)
+
+    # Prefer more inliers; if within 5% of each other, prefer lower median
+    if n_r <= 0 and n_l <= 0:
+        return None, None
+    if n_r <= 0:
+        return M_l, inl_l
+    if n_l <= 0:
+        return M_r, inl_r
+    if n_l > n_r * 1.05:
+        return M_l, inl_l
+    if n_r > n_l * 1.05:
+        return M_r, inl_r
+    return (M_l, inl_l) if med_l <= med_r else (M_r, inl_r)
 
 
 # ---------------------------------------------------------------------------

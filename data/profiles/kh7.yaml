@@ -5,3 +5,14 @@ meta:
   description: KH-7 GAMBIT (1963-1967), high resolution surveillance
   cameras:
   - KH-7
+
+camera:
+  type: opticalbar
+  focal_length: 1.981          # metres (78 inch focal length)
+  pixel_pitch: 7.0e-6          # metres (7 micron USGS scan)
+  scan_time: 0.5               # seconds (strip camera)
+  speed: 7800                  # m/s (orbital velocity)
+  forward_tilt: 0.0            # near-nadir
+  scan_dir: right
+  motion_compensation_factor: 1.0
+  scan_arc_deg: 5.4            # narrow strip camera

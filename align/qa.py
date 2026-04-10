@@ -1,4 +1,7 @@
-"""Alignment quality metrics and diagnostic visualization."""
+"""Alignment quality metrics, QA orchestration, and diagnostic visualization."""
+
+import json
+from typing import Iterable
 
 import cv2
 import numpy as np
@@ -9,6 +12,7 @@ import torch
 from .geo import read_overlap_region
 from .image import build_semantic_masks, shoreline_mask, to_u8
 from .models import get_torch_device
+from .types import MatchPair, QaReport
 
 _QA_GRID_ROWS = 4
 _QA_GRID_COLS = 6
@@ -440,14 +444,9 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
 def evaluate_alignment_quality_paths(output_path, reference_path, overlap, work_crs, eval_res=8.0,
                                      mask_mode="coastal_obia"):
     """Compute alignment QA metrics directly from raster paths."""
-    src_ref = rasterio.open(reference_path)
-    src_out = rasterio.open(output_path)
-    try:
+    with rasterio.open(reference_path) as src_ref, rasterio.open(output_path) as src_out:
         arr_ref, _ = read_overlap_region(src_ref, overlap, work_crs, eval_res)
         arr_out, _ = read_overlap_region(src_out, overlap, work_crs, eval_res)
-    finally:
-        src_ref.close()
-        src_out.close()
 
     valid = (arr_ref > 0) & (arr_out > 0)
     if np.mean(valid) < 0.05:
@@ -480,8 +479,9 @@ def generate_debug_image(src_ref, src_offset, overlap, work_crs,
         match_coords = []
 
         for i, pair in enumerate(matched_pairs):
-            rgx, rgy, ogx, ogy = pair[0], pair[1], pair[2], pair[3]
-            name = pair[5]
+            rgx, rgy = pair.ref_x, pair.ref_y
+            ogx, ogy = pair.off_x, pair.off_y
+            name = pair.name
             residual = geo_residuals[i]
 
             ref_row, ref_col = rasterio.transform.rowcol(ref_vis_transform, rgx, rgy)
@@ -561,3 +561,263 @@ def generate_debug_image(src_ref, src_offset, overlap, work_crs,
         print(f"  Diagnostic image saved: {output_path}")
     except Exception as e:
         print(f"  WARNING: Could not create diagnostic visualization: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Holdout validation and QA report building (merged from qa_runner.py)
+# ---------------------------------------------------------------------------
+
+def split_holdout_pairs(matched_pairs: Iterable[MatchPair], holdout_fraction: float = 0.2,
+                        min_holdout: int = 4, seed: int = 42):
+    """Split match pairs into training and holdout sets."""
+    pairs = list(matched_pairs)
+    auto_idx = [idx for idx, pair in enumerate(pairs) if not pair.is_anchor]
+    if len(auto_idx) < max(min_holdout + 6, 12):
+        return pairs, []
+
+    holdout_n = max(min_holdout, int(round(len(auto_idx) * holdout_fraction)))
+    holdout_n = min(holdout_n, max(0, len(auto_idx) - 6))
+    if holdout_n <= 0:
+        return pairs, []
+
+    rng = np.random.default_rng(seed)
+    shuffled = np.array(auto_idx, dtype=np.int32)
+    rng.shuffle(shuffled)
+    holdout_idx = set(int(idx) for idx in shuffled[:holdout_n])
+    train = [pair for idx, pair in enumerate(pairs) if idx not in holdout_idx]
+    holdout = [pair for idx, pair in enumerate(pairs) if idx in holdout_idx]
+    return train, holdout
+
+
+def compute_holdout_affine_metrics(M_geo, holdout_pairs: Iterable[MatchPair]):
+    """Return independent residual stats for held-out matches."""
+    if M_geo is None:
+        return {}
+
+    holdout = list(holdout_pairs)
+    if not holdout:
+        return {}
+
+    errors = []
+    for pair in holdout:
+        pred_x = M_geo[0, 0] * pair.off_x + M_geo[0, 1] * pair.off_y + M_geo[0, 2]
+        pred_y = M_geo[1, 0] * pair.off_x + M_geo[1, 1] * pair.off_y + M_geo[1, 2]
+        errors.append(float(np.hypot(pred_x - pair.ref_x, pred_y - pair.ref_y)))
+
+    err_arr = np.array(errors, dtype=np.float32)
+    return {
+        "count": int(len(errors)),
+        "mean_m": float(np.mean(err_arr)),
+        "median_m": float(np.median(err_arr)),
+        "p90_m": float(np.percentile(err_arr, 90)),
+        "max_m": float(np.max(err_arr)),
+    }
+
+
+def compute_holdout_warp_metrics(output_path: str, reference_path: str,
+                                 holdout_pairs: Iterable[MatchPair],
+                                 work_crs, overlap, eval_res: float = 4.0):
+    """Validate holdout pairs against the final warped output (not just affine)."""
+    holdout = list(holdout_pairs)
+    if not holdout or len(holdout) < 4:
+        return {}
+
+    try:
+        with rasterio.open(reference_path) as src_ref, rasterio.open(output_path) as src_out:
+            arr_ref, ref_transform = read_overlap_region(src_ref, overlap, work_crs, eval_res)
+            arr_out, _ = read_overlap_region(src_out, overlap, work_crs, eval_res)
+    except Exception:
+        return {}
+
+    valid = (arr_ref > 0) & (arr_out > 0)
+    h, w = arr_ref.shape
+    patch = 64
+    half = patch // 2
+    device = get_torch_device()
+
+    ref_patches = []
+    out_patches = []
+    win = np.outer(np.hanning(patch), np.hanning(patch)).astype(np.float32)
+
+    for pair in holdout:
+        col, row = ~ref_transform * (pair.ref_x, pair.ref_y)
+        row, col = int(round(row)), int(round(col))
+        r0, r1 = row - half, row + half
+        c0, c1 = col - half, col + half
+        if r0 < 0 or r1 > h or c0 < 0 or c1 > w:
+            continue
+        if np.mean(valid[r0:r1, c0:c1]) < 0.5:
+            continue
+        ref_patches.append(arr_ref[r0:r1, c0:c1].astype(np.float32) * win)
+        out_patches.append(arr_out[r0:r1, c0:c1].astype(np.float32) * win)
+
+    if len(ref_patches) < 4:
+        return {}
+
+    ref_t = torch.from_numpy(np.stack(ref_patches)).to(device)
+    out_t = torch.from_numpy(np.stack(out_patches)).to(device)
+
+    with torch.no_grad():
+        shifts, _, vmask = _batch_phase_correlate(ref_t, out_t, 0.02)
+
+    mags = np.hypot(shifts[vmask, 0], shifts[vmask, 1]) * eval_res
+
+    if len(mags) < 2:
+        return {}
+
+    return {
+        "count": int(len(mags)),
+        "mean_m": float(np.mean(mags)),
+        "median_m": float(np.median(mags)),
+        "p90_m": float(np.percentile(mags, 90)),
+        "max_m": float(np.max(mags)),
+        "method": "post_warp_phase_correlation",
+    }
+
+
+def _effective_holdout_metrics(holdout_metrics):
+    if not holdout_metrics:
+        return {}
+    post_warp = holdout_metrics.get("post_warp")
+    if isinstance(post_warp, dict) and post_warp:
+        return post_warp
+    return holdout_metrics
+
+
+def _confidence_from_metrics(image_metrics, holdout_metrics, coverage, cv_mean_m):
+    components = []
+    if image_metrics and "score" in image_metrics:
+        image_score = float(image_metrics["score"])
+        components.append(np.clip(1.0 - (image_score / 200.0), 0.0, 1.0))
+    effective_holdout = _effective_holdout_metrics(holdout_metrics)
+    if effective_holdout:
+        components.append(np.clip(1.0 - (float(effective_holdout.get("mean_m", 200.0)) / 120.0), 0.0, 1.0))
+        components.append(np.clip(1.0 - (float(effective_holdout.get("p90_m", 240.0)) / 180.0), 0.0, 1.0))
+    if cv_mean_m is not None:
+        components.append(np.clip(1.0 - (float(cv_mean_m) / 120.0), 0.0, 1.0))
+    components.append(np.clip(float(coverage) / 0.35, 0.0, 1.0))
+    return float(np.mean(components)) if components else 0.0
+
+
+def _total_score(image_metrics, holdout_metrics, coverage, cv_mean_m):
+    score = float(image_metrics["score"]) if image_metrics and "score" in image_metrics else 0.0
+    effective_holdout = _effective_holdout_metrics(holdout_metrics)
+    if effective_holdout:
+        score += 0.60 * float(effective_holdout.get("mean_m", 0.0))
+        score += 0.25 * float(effective_holdout.get("p90_m", 0.0))
+    if cv_mean_m is not None:
+        score += 0.35 * float(cv_mean_m)
+    if coverage < 0.12:
+        score += (0.12 - coverage) * 400.0
+    return float(score)
+
+
+def _compute_quality_grade(image_score, holdout_median, cv_mean, qa_params=None):
+    """Compute quality grade A/B/C/D from metrics and thresholds."""
+    from .params import get_params
+    qp = qa_params or get_params().qa
+    score = None if image_score is None else float(image_score)
+    holdout = None if holdout_median is None else float(holdout_median)
+    cv = None if cv_mean is None else float(cv_mean)
+    if holdout is None:
+        return "D"
+    if score is None:
+        if holdout <= qp.grade_a_holdout and (cv is None or cv <= qp.grade_a_holdout):
+            return "A"
+        if holdout <= qp.grade_b_holdout and (cv is None or cv <= qp.grade_b_holdout):
+            return "B"
+        if holdout <= qp.accept_holdout_median_max and (cv is None or cv <= qp.accept_cv_mean_max):
+            return "C"
+        return "D"
+    if score <= qp.grade_a_score and holdout <= qp.grade_a_holdout and (cv is None or cv <= qp.grade_a_holdout):
+        return "A"
+    if score <= qp.grade_b_score and holdout <= qp.grade_b_holdout and (cv is None or cv <= qp.grade_b_holdout):
+        return "B"
+    if score <= qp.accept_image_score_max and holdout <= qp.accept_holdout_median_max and (cv is None or cv <= qp.accept_cv_mean_max):
+        return "C"
+    return "D"
+
+
+def build_candidate_report(candidate_name: str, output_path: str, reference_path: str,
+                           overlap, work_crs, *, holdout_pairs=None, M_geo=None,
+                           coverage: float = 0.0, cv_mean_m: float | None = None,
+                           hypothesis_id: str = "", eval_res: float = 4.0,
+                           image_metrics=None, qa_params=None) -> QaReport:
+    """Compute an independent QA report for a candidate output."""
+    from .params import get_params
+    qp = qa_params or get_params().qa
+
+    if image_metrics is None:
+        image_metrics = evaluate_alignment_quality_paths(
+            output_path, reference_path, overlap, work_crs, eval_res=eval_res,
+        ) or {}
+    holdout_metrics = compute_holdout_affine_metrics(M_geo, holdout_pairs or [])
+    holdout_warp_metrics = compute_holdout_warp_metrics(
+        output_path, reference_path, holdout_pairs or [],
+        work_crs, overlap, eval_res=eval_res,
+    )
+    if holdout_warp_metrics:
+        holdout_metrics["post_warp"] = holdout_warp_metrics
+    effective_holdout = _effective_holdout_metrics(holdout_metrics)
+    total = _total_score(image_metrics, holdout_metrics, coverage, cv_mean_m)
+    confidence = _confidence_from_metrics(image_metrics, holdout_metrics, coverage, cv_mean_m)
+
+    image_score = float(image_metrics["score"]) if image_metrics and "score" in image_metrics else None
+    holdout_median = float(effective_holdout.get("median_m")) if effective_holdout else None
+    geometry_only = not image_metrics or "score" not in image_metrics
+
+    reasons = []
+    accepted = True
+    if not geometry_only and image_score is not None and image_score > qp.accept_image_score_max:
+        accepted = False
+        reasons.append("image_alignment_score_high")
+    if holdout_median is not None and holdout_median > qp.accept_holdout_median_max:
+        accepted = False
+        reasons.append("holdout_residual_high")
+    if cv_mean_m is not None and float(cv_mean_m) > qp.accept_cv_mean_max:
+        accepted = False
+        reasons.append("cross_validation_high")
+    if not geometry_only and coverage < qp.accept_coverage_min:
+        accepted = False
+        reasons.append("gcp_coverage_low")
+    if holdout_warp_metrics and holdout_metrics:
+        affine_mean = float(holdout_metrics.get("mean_m", 0.0))
+        warp_mean = float(holdout_warp_metrics.get("mean_m", 0.0))
+        affine_p90 = float(holdout_metrics.get("p90_m", 0.0))
+        warp_p90 = float(holdout_warp_metrics.get("p90_m", 0.0))
+        if (
+            affine_mean > 0.0 and warp_mean > affine_mean * 1.5
+        ) or (
+            affine_p90 > 0.0 and warp_p90 > affine_p90 * 1.5
+        ):
+            accepted = False
+            reasons.append("post_warp_holdout_regression")
+
+    grade = _compute_quality_grade(image_score, holdout_median, cv_mean_m, qp)
+
+    return QaReport(
+        candidate=candidate_name,
+        output_path=output_path,
+        total_score=total,
+        confidence=confidence,
+        accepted=accepted,
+        image_metrics=image_metrics,
+        holdout_metrics=holdout_metrics,
+        coverage=float(coverage),
+        cv_mean_m=None if cv_mean_m is None else float(cv_mean_m),
+        hypothesis_id=hypothesis_id,
+        reasons=reasons,
+        quality_grade=grade,
+    )
+
+
+def write_qa_report(path: str, reports: list[QaReport], *, selected_candidate: str | None = None,
+                    metadata: dict | None = None):
+    """Persist QA reports to JSON."""
+    payload = {
+        "selected_candidate": selected_candidate,
+        "metadata": metadata or {},
+        "reports": [report.to_dict() for report in reports],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
