@@ -5,6 +5,7 @@ __pycache__/
 *.bak
 .#*
 .claude/
+CLAUDE.md
 session-*.md
 test_results.py
 test_type.py
