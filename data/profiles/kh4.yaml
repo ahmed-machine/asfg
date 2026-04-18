@@ -40,6 +40,16 @@ camera:
   # production default to ``stitched`` on both KH-4 and KH-9 until the
   # per-segment branch closes its benchmark gaps. Opt in to the
   # experimental path with ``ortho_strategy: per_segment_experimental``.
+  #
+  # Phase 11: KH-4 per-segment expansion is deliberately deferred until
+  # KH-9 Bahrain (scene D3C1213-200346A003) passes the phase gates
+  # defined by the recovery plan. Promoting KH-4 before then would
+  # confound failure attribution — Phase 7 already gives KH-4 the
+  # physically-correct native GSD (≈ 1.95 m/px vs KH-9's 0.78 m/px)
+  # via the altitude × pixel_pitch / focal_length computation, but
+  # KH-4-specific bbox_policy / guided_refit_max_iter / focal bounds
+  # should be measured against DA022 / DA025 in an experimental
+  # profile variant once KH-9 is green.
   ortho_strategy: stitched
   # Phase 3 (smooth-vector-field seam reconciliation) — post-hoc TPS half-
   # warp applied to each segment's seam band. KH-4 sub-frames are narrower
