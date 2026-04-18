@@ -218,6 +218,19 @@ class CameraParams:
     # here preserves the current ±30 % / 0.5 % behaviour.
     f_frac_range: Optional[float] = None
     f_prior_frac_sigma: Optional[float] = None
+    # Phase 3d — cross-segment focal-length consistency. After the
+    # main per-segment loop lands independent Stage A/B fits, pick
+    # the lowest-RMS "off-bound" segment's ``f`` as a shared value
+    # and re-fit every other segment with f pinned there. Guards
+    # against the post-Phase-3c failure mode where heterogeneous f
+    # (one segment at the ±_F_FRAC_RANGE bound, others not) produces
+    # orthos at incompatible ground scales and breaks seam QA.
+    # Default True because the refit rejects individually on RMS
+    # regression; net effect is either seam improvement or no-op.
+    shared_f_refit_enabled: bool = True
+    # Per-segment f values within this relative threshold skip the
+    # refit entirely (no heterogeneity problem to fix).
+    shared_f_refit_min_spread_frac: float = 0.02
     # Feature matcher backend used by preprocessing-only correspondence
     # extraction (per-segment rectification and experimental BA .match files).
     preprocess_matcher: str = "roma"
@@ -282,6 +295,8 @@ class CameraParams:
             "preprocess_mte_radius_px": self.preprocess_mte_radius_px,
             "f_frac_range": self.f_frac_range,
             "f_prior_frac_sigma": self.f_prior_frac_sigma,
+            "shared_f_refit_enabled": self.shared_f_refit_enabled,
+            "shared_f_refit_min_spread_frac": self.shared_f_refit_min_spread_frac,
             "panoramic_seam_warp": self.panoramic_seam_warp,
             "panoramic_seam_feather_px": self.panoramic_seam_feather_px,
             "panoramic_seam_tps_smoothing": self.panoramic_seam_tps_smoothing,

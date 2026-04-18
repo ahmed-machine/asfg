@@ -705,6 +705,267 @@ def test_phase3_altitude_gate_accepts_cam_gen_when_agrees_with_tle(tmp_path, mon
     assert telem.get("altitude_tiebreak_candidates") in (None, [])
 
 
+def _phase3d_test_fixture(tmp_path, monkeypatch, seg_f_values,
+                          shared_f_refit_enabled=True,
+                          min_spread_frac=0.02,
+                          refit_f_rms_multiplier=1.0):
+    """Fixture for Phase 3d shared-f tests.
+
+    ``seg_f_values`` — dict {seg_idx: (fitted_f_m, fitted_rms_px)} that
+    the fake fit returns on each segment's ``initial.Zs0``/GCPs. When
+    Phase 3d issues a refit (initial.f = shared_f, fix_f=True in kwargs),
+    the fake returns ``(shared_f, original_rms * refit_f_rms_multiplier)``
+    so tests can control whether the refit is accepted.
+    """
+    import numpy as np
+    import preprocess.camera_model as cm
+    import preprocess.kh_panoramic as kp
+    from osgeo import gdal, osr
+    from pathlib import Path as _P
+    import json
+
+    frames = []
+    for idx in range(3):
+        p = tmp_path / f"TEST_P3D_{idx}.tif"
+        drv = gdal.GetDriverByName("GTiff")
+        ds = drv.Create(str(p), 64, 32, 1, gdal.GDT_Byte)
+        arr = np.zeros((32, 64), dtype=np.uint8)
+        arr[:, 12:52] = 180
+        ds.GetRasterBand(1).WriteArray(arr)
+        ds.FlushCache()
+        ds = None
+        frames.append(str(p))
+
+    def _synthetic_gcps():
+        cols = np.linspace(4, 59, 6)
+        rows = np.linspace(4, 27, 5)
+        cc, rr = np.meshgrid(cols, rows)
+        x = 5600000.0 + cc.ravel() * 8.0
+        y = 3040000.0 - rr.ravel() * 8.0
+        z = np.zeros_like(x)
+        return np.column_stack([cc.ravel(), rr.ravel(), x, y, z]).astype(np.float64)
+
+    _fit_call_count = {"n": 0}
+
+    def fake_fit_panoramic(sub_frame_gcps, initial, *a, **kw):
+        _fit_call_count["n"] += 1
+        # Determine which segment this call is for by looking at the
+        # ground-point centroid of the GCPs (same for each seg in our
+        # fixture — so we thread the segment index through the initial
+        # via a small trick: the fake_mapproject encodes seg_idx into
+        # the initial's Xs0 offset when building. Simpler: match by
+        # initial.f if we already refitted, otherwise use next seg.)
+        #
+        # Here we key on kw.get("fix_f") + initial.f to decide whether
+        # this is a Phase 3d refit or an initial fit. Initial fits have
+        # fix_f=False; Phase 3d refits have fix_f=True and initial.f set
+        # to the shared value.
+        fix_f = bool(kw.get("fix_f", False))
+        initial_f = float(initial.f)
+        if fix_f:
+            # Phase 3d refit: return (shared_f, scaled rms).
+            return type(
+                "FitResult", (),
+                {
+                    "params": initial,
+                    "reprojection_rms_px": _fit_call_count.get(
+                        "last_seg_rms", 10.0
+                    ) * refit_f_rms_multiplier,
+                    "reprojection_rms_m": 10.0 * 7e-6,
+                    "success": True,
+                    "message": "synthetic-refit",
+                },
+            )()
+        # Initial fit: return per-seg f + rms based on which seg is
+        # next in processing order. Heuristic: count preceding calls.
+        # There are 2 calls (Stage A + Stage B) per segment in the
+        # real _fit_segment_staged, so seg_idx = (n-1) // 2.
+        seg_idx = (_fit_call_count["n"] - 1) // 2
+        seg_idx = min(seg_idx, max(seg_f_values.keys()))
+        f_val, rms_val = seg_f_values[seg_idx]
+        _fit_call_count["last_seg_rms"] = rms_val
+        # Build a new params with the target f
+        params = type(initial)(
+            **{k: getattr(initial, k) for k in (
+                "Xs0", "Ys0", "Zs0",
+                "omega0", "phi0", "kappa0",
+                "Xs1", "Ys1", "Zs1",
+                "omega1", "phi1", "kappa1",
+                "P", "f",
+            )}
+        )
+        params.f = float(f_val)
+        return type(
+            "FitResult", (),
+            {
+                "params": params,
+                "reprojection_rms_px": float(rms_val),
+                "reprojection_rms_m": float(rms_val) * 7e-6,
+                "success": True,
+                "message": "synthetic",
+            },
+        )()
+
+    def fake_mapproject(*a, **kw):
+        out = kw["out_path"]
+        seg_idx = int(_P(out).stem.split("_seg", 1)[1][:2])
+        drv = gdal.GetDriverByName("GTiff")
+        ds = drv.Create(out, 64, 32, 1, gdal.GDT_Float32)
+        x_origin = 5600000.0 + seg_idx * (64 - 20) * 3.5
+        ds.SetGeoTransform([x_origin, 3.5, 0, 3040000.0, 0, -3.5])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(3857)
+        ds.SetProjection(srs.ExportToWkt())
+        cols = seg_idx * (64 - 20) + np.arange(64, dtype=np.float32)
+        rows = np.arange(32, dtype=np.float32)[:, None]
+        arr = rows * 4.0 + cols[None, :] * 2.0
+        ds.GetRasterBand(1).WriteArray(arr)
+        ds.GetRasterBand(1).SetNoDataValue(-32768)
+        ds.FlushCache()
+        ds = None
+        return out
+
+    class _FakeAltitudeResult:
+        altitude_m = 170_000.0
+        source = "from_catalog_nominal"
+        tle_epoch_utc = None
+        subpoint_distance_km = None
+
+    monkeypatch.setattr(kp, "extract_reference_gcps",
+                        lambda *a, **kw: _synthetic_gcps())
+    monkeypatch.setattr(kp, "fit_panoramic", fake_fit_panoramic)
+    monkeypatch.setattr(kp, "extract_model_guided_gcps",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "extract_raw_subframe_tie_points",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "raw_tie_points_to_gcps",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "mapproject", fake_mapproject)
+    monkeypatch.setattr(cm, "altitude_m_at",
+                        lambda *a, **kw: _FakeAltitudeResult())
+    monkeypatch.setattr(cm, "catalog_mean_altitude_m",
+                        lambda *a, **kw: None)
+
+    corners = {"NW": (26.3, 50.3), "NE": (26.1, 50.6),
+               "SE": (25.9, 50.6), "SW": (26.1, 50.3)}
+    cam_params = {"focal_length": 1.524, "pixel_pitch": 7e-6,
+                  "scan_time": 0.5, "speed": 7500, "forward_tilt": 0.0,
+                  "scan_dir": "right", "motion_compensation_factor": 1.0,
+                  "shared_f_refit_enabled": bool(shared_f_refit_enabled),
+                  "shared_f_refit_min_spread_frac": float(min_spread_frac),
+                  "f_frac_range": 0.30}
+    reference = write_test_raster(tmp_path / "ref_p3d.tif", crs="EPSG:3857")
+    seg_dir = tmp_path / "segments_p3d"
+
+    cm.opticalbar_per_segment_precorrect(
+        frames, cam_params, corners, str(seg_dir),
+        scene_id="TEST_P3D", is_aft=False,
+        reference_path=str(reference),
+    )
+    telem = json.loads((seg_dir / "per_segment_telemetry.json").read_text())
+    return telem
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3d_shares_best_off_bound_f_across_segments(tmp_path, monkeypatch):
+    """Phase 3d: three segments with f = 1.0668 (bound) / 1.17 / 1.10
+    where 1.17 has the lowest RMS. The off-bound-lowest-RMS wins as the
+    shared f; seg00 (at bound) and seg02 get refitted with f=1.17. The
+    refit rms multiplier is 1.0 so both accept."""
+    telem = _phase3d_test_fixture(
+        tmp_path, monkeypatch,
+        seg_f_values={
+            0: (1.0668, 18.0),   # at ±30% bound
+            1: (1.17, 10.0),     # off-bound, best RMS → source
+            2: (1.10, 15.0),     # off-bound
+        },
+        shared_f_refit_enabled=True,
+        refit_f_rms_multiplier=1.0,
+    )
+    assert telem["phase3d_enabled"] is True
+    assert telem["phase3d_applied"] is True
+    assert telem["phase3d_shared_f_m"] == pytest.approx(1.17, abs=1e-4)
+    assert telem["phase3d_shared_f_source_seg"] == 1
+    refits = telem["phase3d_refit_per_segment"]
+    accepted = {r["seg_idx"]: r for r in refits if r["accepted"]}
+    assert set(accepted.keys()) == {0, 1, 2}, (
+        f"all three should accept (source=1 is no-op-accept, 0/2 refitted); "
+        f"got {sorted(accepted.keys())}"
+    )
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3d_skipped_when_all_agree(tmp_path, monkeypatch):
+    """Phase 3d: when per-segment f values agree within
+    ``shared_f_refit_min_spread_frac`` (default 2%), no refit runs."""
+    telem = _phase3d_test_fixture(
+        tmp_path, monkeypatch,
+        seg_f_values={
+            0: (1.520, 12.0),
+            1: (1.525, 12.5),   # spread = (1.525-1.520)/1.522 = 0.33%
+            2: (1.523, 13.0),
+        },
+        shared_f_refit_enabled=True,
+    )
+    assert telem["phase3d_enabled"] is True
+    assert telem["phase3d_applied"] is False
+    assert telem["phase3d_skipped_reason"] is not None
+    assert "spread" in telem["phase3d_skipped_reason"]
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3d_skipped_when_all_at_bound(tmp_path, monkeypatch):
+    """Phase 3d: when every segment's f sits at a ±30% bound (lower
+    or upper), no off-bound source exists to share. The spread check
+    passes because some segments are at the lower bound and some at
+    the upper bound, but no source can be picked so the phase skips
+    with ``phase3d_skipped_reason = 'all_segments_at_f_bound'``."""
+    telem = _phase3d_test_fixture(
+        tmp_path, monkeypatch,
+        seg_f_values={
+            0: (1.0668, 18.0),   # lower bound (1.524 * 0.70)
+            1: (1.9812, 17.0),   # upper bound (1.524 * 1.30)
+            2: (1.0668, 16.0),   # lower bound
+        },
+        shared_f_refit_enabled=True,
+        min_spread_frac=0.02,
+    )
+    assert telem["phase3d_enabled"] is True
+    assert telem["phase3d_applied"] is False
+    assert telem["phase3d_skipped_reason"] == "all_segments_at_f_bound"
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3d_rejects_refit_on_rms_regression(tmp_path, monkeypatch):
+    """Phase 3d: when the shared-f refit blows up RMS beyond
+    1.5× original, the refit is rejected and the original fit is kept.
+    The source segment always accepts (no-op). The other segments see
+    the inflated refit RMS and reject."""
+    telem = _phase3d_test_fixture(
+        tmp_path, monkeypatch,
+        seg_f_values={
+            0: (1.0668, 18.0),
+            1: (1.17, 10.0),
+            2: (1.10, 15.0),
+        },
+        shared_f_refit_enabled=True,
+        refit_f_rms_multiplier=3.0,   # each refit comes back 3× original RMS
+    )
+    assert telem["phase3d_enabled"] is True
+    refits = telem["phase3d_refit_per_segment"]
+    rejected_non_source = [
+        r for r in refits
+        if not r["accepted"] and r["seg_idx"] != 1
+    ]
+    assert len(rejected_non_source) == 2
+    for r in rejected_non_source:
+        assert "refit_rms" in (r["reject_reason"] or "")
+
+
 @pytest.mark.fast
 @pytest.mark.process
 def test_phase3c_catalog_mean_enters_tiebreak_candidate_list(tmp_path, monkeypatch):

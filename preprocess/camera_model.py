@@ -101,6 +101,16 @@ class _SceneTelemetry:
     # Phase 3b — fit-quality tiebreak candidates (populated only when the
     # tiebreak fired; each entry is a dict of source/alt_m/rms_px).
     altitude_tiebreak_candidates: list = field(default_factory=list)
+    # Phase 3d — cross-segment focal-length consistency refit.
+    phase3d_enabled: bool = False
+    phase3d_applied: bool = False
+    phase3d_shared_f_m: Optional[float] = None
+    phase3d_shared_f_source_seg: Optional[int] = None
+    phase3d_skipped_reason: Optional[str] = None
+    # Per-segment refit telemetry (one dict per segment that was
+    # considered). Each entry: seg_idx, original_f_m, original_rms_px,
+    # refit_f_m, refit_rms_px, accepted (bool), reject_reason.
+    phase3d_refit_per_segment: list = field(default_factory=list)
     # Phase gates:
     phase2_max_iter: int = 0
     phase3_seam_warp_enabled: bool = False
@@ -4070,6 +4080,12 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
     seg_orthos_map: dict = {}
     seg_fit_map: dict = {}
     seg_shape_map: dict = {}
+    # Phase 3d: stash the winning GCPs and sub-frame path per segment so
+    # the cross-segment shared-f refit has everything it needs without
+    # re-extracting. Populated alongside ``seg_fit_map[i] = final_fit``.
+    seg_gcps_map: dict = {}
+    seg_sub_path_map: dict = {}
+    seg_base_corners_map: dict = {}
     failed_segments: list[int] = []
     try:
         matcher_runtime = create_preprocess_matcher_runtime(preprocess_matcher)
@@ -4575,6 +4591,10 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             _save_ortho_corners(final_ortho, base_corners[i], base_corners[i], metadata=meta)
             seg_orthos_map[i] = final_ortho
             seg_fit_map[i] = final_fit
+            # Phase 3d: stash the fit inputs for later cross-segment refit.
+            seg_gcps_map[i] = final_gcps
+            seg_sub_path_map[i] = sub_path
+            seg_base_corners_map[i] = base_corners[i]
             # Record final fit outcome in telemetry.
             try:
                 nominal_f = float(seg_camera_params["focal_length"])
@@ -4623,6 +4643,244 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             f"successful segments"
         )
     active_indices = succeeded
+
+    # ------------------------------------------------------------------
+    # Phase 3d — cross-segment focal-length consistency refit.
+    # ------------------------------------------------------------------
+    # After Phase 3c lands the correct scene-level altitude, individual
+    # segments may still fit to different f values depending on GCP
+    # distribution — one may hit the ±_F_FRAC_RANGE bound while its
+    # neighbours land at physically plausible values. Heterogeneous f
+    # produces orthos at different ground scales; adjacent-ortho seams
+    # then measure huge apparent shifts even when each pose is locally
+    # good. Phase 3d picks the "best" (lowest-RMS, off-bound) segment's
+    # f and refits every other segment with f pinned there. The refit
+    # is accepted per segment only if RMS stays within a multiplier of
+    # the original; rejections keep the original fit unchanged.
+    _PHASE3D_RMS_REGRESSION_MAX = 1.5  # reject refit if RMS > 1.5× original
+    _PHASE3D_F_BOUND_MARGIN_M = 0.005  # exclude fits within this much of bound as "at bound"
+    scene_telem.phase3d_enabled = bool(
+        seg_camera_params.get("shared_f_refit_enabled", True)
+    )
+    if scene_telem.phase3d_enabled and len(active_indices) >= 2:
+        nominal_f = float(seg_camera_params["focal_length"])
+        f_frac_range_val = float(
+            seg_camera_params.get("f_frac_range") or 0.30
+        )
+        f_lo_bound = nominal_f * (1.0 - f_frac_range_val)
+        f_hi_bound = nominal_f * (1.0 + f_frac_range_val)
+
+        # Collect (seg_idx, f, rms, at_bound) for every successful seg.
+        seg_fits: list = []
+        for i in active_indices:
+            fit = seg_fit_map.get(i)
+            if fit is None:
+                continue
+            f_i = float(fit.params.f)
+            rms_i = float(fit.reprojection_rms_px)
+            at_bound = (
+                abs(f_i - f_lo_bound) <= _PHASE3D_F_BOUND_MARGIN_M
+                or abs(f_i - f_hi_bound) <= _PHASE3D_F_BOUND_MARGIN_M
+            )
+            seg_fits.append((i, f_i, rms_i, at_bound))
+
+        f_values = [s[1] for s in seg_fits]
+        if not f_values:
+            scene_telem.phase3d_skipped_reason = "no_usable_fits"
+        else:
+            f_min = min(f_values)
+            f_max = max(f_values)
+            f_mean = sum(f_values) / len(f_values)
+            spread_frac = (
+                (f_max - f_min) / f_mean if f_mean > 0 else 0.0
+            )
+            min_spread = float(
+                seg_camera_params.get("shared_f_refit_min_spread_frac", 0.02)
+            )
+            off_bound = [s for s in seg_fits if not s[3]]
+
+            if spread_frac < min_spread:
+                scene_telem.phase3d_skipped_reason = (
+                    f"spread {spread_frac*100:.2f}% < "
+                    f"threshold {min_spread*100:.2f}%"
+                )
+                print(
+                    f"  [per_segment/phase3d] segments agree on f within "
+                    f"{spread_frac*100:.2f}% — no refit needed"
+                )
+            elif not off_bound:
+                scene_telem.phase3d_skipped_reason = (
+                    "all_segments_at_f_bound"
+                )
+                print(
+                    f"  [per_segment/phase3d] all segments' f values sit at "
+                    f"the ±{f_frac_range_val*100:.0f}% bound — no signal "
+                    f"to share"
+                )
+            else:
+                # Pick the off-bound segment with lowest RMS as the source.
+                source_i, shared_f, source_rms, _ = min(
+                    off_bound, key=lambda s: s[2]
+                )
+                scene_telem.phase3d_shared_f_m = float(shared_f)
+                scene_telem.phase3d_shared_f_source_seg = int(source_i)
+                print(
+                    f"  [per_segment/phase3d] shared f = {shared_f:.4f} m "
+                    f"(from seg{source_i:02d}, RMS {source_rms:.2f}px); "
+                    f"refitting segments whose f differs by > "
+                    f"{min_spread*100:.2f}%"
+                )
+
+                # Refit each segment with fix_f=True at shared_f.
+                accepted_ids: list = []
+                for seg_idx, seg_f, seg_rms, seg_at_bound in seg_fits:
+                    refit_entry = {
+                        "seg_idx": int(seg_idx),
+                        "original_f_m": float(seg_f),
+                        "original_rms_px": float(seg_rms),
+                        "refit_f_m": float(shared_f),
+                        "refit_rms_px": None,
+                        "accepted": False,
+                        "reject_reason": None,
+                    }
+                    if seg_idx == source_i:
+                        refit_entry["accepted"] = True
+                        refit_entry["refit_rms_px"] = float(seg_rms)
+                        refit_entry["reject_reason"] = "source_segment_no_refit"
+                        scene_telem.phase3d_refit_per_segment.append(refit_entry)
+                        continue
+                    gcps = seg_gcps_map.get(seg_idx)
+                    sub_path = seg_sub_path_map.get(seg_idx)
+                    shape = seg_shape_map.get(seg_idx)
+                    if gcps is None or sub_path is None or shape is None:
+                        refit_entry["reject_reason"] = "missing_inputs"
+                        scene_telem.phase3d_refit_per_segment.append(refit_entry)
+                        continue
+                    sf_w_ri, sf_h_ri = shape
+                    original_fit = seg_fit_map[seg_idx]
+                    # Build initial with Zs0 from the original fit (already
+                    # authoritative via Phase 3c) and f pinned to shared.
+                    try:
+                        initial_ri = kh_panoramic.PanoramicParams(
+                            **{k: getattr(original_fit.params, k) for k in (
+                                "Xs0", "Ys0", "Zs0",
+                                "omega0", "phi0", "kappa0",
+                                "Xs1", "Ys1", "Zs1",
+                                "omega1", "phi1", "kappa1",
+                                "P", "f",
+                            )}
+                        )
+                        initial_ri.f = float(shared_f)
+                    except Exception as _exc:
+                        refit_entry["reject_reason"] = f"initial_build_failed:{_exc}"
+                        scene_telem.phase3d_refit_per_segment.append(refit_entry)
+                        continue
+                    # Stage-B-like refit: fix f AND Zs0, leave pose free.
+                    kw_prior_ri = {}
+                    _fprior = seg_camera_params.get("f_prior_frac_sigma")
+                    if _fprior is not None:
+                        kw_prior_ri["f_prior_frac_sigma"] = float(_fprior)
+                    _frange = seg_camera_params.get("f_frac_range")
+                    if _frange is not None:
+                        kw_prior_ri["f_frac_range"] = float(_frange)
+                    try:
+                        refit = kh_panoramic.fit_panoramic(
+                            sub_frame_gcps=gcps,
+                            initial=initial_ri,
+                            pixel_pitch=float(seg_camera_params["pixel_pitch"]),
+                            image_width_px=int(sf_w_ri),
+                            image_height_px=int(sf_h_ri),
+                            nominal_f=float(shared_f),
+                            max_iter=260,
+                            loss="cauchy",
+                            fix_zs0=True,
+                            fix_f=True,
+                            fix_velocities=False,
+                            fix_rates=False,
+                            fix_p=False,
+                            **kw_prior_ri,
+                        )
+                    except Exception as _exc:
+                        refit_entry["reject_reason"] = f"fit_exception:{_exc}"
+                        scene_telem.phase3d_refit_per_segment.append(refit_entry)
+                        continue
+                    if not _fit_is_usable(refit):
+                        refit_entry["reject_reason"] = "refit_unusable"
+                        scene_telem.phase3d_refit_per_segment.append(refit_entry)
+                        continue
+                    refit_rms = float(refit.reprojection_rms_px)
+                    refit_entry["refit_rms_px"] = refit_rms
+                    rms_gate = max(
+                        seg_rms * _PHASE3D_RMS_REGRESSION_MAX,
+                        fit_rms_px_max * 2.0,
+                    )
+                    if refit_rms > rms_gate:
+                        refit_entry["reject_reason"] = (
+                            f"refit_rms_{refit_rms:.2f}_exceeds_gate_"
+                            f"{rms_gate:.2f}"
+                        )
+                        scene_telem.phase3d_refit_per_segment.append(refit_entry)
+                        print(
+                            f"  [per_segment/phase3d] seg{seg_idx:02d} "
+                            f"rejected: RMS {seg_rms:.2f} → {refit_rms:.2f}px "
+                            f"(> {rms_gate:.2f}px gate)"
+                        )
+                        continue
+                    # Accept: re-render the ortho with the refit params.
+                    ortho_path_ri = seg_orthos_map[seg_idx]
+                    final_bbox_ri, predicted_bbox_ri, gcp_bbox_ri = (
+                        _resolve_render_bbox(
+                            bbox_policy=bbox_policy,
+                            gcps=gcps,
+                            fit_params=refit.params,
+                            pixel_pitch=float(seg_camera_params["pixel_pitch"]),
+                            image_width_px=int(sf_w_ri),
+                            image_height_px=int(sf_h_ri),
+                        )
+                    )
+                    new_ortho = _do_mapproject(
+                        refit.params, sub_path, final_bbox_ri,
+                        int(sf_w_ri), int(sf_h_ri), ortho_path_ri,
+                    )
+                    if new_ortho is None:
+                        refit_entry["reject_reason"] = "refit_mapproject_failed"
+                        scene_telem.phase3d_refit_per_segment.append(refit_entry)
+                        continue
+                    seg_fit_map[seg_idx] = refit
+                    refit_entry["accepted"] = True
+                    accepted_ids.append(seg_idx)
+                    # Re-save sidecar so the ortho cache key reflects the new fit.
+                    meta_ri = {
+                        "mode": mode_tag,
+                        "local_crs": local_crs,
+                        "preprocess_matcher": preprocess_matcher,
+                        "matcher_cache_tag": matcher_cache_tag,
+                        "fit_rms_px": refit_rms,
+                        "n_gcps": int(gcps.shape[0]),
+                        "zs0_m": float(refit.params.Zs0),
+                        "altitude_source": scene_telem.altitude_source_used,
+                        "phase3d_shared_f_m": float(shared_f),
+                    }
+                    base_corners_ri = seg_base_corners_map.get(seg_idx)
+                    if base_corners_ri is not None:
+                        _save_ortho_corners(
+                            new_ortho, base_corners_ri, base_corners_ri,
+                            metadata=meta_ri,
+                        )
+                    scene_telem.phase3d_refit_per_segment.append(refit_entry)
+                    print(
+                        f"  [per_segment/phase3d] seg{seg_idx:02d} "
+                        f"refitted: RMS {seg_rms:.2f} → {refit_rms:.2f}px "
+                        f"at shared f={shared_f:.4f}m"
+                    )
+                scene_telem.phase3d_applied = bool(accepted_ids)
+                if accepted_ids:
+                    print(
+                        f"  [per_segment/phase3d] applied shared-f to "
+                        f"segs {accepted_ids} (source=seg{source_i:02d})"
+                    )
+    elif scene_telem.phase3d_enabled:
+        scene_telem.phase3d_skipped_reason = "fewer_than_2_active_segments"
 
     seg_orthos = [seg_orthos_map[i] for i in active_indices]
     seam_reports = _measure_segment_seams(seg_orthos)
