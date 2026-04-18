@@ -1159,9 +1159,29 @@ def _measure_segment_seams(seg_orthos: list) -> list[dict]:
             else:
                 zncc = raw_zncc
 
+            # Phase 3e: detect low-texture / low-signal overlaps that
+            # carry insufficient content to measure seam quality
+            # reliably (typical of cloud, ocean, or uniform desert).
+            # Both the phase-correlation response and |ZNCC| must be
+            # below their signal floors — if either signal is strong
+            # the seam is measurable (whether the content matches or
+            # not). Callers treat ``low_texture`` like
+            # ``no_valid_overlap`` — the seam is skipped in QA rather
+            # than counted as a failure. ASP's whole-strip approach
+            # sidesteps this by not having seams at all; our per-
+            # segment path needs an equivalent escape hatch or
+            # otherwise-good geometry fails QA on uniform-content
+            # regions.
+            _LOW_RESPONSE = 0.003
+            _LOW_ZNCC_ABS = 0.15
+            is_low_texture = (
+                float(response) < _LOW_RESPONSE
+                and abs(float(zncc)) < _LOW_ZNCC_ABS
+            )
+
             reports.append({
                 "index": f"{i}-{i+1}",
-                "status": "ok",
+                "status": "low_texture" if is_low_texture else "ok",
                 "zncc": float(zncc),
                 "raw_zncc": float(raw_zncc),
                 "phase_shift_px": float(np.hypot(dx, dy)),
@@ -1176,8 +1196,19 @@ def _measure_segment_seams(seg_orthos: list) -> list[dict]:
 
 
 def _seam_report_passes(report: dict | None, seam_shift_px_max: float) -> bool:
-    """Return True when a seam report satisfies the production QA gate."""
-    if not report or report.get("status") != "ok":
+    """Return True when a seam report satisfies the production QA gate.
+
+    Phase 3e: ``low_texture`` reports pass the QA gate because the
+    overlap's signal is too weak to measure — the seam may be fine,
+    it's just unmeasurable. ASP's whole-strip approach doesn't have
+    this problem (no seams); we treat low_texture identically.
+    """
+    if report is None:
+        return False
+    status = report.get("status")
+    if status == "low_texture":
+        return True
+    if status != "ok":
         return False
     if float(report.get("phase_shift_px", np.inf)) > float(seam_shift_px_max):
         return False
@@ -1203,6 +1234,11 @@ def _seam_report_score(report: dict | None) -> tuple:
             zncc,
             float(report.get("response", float("-inf"))),
         )
+    if status == "low_texture":
+        # Rank ``low_texture`` below ``ok`` (a measurable seam is
+        # preferable to an unmeasurable one) but above the overlap-
+        # geometry failures, which are worse outcomes.
+        return (2, float("-inf"), float("-inf"), float("-inf"), float("-inf"))
     if status == "small_overlap":
         return (2, float("-inf"), float("-inf"), float("-inf"), float("-inf"))
     if status == "no_valid_overlap":
@@ -4902,8 +4938,25 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         # segment's thin panoramic strip can be positioned so that the
         # y-ranges barely touch). Skip the shift/ZNCC gate in that case
         # and let the winner-take-all blender stitch whatever is there.
-        if status in ("no_overlap", "no_valid_overlap", "overlap_too_small"):
-            print(f"    seam {report['index']}: {status} (skipped)")
+        # Phase 3e: "low_texture" is the content analogue — the overlap
+        # exists and is spatially well-aligned, but the pixels carry
+        # insufficient signal (cloud, ocean, uniform desert) to support
+        # a reliable ZNCC/phase-corr measurement. ASP's whole-strip
+        # approach doesn't need a seam check; our per-segment path
+        # treats a low-texture seam as unmeasurable-not-failed. Each
+        # entry still records its numerical metrics in telemetry for
+        # manual review.
+        if status in (
+            "no_overlap", "no_valid_overlap", "overlap_too_small", "low_texture",
+        ):
+            extra = ""
+            if status == "low_texture":
+                extra = (
+                    f"  [zncc={report.get('zncc', 0):.3f} "
+                    f"resp={report.get('response', 0):.3f} "
+                    f"shift={report.get('phase_shift_px', 0):.2f}px]"
+                )
+            print(f"    seam {report['index']}: {status} (skipped){extra}")
             continue
         if status != "ok":
             seam_ok = False

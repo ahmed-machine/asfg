@@ -705,6 +705,56 @@ def test_phase3_altitude_gate_accepts_cam_gen_when_agrees_with_tle(tmp_path, mon
     assert telem.get("altitude_tiebreak_candidates") in (None, [])
 
 
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3e_low_texture_seam_treated_as_skipped():
+    """Phase 3e: a seam report with low response and low |ZNCC|
+    (cloud/ocean overlap — insufficient signal to measure) gets status
+    'low_texture'. Both the production QA gate (_seam_report_passes)
+    and the ranking helper (_seam_report_score) treat it like a skip
+    (pass / rank above the overlap-geometry failures)."""
+    from preprocess.camera_model import (
+        _seam_report_passes, _seam_report_score,
+    )
+
+    low_tex = {
+        "index": "1-2",
+        "status": "low_texture",
+        "zncc": -0.126,
+        "raw_zncc": -0.125,
+        "phase_shift_px": 0.89,
+        "response": 0.002,
+    }
+    assert _seam_report_passes(low_tex, 80.0) is True
+    score = _seam_report_score(low_tex)
+    assert score[0] == 2  # equal to small_overlap rank, below "ok" rank (3)
+
+    # Comparison: an ``ok`` report with content match wins on score.
+    ok_good = {
+        "index": "0-1",
+        "status": "ok",
+        "zncc": 0.80,
+        "raw_zncc": 0.75,
+        "phase_shift_px": 1.2,
+        "response": 0.04,
+    }
+    assert _seam_report_score(ok_good)[0] == 3
+
+    # And an ``ok`` report with bad metrics should still rank higher
+    # than low_texture in the bucket sense (both get a status bucket,
+    # but only low_texture passes the production gate).
+    ok_bad = {
+        "index": "2-3",
+        "status": "ok",
+        "zncc": -0.05,
+        "raw_zncc": -0.05,
+        "phase_shift_px": 120.0,
+        "response": 0.0001,
+    }
+    assert _seam_report_passes(ok_bad, 80.0) is False
+    assert _seam_report_passes(low_tex, 80.0) is True
+
+
 def _phase3d_test_fixture(tmp_path, monkeypatch, seg_f_values,
                           shared_f_refit_enabled=True,
                           min_spread_frac=0.02,
