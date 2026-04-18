@@ -36,6 +36,11 @@ camera:
   # eccentric (perigee 154 km, apogee 276 km) and the nominal 170 km is
   # wrong for many frames in a pass.
   cam_gen_altitude: true
+  # Orthorectification strategy. Phase 1 of the recovery plan sets the
+  # production default to ``stitched`` on both KH-4 and KH-9 until the
+  # per-segment branch closes its benchmark gaps. Opt in to the
+  # experimental path with ``ortho_strategy: per_segment_experimental``.
+  ortho_strategy: stitched
   # Phase 3 (smooth-vector-field seam reconciliation) — post-hoc TPS half-
   # warp applied to each segment's seam band. KH-4 sub-frames are narrower
   # than KH-9, so use a smaller feather by default.

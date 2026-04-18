@@ -45,13 +45,16 @@ camera:
   # spread is unmeasured in the paper; we assume similar-order drift and
   # let ASP bundle_adjust float focal_length per frame.
   bundle_adjust_solve_intrinsics: true
-  # 2OC §3.1: orthorectify each USGS sub-frame independently with its own
-  # OpticalBar camera model, then blend the results into a single target
-  # mosaic. Avoids leaking per-segment offsets into a single-camera fit.
-  # opticalbar_per_segment_precorrect handles (a) initial per-segment
-  # cam_gen + mapproject, (b) median reference NCC shift (global offset),
-  # and (c) pairwise phase-correlation seam alignment (fixes inter-segment
-  # disagreement from the cam_gen 4-corner fit freedom).
+  # Orthorectification strategy. Phase 1 of the recovery plan defaults
+  # the production path to ``stitched`` (whole-strip cam_gen + mapproject)
+  # because the per-segment branch still shows geometry failures on the
+  # KH-9 Bahrain benchmark (seam 0-1: no valid overlap; seam 1-2 ZNCC:
+  # -0.01). Opt in to the 2OC-style per-segment path by setting
+  # ``ortho_strategy: per_segment_experimental`` in an override file or
+  # at the CLI. The legacy ``per_segment_ortho: true`` flag is still
+  # honoured as a deprecated alias; new configs should use
+  # ``ortho_strategy`` directly.
+  ortho_strategy: stitched
   per_segment_ortho: true
   # Strip-level Zs0 from ASP cam_gen. Runs cam_gen ONCE on the stitched
   # raw strip (paired with the 4 USGS strip corners), parses altitude-

@@ -152,11 +152,20 @@ class CameraParams:
     # re-matching, NOT from the focal length fit — the focal length
     # contribution is not separately ablated in the paper.
     bundle_adjust_solve_intrinsics: bool = False
-    # When True, _maybe_generate_asp_ortho processes each USGS sub-image
-    # (a, b, c, d for KH-4; a..g for KH-9 PC) independently — separate
-    # cam_gen + mapproject per sub-frame, then a gdalbuildvrt mosaic of
-    # the resulting orthos. 2OC §3.1: stitching first leaks per-segment
-    # offsets into the single-camera fit. Default false; gate per profile.
+    # Orthorectification strategy for process.py / _maybe_generate_asp_ortho.
+    #   'stitched'                 — whole-strip cam_gen + mapproject (stable)
+    #   'per_segment_experimental' — 14p-fit per sub-frame then blend
+    # Left as an empty string at the dataclass level so the resolver can
+    # distinguish "user set stitched explicitly" from "nothing set, fall
+    # back to deprecated ``per_segment_ortho`` alias". Profiles that
+    # want the production boundary should set this to 'stitched'
+    # explicitly (see data/profiles/kh{4,9}.yaml, Phase 1 of the plan).
+    ortho_strategy: str = ""
+    # DEPRECATED: pre-Phase-1 flag that implicitly selected per-segment
+    # ortho. Kept as a read-only alias — if True and ``ortho_strategy``
+    # is left at its default, it is interpreted as
+    # 'per_segment_experimental'. Profiles should migrate to the
+    # explicit ``ortho_strategy`` field.
     per_segment_ortho: bool = False
     # Feature matcher backend used by preprocessing-only correspondence
     # extraction (per-segment rectification and experimental BA .match files).
@@ -213,11 +222,17 @@ class CameraParams:
             "panoramic_fit_rms_px_hard_max": self.panoramic_fit_rms_px_hard_max,
             "panoramic_seam_shift_px_max": self.panoramic_seam_shift_px_max,
             "cam_gen_altitude": self.cam_gen_altitude,
+            "ortho_strategy": self.ortho_strategy,
+            "per_segment_ortho": self.per_segment_ortho,
             "panoramic_seam_warp": self.panoramic_seam_warp,
             "panoramic_seam_feather_px": self.panoramic_seam_feather_px,
             "panoramic_seam_tps_smoothing": self.panoramic_seam_tps_smoothing,
             "panoramic_seam_post_warp_rms_m_max": self.panoramic_seam_post_warp_rms_m_max,
         }
+
+    def resolve_ortho_strategy(self) -> str:
+        """Return the effective ortho strategy — see :func:`resolve_ortho_strategy`."""
+        return resolve_ortho_strategy(self)
 
 
 @dataclass
@@ -225,6 +240,46 @@ class MetaParams:
     name: str = "base"
     description: str = ""
     cameras: List[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Ortho strategy resolver (Phase 1 policy, duck-typed for test mocks)
+# ---------------------------------------------------------------------------
+
+_VALID_ORTHO_STRATEGIES = ("stitched", "per_segment_experimental")
+
+
+def resolve_ortho_strategy(camera) -> str:
+    """Phase 1 policy resolver. Works on any object with the right fields.
+
+    Precedence:
+      1. Explicit ``ortho_strategy`` attribute in
+         {``'stitched'``, ``'per_segment_experimental'``}.
+      2. DEPRECATED: ``per_segment_ortho: true`` maps to
+         ``'per_segment_experimental'`` if ``ortho_strategy`` is absent
+         or still at its default ``'stitched'``.
+      3. Otherwise ``'stitched'``.
+
+    Unknown ``ortho_strategy`` values log a warning and fall back to
+    ``'stitched'`` rather than crashing — this is a config policy knob,
+    not a type-safety boundary.
+    """
+    raw = getattr(camera, "ortho_strategy", None)
+    explicit = (str(raw).strip().lower() if raw else "")
+    if explicit == "per_segment_experimental":
+        return "per_segment_experimental"
+    if explicit == "stitched":
+        return "stitched"
+    if explicit and explicit not in _VALID_ORTHO_STRATEGIES:
+        print(
+            f"  [ortho] warning: unknown ortho_strategy={raw!r}; "
+            f"valid values are {_VALID_ORTHO_STRATEGIES}. "
+            f"Falling back to 'stitched'."
+        )
+        return "stitched"
+    if bool(getattr(camera, "per_segment_ortho", False)):
+        return "per_segment_experimental"
+    return "stitched"
 
 
 # ---------------------------------------------------------------------------

@@ -345,16 +345,18 @@ def _maybe_generate_asp_ortho(scene, cache_dir: str, stitched_path: str,
         east=bbox[2] + 0.1, north=bbox[3] + 0.1,
     )
 
-    # 2OC §3.1: per-sub-image processing if the profile asks for it. Each
-    # sub-frame gets its own cam_gen + mapproject, and the resulting
-    # orthos are blended via distance-to-edge tessellation.
-    # opticalbar_per_segment_precorrect handles Pass 1 (initial cam_gen +
-    # mapproject), Pass 2 (median reference NCC shift for global offset),
-    # and Pass 2.5 (pairwise phase-correlation seam alignment to fix the
-    # inter-segment disagreement left over from the 4-corner cam_gen fit).
-    # Falls back to the stitched cam_gen if sub-frames aren't on disk.
+    # 2OC §3.1 per-sub-image processing is gated on the profile's explicit
+    # ``ortho_strategy`` policy field. ``stitched`` (the Phase 1 default)
+    # runs whole-strip cam_gen + mapproject; ``per_segment_experimental``
+    # runs per-sub-frame cam_gen + mapproject + blend. The older
+    # ``per_segment_ortho: true`` boolean is honoured as a deprecated
+    # alias. See ``CameraParams.resolve_ortho_strategy`` for precedence.
+    from align.params import resolve_ortho_strategy as _resolve_ortho_strategy
     profile = load_profile(_profile_name_for_scene(scene))
-    use_per_segment = bool(getattr(profile.camera, "per_segment_ortho", False))
+    ortho_strategy = _resolve_ortho_strategy(profile.camera)
+    use_per_segment = ortho_strategy == "per_segment_experimental"
+    profile_name = getattr(getattr(profile, "meta", None), "name", "?")
+    print(f"  [ortho] strategy={ortho_strategy} (profile={profile_name})")
     if use_per_segment:
         sub_frames = _per_segment_sub_frames(scene, cache_dir)
         if sub_frames and len(sub_frames) > 1:
@@ -715,14 +717,17 @@ def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, referenc
             return False
 
         corners = scene.corners
+        from align.params import resolve_ortho_strategy as _resolve_ortho_strategy
         profile = load_profile(_profile_name_for_scene(scene))
-        use_per_segment = bool(getattr(profile.camera, "per_segment_ortho", False))
+        ortho_strategy = _resolve_ortho_strategy(profile.camera)
+        use_per_segment = ortho_strategy == "per_segment_experimental"
 
-        # --- Fast path (A+B+C): skip stitch/georef for per-segment mode ---
-        # Per-segment ortho uses raw sub-frames directly (not the stitched
-        # image).  Orientation is determined from is_aft_camera() (entity ID
-        # parsing), which is reliable for KH-4/KH-9.  This eliminates the
-        # expensive stitch → orient → georef → verify cascade (~20 min).
+        # --- Fast path: skip stitch/georef only for the experimental
+        # per-segment strategy. Phase 1 of the recovery plan flipped the
+        # default to ``stitched`` so production runs no longer take the
+        # fast-path shortcut (which bypasses orientation detection and
+        # post-georef orientation verification). Explicit experimental
+        # profiles still opt in and keep the fast path.
         if use_per_segment and reference and os.path.exists(reference):
             from preprocess.camera_model import is_aft_camera
             cam_name = (camera.name or "").upper().replace("-", "")
@@ -766,6 +771,7 @@ def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, referenc
             _merge_scene_metadata(
                 cd, scene,
                 preprocess_matcher=selected_matcher,
+                ortho_strategy=ortho_strategy,
                 gcp_corners={k: list(v) for k, v in gcp_corners.items()},
                 georef_path=os.path.abspath(georef_path),
                 asp_ortho_path=os.path.abspath(asp_ortho_path) if asp_ortho_path else None,
@@ -820,6 +826,7 @@ def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, referenc
             _merge_scene_metadata(
                 cd, scene,
                 preprocess_matcher=selected_matcher,
+                ortho_strategy=ortho_strategy,
                 gcp_corners={k: list(v) for k, v in gcp_corners.items()},
                 georef_path=os.path.abspath(georef_path),
                 stitched_path=os.path.abspath(input_for_orient),
