@@ -161,6 +161,30 @@ def test_forward_project_east_ground_point_projects_east_on_film():
     assert abs(float(yp_mod.item())) < 1e-4
 
 
+def test_phase9_bounds_respect_f_frac_range_override():
+    """Phase 9: tightening ``f_frac_range`` via the new kwarg must
+    narrow the focal-length bound around ``nominal_f``. Exercises the
+    profile-driven override without running a full fit."""
+    params = PanoramicParams(
+        Xs0=5_600_000.0, Ys0=3_040_000.0, Zs0=170_000.0,
+        omega0=0.0, phi0=0.0, kappa0=0.0,
+        Xs1=0.0, Ys1=0.0, Zs1=0.0,
+        omega1=0.0, phi1=0.0, kappa1=0.0,
+        P=0.0, f=1.524,
+    )
+    # Default (None) → legacy ±30 %.
+    lo_default, hi_default = params.bounds(nominal_f=1.524)
+    assert hi_default[13] == pytest.approx(1.524 * 1.30, rel=1e-9)
+    assert lo_default[13] == pytest.approx(1.524 * 0.70, rel=1e-9)
+    # Tightened to ±5 %.
+    lo_tight, hi_tight = params.bounds(nominal_f=1.524, f_frac_range=0.05)
+    assert hi_tight[13] == pytest.approx(1.524 * 1.05, rel=1e-9)
+    assert lo_tight[13] == pytest.approx(1.524 * 0.95, rel=1e-9)
+    # The rest of the 14-vec is unaffected — only the f bound moves.
+    assert np.allclose(lo_default[:13], lo_tight[:13])
+    assert np.allclose(hi_default[:13], hi_tight[:13])
+
+
 def test_fit_recovers_kh4b_geometry_phase2_sanity():
     """Phase 2 sanity check: the 14-parameter fit must reproduce KH-4B
     geometry on noise-free synthetic GCPs.

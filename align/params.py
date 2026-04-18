@@ -207,6 +207,17 @@ class CameraParams:
     # Bahrain once Phase 3/4/5 have raised the noise floor.
     preprocess_mte_enabled: bool = False
     preprocess_mte_radius_px: float = 500.0
+    # Phase 9 — focal-length policy. Promoted from the
+    # ``_F_FRAC_RANGE`` / ``_PRIOR_F_FRAC_SIGMA`` module constants
+    # in ``preprocess/kh_panoramic.py`` so engineers can stage-
+    # tighten (±30 % → ±5 % → ±2 %) from the profile surface.
+    # Staged tightening is done OFFLINE on a frozen benchmark; the
+    # recovery-plan order is Phase 3 altitude → Phase 4 bbox →
+    # Phase 5 guided-refit first, because tightening f before those
+    # fixes land just rejects otherwise-valid fits. Leaving None
+    # here preserves the current ±30 % / 0.5 % behaviour.
+    f_frac_range: Optional[float] = None
+    f_prior_frac_sigma: Optional[float] = None
     # Feature matcher backend used by preprocessing-only correspondence
     # extraction (per-segment rectification and experimental BA .match files).
     preprocess_matcher: str = "roma"
@@ -269,6 +280,8 @@ class CameraParams:
             "guided_refit_f_guard_m": self.guided_refit_f_guard_m,
             "preprocess_mte_enabled": self.preprocess_mte_enabled,
             "preprocess_mte_radius_px": self.preprocess_mte_radius_px,
+            "f_frac_range": self.f_frac_range,
+            "f_prior_frac_sigma": self.f_prior_frac_sigma,
             "panoramic_seam_warp": self.panoramic_seam_warp,
             "panoramic_seam_feather_px": self.panoramic_seam_feather_px,
             "panoramic_seam_tps_smoothing": self.panoramic_seam_tps_smoothing,

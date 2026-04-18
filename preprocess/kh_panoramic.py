@@ -182,15 +182,22 @@ class PanoramicParams:
     def bounds(
         self,
         nominal_f: Optional[float] = None,
+        f_frac_range: Optional[float] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return (lower, upper) bounds arrays for scipy.optimize.least_squares.
 
         Centred on the current values with the per-parameter ranges at
         module top. ``nominal_f`` lets the caller anchor the focal-length
         bounds on the profile's nominal rather than the (possibly drifted)
-        current value.
+        current value. ``f_frac_range`` overrides the default
+        ``_F_FRAC_RANGE`` so engineers can stage-tighten per Phase 9
+        of the recovery plan (±30 % → ±5 % → ±2 %) without editing
+        this module.
         """
         f_nom = nominal_f if nominal_f is not None else self.f
+        f_range = (
+            float(f_frac_range) if f_frac_range is not None else _F_FRAC_RANGE
+        )
         omega_range = math.radians(_OMEGA_RANGE_DEG)
         phi_kappa_range = math.radians(_PHI_KAPPA_RANGE_DEG)
         rate_range = math.radians(_RATE_RANGE_DEG)
@@ -208,7 +215,7 @@ class PanoramicParams:
             -rate_range,
             -rate_range,
             -_P_RANGE,
-            f_nom * (1.0 - _F_FRAC_RANGE),
+            f_nom * (1.0 - f_range),
         ], dtype=np.float64)
         hi = np.array([
             self.Xs0 + _XY_S0_RANGE_M,
@@ -224,7 +231,7 @@ class PanoramicParams:
             +rate_range,
             +rate_range,
             +_P_RANGE,
-            f_nom * (1.0 + _F_FRAC_RANGE),
+            f_nom * (1.0 + f_range),
         ], dtype=np.float64)
         return lo, hi
 
@@ -676,6 +683,8 @@ def fit_panoramic(
     fix_rates: bool = False,
     fix_p: bool = False,
     zs0_prior_sigma_m: Optional[float] = None,
+    f_frac_range: Optional[float] = None,
+    f_prior_frac_sigma: Optional[float] = None,
 ) -> FitResult:
     """Levenberg–Marquardt fit of the 14 parameters to a list of GCPs.
 
@@ -807,6 +816,10 @@ def fit_panoramic(
         float(zs0_prior_sigma_m) if zs0_prior_sigma_m is not None
         else _PRIOR_Z_S0_SIGMA_M
     )
+    f_prior_frac = (
+        float(f_prior_frac_sigma) if f_prior_frac_sigma is not None
+        else _PRIOR_F_FRAC_SIGMA
+    )
     full_prior_inv_sigma = np.array([
         two_px_m / _PRIOR_XY_S0_SIGMA_M,
         two_px_m / _PRIOR_XY_S0_SIGMA_M,
@@ -821,7 +834,7 @@ def fit_panoramic(
         two_px_m / _PRIOR_RATE_SIGMA_RAD,
         two_px_m / _PRIOR_RATE_SIGMA_RAD,
         two_px_m / _PRIOR_P_SIGMA,
-        two_px_m / (_PRIOR_F_FRAC_SIGMA * f_nom_val),
+        two_px_m / (f_prior_frac * f_nom_val),
     ], dtype=np.float64)
 
     # Build free-index list: drop requested fixed indices.
@@ -896,7 +909,9 @@ def fit_panoramic(
 
     # Build initial free-param vector, bounds, x_scale
     p0_full = initial.to_tensor(device).detach().cpu().numpy()
-    lo_full, hi_full = initial.bounds(nominal_f=nominal_f)
+    lo_full, hi_full = initial.bounds(
+        nominal_f=nominal_f, f_frac_range=f_frac_range,
+    )
     p0 = p0_full[free_indices_arr]
     lo = lo_full[free_indices_arr]
     hi = hi_full[free_indices_arr]

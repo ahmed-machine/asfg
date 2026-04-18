@@ -3117,6 +3117,13 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         """
         kw_prior = ({"zs0_prior_sigma_m": float(zs0_prior_sigma_m)}
                     if zs0_prior_sigma_m is not None else {})
+        # Phase 9.1: forward the focal-length policy knobs when set.
+        _f_frac_range = seg_camera_params.get("f_frac_range")
+        if _f_frac_range is not None:
+            kw_prior["f_frac_range"] = float(_f_frac_range)
+        _f_prior_frac = seg_camera_params.get("f_prior_frac_sigma")
+        if _f_prior_frac is not None:
+            kw_prior["f_prior_frac_sigma"] = float(_f_prior_frac)
         stage_a = kh_panoramic.fit_panoramic(
             sub_frame_gcps=gcps,
             initial=initial,
