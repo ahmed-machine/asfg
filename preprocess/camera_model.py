@@ -3034,6 +3034,12 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         seg_camera_params["scan_time"] = nominal_scan_time / n
     bbox_policy = _resolve_bbox_policy(seg_camera_params.get("bbox_policy"))
     print(f"  [per_segment/bbox] policy={bbox_policy}")
+    # Record Phase 10 opt-in as soon as the profile is read so fallback
+    # exits before the Phase 3 TPS block still report the request
+    # accurately in telemetry.
+    scene_telem.phase3_seam_warp_enabled = bool(
+        seg_camera_params.get("panoramic_seam_warp", False)
+    )
 
     # --- 2OC-style staged 14-parameter fit in local UTM ---
     try:
