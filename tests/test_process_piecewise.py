@@ -267,6 +267,181 @@ def test_per_segment_precorrect_reverses_and_rotates_aft_frames(tmp_path, monkey
     assert "seg02_rot180" in observed_paths[2]
 
 
+def _phase3_altitude_test_fixture(tmp_path, monkeypatch, cam_gen_altitude_m,
+                                  tle_altitude_m):
+    """Shared setup for the Phase 3 altitude-gate tests.
+
+    Builds 3 minimal sub-frames, mocks the heavy helpers, and installs a
+    mock ``altitude_m_at`` / ``cam_gen_opticalbar_per_subframe`` pair so
+    the test can control both candidates that feed the resolver.
+
+    Returns (out_path, telemetry_dict).
+    """
+    import json
+    import numpy as np
+    import preprocess.camera_model as cm
+    import preprocess.kh_panoramic as kp
+    import preprocess.mission_altitude as ma
+    from osgeo import gdal, osr
+    from pathlib import Path as _P
+
+    frames = []
+    for idx in range(3):
+        p = tmp_path / f"TEST_ALT_{idx}.tif"
+        drv = gdal.GetDriverByName("GTiff")
+        ds = drv.Create(str(p), 64, 32, 1, gdal.GDT_Byte)
+        arr = np.zeros((32, 64), dtype=np.uint8)
+        arr[:, 12:52] = 180
+        ds.GetRasterBand(1).WriteArray(arr)
+        ds.FlushCache()
+        ds = None
+        frames.append(str(p))
+
+    def _synthetic_gcps():
+        cols = np.linspace(4, 59, 6)
+        rows = np.linspace(4, 27, 5)
+        cc, rr = np.meshgrid(cols, rows)
+        x = 5600000.0 + cc.ravel() * 8.0
+        y = 3040000.0 - rr.ravel() * 8.0
+        z = np.zeros_like(x)
+        return np.column_stack([cc.ravel(), rr.ravel(), x, y, z]).astype(np.float64)
+
+    def fake_fit_panoramic(sub_frame_gcps, initial, *a, **kw):
+        return type(
+            "FitResult", (),
+            {"params": initial, "reprojection_rms_px": 1.0, "success": True},
+        )()
+
+    def fake_mapproject(*a, **kw):
+        out = kw["out_path"]
+        seg_idx = int(_P(out).stem.split("_seg", 1)[1][:2])
+        drv = gdal.GetDriverByName("GTiff")
+        ds = drv.Create(out, 64, 32, 1, gdal.GDT_Float32)
+        x_origin = 5600000.0 + seg_idx * (64 - 20) * 3.5
+        ds.SetGeoTransform([x_origin, 3.5, 0, 3040000.0, 0, -3.5])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(3857)
+        ds.SetProjection(srs.ExportToWkt())
+        cols = seg_idx * (64 - 20) + np.arange(64, dtype=np.float32)
+        rows = np.arange(32, dtype=np.float32)[:, None]
+        arr = rows * 4.0 + cols[None, :] * 2.0
+        ds.GetRasterBand(1).WriteArray(arr)
+        ds.GetRasterBand(1).SetNoDataValue(-32768)
+        ds.FlushCache()
+        ds = None
+        return out
+
+    def fake_cam_gen(*a, **kw):
+        # cam_gen must write something to output_tsai to not look broken
+        # downstream. The callers only consult the returned dict.
+        return {
+            "altitude_m": float(cam_gen_altitude_m),
+            "focal_length": 1.524,
+            "lat_rad": 0.458,
+            "lon_rad": 0.881,
+            "iC": [0.0, 0.0, 0.0],
+        }
+
+    class _FakeAltitudeResult:
+        def __init__(self, alt_m):
+            self.altitude_m = float(alt_m)
+            self.source = "from_tle_at_closest_pass"
+            self.tle_epoch_utc = "1977-08-27T00:00:00Z"
+            self.subpoint_distance_km = 12.3
+
+    def fake_altitude_m_at(*a, **kw):
+        return _FakeAltitudeResult(tle_altitude_m)
+
+    monkeypatch.setattr(kp, "extract_reference_gcps",
+                        lambda *a, **kw: _synthetic_gcps())
+    monkeypatch.setattr(kp, "fit_panoramic", fake_fit_panoramic)
+    monkeypatch.setattr(kp, "extract_model_guided_gcps",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "extract_raw_subframe_tie_points",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "raw_tie_points_to_gcps",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "mapproject", fake_mapproject)
+    monkeypatch.setattr(cm, "cam_gen_opticalbar_per_subframe", fake_cam_gen)
+    monkeypatch.setattr(cm, "altitude_m_at", fake_altitude_m_at)
+
+    corners = {"NW": (26.3, 50.3), "NE": (26.1, 50.6),
+               "SE": (25.9, 50.6), "SW": (26.1, 50.3)}
+    cam_params = {"focal_length": 1.524, "pixel_pitch": 7e-6,
+                  "scan_time": 0.5, "speed": 7500, "forward_tilt": 0.0,
+                  "scan_dir": "right", "motion_compensation_factor": 1.0,
+                  "cam_gen_altitude": True}
+    reference = write_test_raster(tmp_path / "ref_alt.tif", crs="EPSG:3857")
+    seg_dir = tmp_path / "segments_alt"
+
+    out = cm.opticalbar_per_segment_precorrect(
+        frames, cam_params, corners, str(seg_dir),
+        scene_id="D3C1213-200346A003",  # real scene_id so parse_entity_id works
+        is_aft=True,
+        reference_path=str(reference),
+        acq_date=__import__("datetime").date(1977, 8, 27),
+    )
+
+    telem_path = seg_dir / "per_segment_telemetry.json"
+    with open(telem_path) as fh:
+        telem = json.load(fh)
+    return out, telem
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3_altitude_gate_rejects_cam_gen_when_tle_disagrees(tmp_path, monkeypatch):
+    """Phase 3: cam_gen returning 147.8 km while TLE reports 165.3 km
+    (the observed Bahrain delta) must be rejected. The fit should fall
+    back to TLE altitude, and the telemetry sidecar must record the
+    decision so post-hoc diffs are attributable."""
+    out, telem = _phase3_altitude_test_fixture(
+        tmp_path, monkeypatch,
+        cam_gen_altitude_m=147_800.0,
+        tle_altitude_m=165_300.0,
+    )
+    assert telem["strip_cam_gen_altitude_m"] == pytest.approx(147_800.0)
+    assert telem["strip_tle_altitude_m"] == pytest.approx(165_300.0)
+    assert telem["cam_gen_altitude_delta_km"] == pytest.approx(-17.5, abs=0.01)
+    assert telem["cam_gen_altitude_status"] == "rejected_tle_disagreement", (
+        f"cam_gen at 17 km below TLE must be rejected; got "
+        f"{telem['cam_gen_altitude_status']}"
+    )
+    assert telem["altitude_source_used"] == "tle"
+    assert telem["altitude_used_m"] == pytest.approx(165_300.0)
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3_altitude_gate_accepts_cam_gen_when_agrees_with_tle(tmp_path, monkeypatch):
+    """Phase 3 hygiene: when cam_gen agrees with TLE within the 5 km
+    tolerance, the resolver keeps cam_gen's refined value. Prevents
+    the gate from becoming a universal 'ignore cam_gen' switch."""
+    out, telem = _phase3_altitude_test_fixture(
+        tmp_path, monkeypatch,
+        cam_gen_altitude_m=168_000.0,
+        tle_altitude_m=165_300.0,
+    )
+    assert telem["cam_gen_altitude_status"] == "used"
+    assert telem["altitude_source_used"] == "cam_gen"
+    assert telem["altitude_used_m"] == pytest.approx(168_000.0)
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3_altitude_gate_rejects_cam_gen_out_of_range(tmp_path, monkeypatch):
+    """Phase 3: cam_gen returning a physically impossible altitude
+    (the 51 km artefact from the pre-fix path) still rejects even
+    without TLE comparison. The out-of-range branch takes precedence."""
+    out, telem = _phase3_altitude_test_fixture(
+        tmp_path, monkeypatch,
+        cam_gen_altitude_m=51_000.0,
+        tle_altitude_m=165_300.0,
+    )
+    assert telem["cam_gen_altitude_status"] == "rejected_out_of_range"
+    assert telem["altitude_source_used"] == "tle"
+
+
 @pytest.mark.fast
 @pytest.mark.process
 def test_per_segment_precorrect_falls_back_when_seam_qa_fails(tmp_path, monkeypatch):
