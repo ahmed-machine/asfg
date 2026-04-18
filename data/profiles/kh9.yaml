@@ -53,13 +53,24 @@ camera:
   # and (c) pairwise phase-correlation seam alignment (fixes inter-segment
   # disagreement from the cam_gen 4-corner fit freedom).
   per_segment_ortho: true
-  # Per-sub-frame Zs0 from ASP cam_gen. Runs cam_gen on each sub-frame's
-  # interpolated corners, parses the refined ECEF iC, and feeds
-  # altitude-above-ellipsoid into the 14-parameter LM fit as a fixed Zs0.
-  # Eliminates the f/Zs0 gauge-freedom basin that collapsed f to the lower
-  # bound on Bahrain KH-9 D3C1213 seg00 (see
-  # memory/per_segment_phase1_2_3_findings.md). When true, the per-
-  # segment loop also passes fix_f=True into Stage A/B.
+  # Strip-level Zs0 from ASP cam_gen. Runs cam_gen ONCE on the stitched
+  # raw strip (paired with the 4 USGS strip corners), parses altitude-
+  # above-ellipsoid from the refined ECEF camera centre, and uses that
+  # single value as the Zs0 seed for every sub-frame's 14-parameter LM
+  # fit via fix_zs0=True. Breaks the f/Zs0 gauge-freedom basin that
+  # otherwise collapses f to the ±30 % lower bound on narrow-row GCPs.
+  #
+  # Note: fix_f is NOT toggled by this flag. The Stage A/B call sites in
+  # preprocess/camera_model.py pass fix_f=False unconditionally because
+  # narrow-row KH-9 PC GCPs (typical coverage ~2 km out of 20 km sub-
+  # frame) create an 18 % along/cross-track ground-scale asymmetry that
+  # only a free f can absorb (see memory/fix_f_convergence_fix.md and
+  # memory/kh_panoramic_14param_findings.md §2).
+  #
+  # cam_gen is seeded with a TLE-propagated altitude when available. If
+  # cam_gen's refined result falls outside [140, 280] km it is rejected
+  # and the fit falls back to TLE. Phase 3 of the recovery plan will
+  # tighten this gate; today the only check is the range clamp.
   cam_gen_altitude: true
   # Phase 3 (smooth-vector-field seam reconciliation) — post-hoc TPS half-
   # warp applied to each segment's seam band. feather_px controls how far

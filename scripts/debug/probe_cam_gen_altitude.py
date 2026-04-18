@@ -60,6 +60,11 @@ def main() -> int:
                     help="Profile name (kh9 or kh4; default kh9)")
     ap.add_argument("--dem", default=None,
                     help="DEM path (defaults to output/dem.tif if present)")
+    ap.add_argument("--allow-no-dem", action="store_true",
+                    help="Proceed without a DEM. DEFAULT IS TO REFUSE: cam_gen "
+                         "altitude without --refine-camera is unreliable and "
+                         "can return unphysical values (e.g. 51 km) that look "
+                         "like valid 4-corner fits. Only use for exploration.")
     args = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -126,8 +131,24 @@ def main() -> int:
                 break
     if dem:
         print(f"Using DEM: {dem}")
+    elif args.allow_no_dem:
+        print(
+            "WARNING: no DEM supplied and --allow-no-dem set. "
+            "cam_gen runs without --refine-camera; altitude is unreliable "
+            "and results should be labelled invalid_for_comparison.",
+            file=sys.stderr,
+        )
     else:
-        print("No DEM — cam_gen will not use --refine-camera")
+        print(
+            "ERROR: no DEM found (tried --dem, output/dem.tif, output/dem.vrt). "
+            "cam_gen without a DEM cannot refine altitude and has been observed "
+            "to return 51 km altitudes on Bahrain that look like valid 4-corner "
+            "fits but poison downstream per-segment fits. "
+            "Pass --allow-no-dem to bypass this check (results will be printed "
+            "with an invalid_for_comparison marker).",
+            file=sys.stderr,
+        )
+        return 2
 
     # cam_gen needs the image whose 4 corners match the supplied
     # --lon-lat-values. That's the STITCHED frame, not a sub-frame —
@@ -169,6 +190,8 @@ def main() -> int:
     print(f"lat/lon    = {lat_deg:.3f}, {lon_deg:.3f}")
     in_orbit = 140_000 <= info["altitude_m"] <= 280_000
     print(f"sanity     = {'OK (in KH orbit range)' if in_orbit else 'REJECT (outside 140–280 km)'}")
+    if not dem:
+        print("status     = invalid_for_comparison (ran without DEM)")
     return 0
 
 

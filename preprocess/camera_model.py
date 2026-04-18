@@ -13,6 +13,9 @@ import subprocess
 import tempfile
 import hashlib
 import json
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Optional
 
 import numpy as np
 
@@ -22,6 +25,109 @@ from .mission_altitude import (
     altitude_m_at,
     parse_entity_id,
 )
+
+
+# ---------------------------------------------------------------------------
+# Per-segment telemetry (Phase 0.3)
+# ---------------------------------------------------------------------------
+#
+# A single JSON file (``{scene_id}_segments/per_segment_telemetry.json``) is
+# written at the end of every ``opticalbar_per_segment_precorrect`` call —
+# both success and fallback paths. It captures the decisions the per-segment
+# code took so that post-hoc diff of run A vs run B becomes mechanical.
+#
+# Fields the recovery plan's later phases rely on:
+#   - altitude authority provenance (Phase 3)
+#   - per-segment fitted f + deviation from nominal (Phase 5, Phase 9)
+#   - bbox source (Phase 4)
+#   - coarse GCP count + image-space coverage (Phase 4, Phase 7)
+#   - which seam-regularizer path fired (Phase 6)
+#   - whether §4.4 iterated at all (Phase 5)
+#   - whether Phase 3 TPS warp fired (Phase 10)
+#   - whether the stitched fallback path was taken
+
+
+@dataclass
+class _SegmentTelemetry:
+    seg_idx: int
+    rotated_path: Optional[str] = None
+    cleaned_path: Optional[str] = None
+    coarse_gcp_count: Optional[int] = None
+    coarse_gcp_coverage_px_w: Optional[int] = None
+    coarse_gcp_coverage_px_h: Optional[int] = None
+    stage_ab_rms_px: Optional[float] = None
+    stage_ab_fitted_f_m: Optional[float] = None
+    stage_ab_f_deviation_pct: Optional[float] = None
+    guided_iter_max: int = 0
+    guided_iter_accepted: int = 0
+    final_fit_rms_px: Optional[float] = None
+    final_fitted_f_m: Optional[float] = None
+    final_f_deviation_pct: Optional[float] = None
+    final_gcp_count: Optional[int] = None
+    regularizer_fired: Optional[str] = None   # 'none' | 'ortho_tie' | 'raw_tie'
+    bbox_source: Optional[str] = None         # 'gcp_hull' | 'predicted_union' (post-Phase-4)
+    predicted_bbox: Optional[list] = None
+    gcp_bbox: Optional[list] = None
+    final_bbox: Optional[list] = None
+    ortho_path: Optional[str] = None
+    rejected: bool = False
+    reject_reason: Optional[str] = None
+
+
+@dataclass
+class _SceneTelemetry:
+    scene_id: str
+    started_at_utc: str
+    ortho_strategy: str = "per_segment_experimental"
+    n_subframes_input: int = 0
+    active_indices: list = field(default_factory=list)
+    is_aft: bool = False
+    # Altitude authority provenance:
+    strip_tle_altitude_m: Optional[float] = None
+    strip_tle_source: Optional[str] = None
+    strip_cam_gen_altitude_m: Optional[float] = None
+    cam_gen_altitude_delta_km: Optional[float] = None
+    cam_gen_altitude_status: Optional[str] = None  # 'used' | 'rejected_out_of_range' | 'not_attempted'
+    altitude_source_used: Optional[str] = None     # 'cam_gen' | 'tle' | 'nominal'
+    altitude_used_m: Optional[float] = None
+    # Phase gates:
+    phase2_max_iter: int = 0
+    phase3_seam_warp_enabled: bool = False
+    phase3_seam_warp_fired: bool = False
+    stitched_fallback_triggered: bool = False
+    fallback_reason: Optional[str] = None
+    seam_qa_passed: Optional[bool] = None
+    seam_reports: list = field(default_factory=list)
+    # Per-segment:
+    segments: list = field(default_factory=list)
+    # Final:
+    final_output_path: Optional[str] = None
+    finished_at_utc: Optional[str] = None
+
+
+def _seg_telem(scene_telem: _SceneTelemetry, seg_idx: int) -> _SegmentTelemetry:
+    """Fetch or create the per-segment telemetry record for ``seg_idx``."""
+    for s in scene_telem.segments:
+        if s.seg_idx == seg_idx:
+            return s
+    rec = _SegmentTelemetry(seg_idx=seg_idx)
+    scene_telem.segments.append(rec)
+    return rec
+
+
+def _persist_scene_telemetry(scene_telem: _SceneTelemetry, output_dir: str) -> None:
+    """Write the telemetry JSON under ``output_dir``. Swallows any I/O error."""
+    try:
+        scene_telem.finished_at_utc = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        path = os.path.join(output_dir, "per_segment_telemetry.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(asdict(scene_telem), fh, indent=2, default=str)
+        os.replace(tmp, path)
+    except Exception as exc:  # intentionally broad — telemetry must not break the pipeline
+        print(f"  [per_segment/telemetry] write failed: {exc}")
 
 
 def _find_gdal_tool(name: str) -> str:
@@ -2552,6 +2658,14 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         if len(scene_id) >= 2 and scene_id[-2] == "_" and scene_id[-1].isalpha():
             scene_id = scene_id[:-2]
 
+    # Telemetry record — populated as decisions are taken, persisted on exit.
+    scene_telem = _SceneTelemetry(
+        scene_id=scene_id,
+        started_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        n_subframes_input=n,
+        is_aft=bool(is_aft),
+    )
+
     # Aft cameras: reverse frame order (geographic west first).
     if is_aft:
         sub_frames = list(reversed(sub_frames))
@@ -2584,6 +2698,8 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         if alt_res is not None:
             strip_tle_altitude = float(alt_res.altitude_m)
             strip_tle_source = alt_res.source
+            scene_telem.strip_tle_altitude_m = strip_tle_altitude
+            scene_telem.strip_tle_source = strip_tle_source
             detail = f" (source={alt_res.source}"
             if alt_res.tle_epoch_utc:
                 detail += f", tle_epoch={alt_res.tle_epoch_utc}"
@@ -2643,21 +2759,44 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         )
         if cam_gen_info is not None:
             alt_m = float(cam_gen_info["altitude_m"])
+            scene_telem.strip_cam_gen_altitude_m = alt_m
+            if strip_tle_altitude is not None:
+                scene_telem.cam_gen_altitude_delta_km = (
+                    (alt_m - strip_tle_altitude) / 1000.0
+                )
             if 140_000.0 <= alt_m <= 280_000.0:
                 strip_cam_gen_altitude = alt_m
+                scene_telem.cam_gen_altitude_status = "used"
                 print(
                     f"  [per_segment] cam_gen strip altitude: "
                     f"{alt_m:,.0f} m (will override Zs0 for all sub-frames)"
                 )
             else:
+                scene_telem.cam_gen_altitude_status = "rejected_out_of_range"
                 print(
                     f"  [per_segment] cam_gen altitude {alt_m:,.0f} m outside "
                     f"[140k, 280k] km — ignoring, using NOMINAL_Z_S0"
                 )
         else:
+            scene_telem.cam_gen_altitude_status = "cam_gen_failed"
             print(
                 f"  [per_segment] cam_gen unavailable/failed — using NOMINAL_Z_S0"
             )
+    else:
+        scene_telem.cam_gen_altitude_status = "not_attempted"
+
+    # Record which altitude source will actually be used by the per-segment
+    # fits below. The Stage A/B caller at ``initial.Zs0 = ...`` prefers
+    # cam_gen (if accepted) over TLE; falls through to NOMINAL otherwise.
+    if strip_cam_gen_altitude is not None:
+        scene_telem.altitude_source_used = "cam_gen"
+        scene_telem.altitude_used_m = float(strip_cam_gen_altitude)
+    elif strip_tle_altitude is not None:
+        scene_telem.altitude_source_used = "tle"
+        scene_telem.altitude_used_m = float(strip_tle_altitude)
+    else:
+        scene_telem.altitude_source_used = "nominal"
+        scene_telem.altitude_used_m = float(NOMINAL_ALTITUDE_M)
 
     active_indices = list(range(n))
     if reference_path and os.path.isfile(reference_path):
@@ -2684,6 +2823,10 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 active_indices = filtered
         except Exception as e:
             print(f"  [per_segment] Reference bbox filter skipped: {e}")
+
+    scene_telem.active_indices = list(active_indices)
+    for i in active_indices:
+        _seg_telem(scene_telem, i)
 
     print(f"  [per_segment] Processing {len(active_indices)} sub-frames for {scene_id}"
           f"{' (Aft)' if is_aft else ''}")
@@ -2753,6 +2896,9 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         )
     except ImportError as e:
         print(f"  [per_segment/14p] infra unavailable ({e})")
+        scene_telem.stitched_fallback_triggered = True
+        scene_telem.fallback_reason = f"14p_infra_import_failed: {e}"
+        _persist_scene_telemetry(scene_telem, output_dir)
         return None
 
     base_corners = [dict(c) for c in all_seg_corners]
@@ -3543,6 +3689,9 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     continue
 
             if reference_path is None or not os.path.isfile(reference_path):
+                seg_t = _seg_telem(scene_telem, i)
+                seg_t.rejected = True
+                seg_t.reject_reason = "no_reference_path"
                 failed_segments.append(i)
                 continue
 
@@ -3592,12 +3741,29 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     _save_array_cache(coarse_cache_path, coarse_cache_key, coarse_gcps)
             if coarse_gcps is None or coarse_gcps.shape[0] < 30:
                 print(f"  [per_segment/14p] seg{i:02d}: coarse GCP extraction failed")
+                seg_t = _seg_telem(scene_telem, i)
+                seg_t.coarse_gcp_count = 0 if coarse_gcps is None else int(coarse_gcps.shape[0])
+                seg_t.rejected = True
+                seg_t.reject_reason = "coarse_gcp_extraction_failed"
                 failed_segments.append(i)
                 continue
 
             coverage_ok, coverage = _gcp_coverage_ok(coarse_gcps, sf_w, sf_h)
+            seg_t = _seg_telem(scene_telem, i)
+            seg_t.coarse_gcp_count = int(coarse_gcps.shape[0])
+            # Coverage is measured in the raw sub-frame's pixel grid
+            # (columns 0 = col_px, 1 = row_px per extract_reference_gcps).
+            try:
+                col_px = coarse_gcps[:, 0].astype(float)
+                row_px = coarse_gcps[:, 1].astype(float)
+                seg_t.coarse_gcp_coverage_px_w = int(col_px.max() - col_px.min())
+                seg_t.coarse_gcp_coverage_px_h = int(row_px.max() - row_px.min())
+            except Exception:
+                pass
             if not coverage_ok:
                 print(f"  [per_segment/14p] seg{i:02d}: reject coarse GCP coverage {coverage}")
+                seg_t.rejected = True
+                seg_t.reject_reason = f"coarse_gcp_coverage:{coverage}"
                 failed_segments.append(i)
                 continue
 
@@ -3644,11 +3810,27 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             )
             if not _fit_is_usable(fit_res):
                 print(f"  [per_segment/14p] seg{i:02d}: Stage A/B fit unusable")
+                seg_t.rejected = True
+                seg_t.reject_reason = "stage_ab_fit_unusable"
                 failed_segments.append(i)
                 continue
 
+            # Record Stage A/B fit diagnostics before any §4.4 iteration.
+            try:
+                nominal_f = float(seg_camera_params["focal_length"])
+                fitted_f = float(fit_res.params.f)
+                seg_t.stage_ab_rms_px = float(fit_res.reprojection_rms_px)
+                seg_t.stage_ab_fitted_f_m = fitted_f
+                seg_t.stage_ab_f_deviation_pct = (
+                    100.0 * (fitted_f - nominal_f) / nominal_f
+                )
+            except Exception:
+                pass
+
             bbox = _bbox_from_gcps(coarse_gcps)
             if bbox is None:
+                seg_t.rejected = True
+                seg_t.reject_reason = "bbox_from_coarse_gcps_none"
                 failed_segments.append(i)
                 continue
 
@@ -3668,6 +3850,8 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             # max_iter ≥ 1 is restored, uncomment the guided-GCP branch
             # below so the first iteration has a cached seed.
             _PHASE2_MAX_ITER = 0
+            scene_telem.phase2_max_iter = int(_PHASE2_MAX_ITER)
+            seg_t.guided_iter_max = int(_PHASE2_MAX_ITER)
             first_guided = None
             if _PHASE2_MAX_ITER > 0:
                 guided_cache_key = _hash_cache_payload({
@@ -3740,6 +3924,15 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 tol_px=0.25,
                 prev_ortho_path=prev_ortho_for_gate,
             )
+            # Count an accepted iteration if RMS actually improved vs Stage A/B.
+            try:
+                if final_fit is not fit_res and (
+                    float(final_fit.reprojection_rms_px)
+                    < float(fit_res.reprojection_rms_px) - 1e-6
+                ):
+                    seg_t.guided_iter_accepted = 1
+            except Exception:
+                pass
 
             final_bbox = _bbox_from_gcps(final_gcps)
             final_ortho = _do_mapproject(
@@ -3751,12 +3944,16 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 seg_ortho_path,
             )
             if final_ortho is None:
+                seg_t.rejected = True
+                seg_t.reject_reason = "final_mapproject_failed"
                 failed_segments.append(i)
                 continue
 
             prev_pos = active_indices.index(i) - 1
             if prev_pos >= 0:
                 prev_idx = active_indices[prev_pos]
+                pre_reg_rms = float(final_fit.reprojection_rms_px)
+                pre_reg_n = int(final_gcps.shape[0])
                 final_fit, final_gcps = _maybe_regularize_against_previous(
                     seg_idx=i,
                     prev_idx=prev_idx,
@@ -3767,6 +3964,20 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     gcps=final_gcps,
                     ortho_path=final_ortho,
                 )
+                # Did the regularizer actually swap the fit? We don't
+                # know here whether the ortho-tie or raw-tie path fired,
+                # only that one of them produced a different result. The
+                # helper logs that detail to stdout; telemetry records
+                # the outcome at this granularity for now.
+                if (
+                    final_gcps.shape[0] != pre_reg_n
+                    or abs(float(final_fit.reprojection_rms_px) - pre_reg_rms) > 1e-6
+                ):
+                    seg_t.regularizer_fired = "fired"
+                else:
+                    seg_t.regularizer_fired = "none"
+            else:
+                seg_t.regularizer_fired = "not_applicable"
 
             if final_fit.reprojection_rms_px > fit_rms_px_max:
                 if final_fit.reprojection_rms_px > fit_rms_px_hard_max and not skip_rms_gate:
@@ -3774,6 +3985,11 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                         f"  [per_segment/14p] seg{i:02d}: RMS "
                         f"{final_fit.reprojection_rms_px:.2f}px exceeds hard gate "
                         f"{fit_rms_px_hard_max:.2f}px"
+                    )
+                    seg_t.rejected = True
+                    seg_t.reject_reason = (
+                        f"final_rms_exceeds_hard_gate:"
+                        f"{final_fit.reprojection_rms_px:.2f}>{fit_rms_px_hard_max:.2f}"
                     )
                     failed_segments.append(i)
                     continue
@@ -3803,6 +4019,23 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             _save_ortho_corners(final_ortho, base_corners[i], base_corners[i], metadata=meta)
             seg_orthos_map[i] = final_ortho
             seg_fit_map[i] = final_fit
+            # Record final fit outcome in telemetry.
+            try:
+                nominal_f = float(seg_camera_params["focal_length"])
+                f_final = float(final_fit.params.f)
+                seg_t.final_fit_rms_px = float(final_fit.reprojection_rms_px)
+                seg_t.final_fitted_f_m = f_final
+                seg_t.final_f_deviation_pct = 100.0 * (f_final - nominal_f) / nominal_f
+                seg_t.final_gcp_count = int(final_gcps.shape[0])
+                seg_t.ortho_path = final_ortho
+                seg_t.bbox_source = "gcp_hull"  # will change in Phase 4
+                try:
+                    seg_t.gcp_bbox = [float(v) for v in final_bbox]
+                    seg_t.final_bbox = [float(v) for v in final_bbox]
+                except Exception:
+                    pass
+            except Exception:
+                pass
             seg_shape_map[i] = (sf_w, sf_h)
             if os.path.isfile(stage1_ortho_path):
                 os.remove(stage1_ortho_path)
@@ -3825,6 +4058,11 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
     if not succeeded:
         print(f"  [per_segment] 14p path failed for all active segments "
               f"{failed_segments}; whole-strip fallback")
+        scene_telem.stitched_fallback_triggered = True
+        scene_telem.fallback_reason = (
+            f"all_segments_failed:{sorted(failed_segments)}"
+        )
+        _persist_scene_telemetry(scene_telem, output_dir)
         return None
     if failed_segments:
         print(
@@ -3836,6 +4074,14 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
 
     seg_orthos = [seg_orthos_map[i] for i in active_indices]
     seam_reports = _measure_segment_seams(seg_orthos)
+    # Record seam reports in telemetry for Phase 3/Phase 5 attribution.
+    try:
+        scene_telem.seam_reports = [
+            {k: v for k, v in r.items() if k != "overlap_bounds"}
+            for r in seam_reports
+        ]
+    except Exception:
+        pass
     seam_ok = True
     if seam_reports:
         print("  [per_segment] Seam QA:")
@@ -3860,8 +4106,12 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         )
         if not _seam_report_passes(report, seam_shift_px_max):
             seam_ok = False
+    scene_telem.seam_qa_passed = bool(seam_ok)
     if not seam_ok:
         print(f"  [per_segment] Seam QA failed; whole-strip fallback")
+        scene_telem.stitched_fallback_triggered = True
+        scene_telem.fallback_reason = "seam_qa_failed"
+        _persist_scene_telemetry(scene_telem, output_dir)
         return None
 
     valid_orthos = [o for o in seg_orthos if o]
@@ -3874,6 +4124,7 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
     # disabled until the TPS field / sign convention is diagnosed end-to-
     # end against a synthetic ortho pair.
     _PHASE3_ENABLED = bool(seg_camera_params.get("panoramic_seam_warp", False))
+    scene_telem.phase3_seam_warp_enabled = bool(_PHASE3_ENABLED)
     phase3_matcher_runtime = None
     if _PHASE3_ENABLED:
         try:
@@ -3912,6 +4163,7 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     f"  [phase3/seam] smoothed {len(smoothed)} segments "
                     f"(feather={phase3_feather_px}px, smoothing={phase3_smoothing})"
                 )
+                scene_telem.phase3_seam_warp_fired = True
                 valid_orthos = smoothed
         except Exception as e:
             print(f"  [phase3/seam] smoothing failed ({e}); using unwarped orthos")
@@ -3951,10 +4203,15 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         ok = _blend_segment_mosaic(valid_orthos, tif_path, applied_corners_list)
         if not ok:
             print(f"  [per_segment] Blending failed")
+            scene_telem.stitched_fallback_triggered = True
+            scene_telem.fallback_reason = "blend_segment_mosaic_failed"
+            _persist_scene_telemetry(scene_telem, output_dir)
             return None
 
     if os.path.isfile(tif_path):
         print(f"  [per_segment] Per-segment mosaic written: {tif_path}")
+        scene_telem.final_output_path = tif_path
+        _persist_scene_telemetry(scene_telem, output_dir)
         return tif_path
 
     return None
