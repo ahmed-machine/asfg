@@ -1385,6 +1385,9 @@ def extract_reference_gcps(
     max_matches: int = 5000,
     max_tiles: int = 300,
     ransac_reproj_px: float = 8.0,
+    native_gsd_m: Optional[float] = None,
+    mte_enabled: bool = False,
+    mte_radius_px: float = 500.0,
 ) -> Optional[np.ndarray]:
     """Use RoMa v2 to dense-match a raw sub-frame against a reference ortho.
 
@@ -1437,7 +1440,16 @@ def extract_reference_gcps(
         sf_w_full = src.width
         sf_h_full = src.height
         sf_nd = src.nodata
-        native_gsd = 0.8  # rough estimate for KH-9 PC at native resolution
+        # Phase 7.1: native_gsd is the raw sub-frame's ground sample
+        # distance at its delivery resolution. Caller passes the
+        # physically-correct value derived from the camera model
+        # (altitude × pixel_pitch / focal_length). Fall back to the
+        # legacy 0.8 m/px KH-9 PC estimate only when not supplied
+        # (old code paths; unit tests).
+        native_gsd = (
+            float(native_gsd_m) if native_gsd_m and native_gsd_m > 0.0
+            else 0.8
+        )
         ds_factor = max(1.0, match_res_m / native_gsd)
         sf_w_ds = max(256, int(round(sf_w_full / ds_factor)))
         sf_h_ds = max(256, int(round(sf_h_full / ds_factor)))
@@ -1527,8 +1539,8 @@ def extract_reference_gcps(
         pts_a_full, pts_b_full, conf,
         affine_reproj_px=ransac_reproj_px,
         sampson_enabled=False,
-        mte_enabled=False,
-        mte_radius_px=500.0,
+        mte_enabled=bool(mte_enabled),
+        mte_radius_px=float(mte_radius_px),
         # ≈ 0.75 × affine gate — matches near scan edges have residual structure
         # that a 3 px local-dev threshold drops along with real outliers.
         mte_max_dev_px=max(6.0, ransac_reproj_px * 0.75),

@@ -3972,6 +3972,22 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     f"({coarse_gcps.shape[0]})"
                 )
             else:
+                # Phase 7.1: compute native GSD per-mission from the
+                # same altitude authority chosen above (Phase 3). Keeps
+                # KH-4 / KH-7 / KH-9 PC on mission-appropriate down-
+                # sampling instead of the legacy KH-9-only 0.8 m/px.
+                _pp = float(seg_camera_params["pixel_pitch"])
+                _ff = float(seg_camera_params["focal_length"])
+                _alt = (
+                    float(strip_cam_gen_altitude)
+                    if strip_cam_gen_altitude is not None
+                    else (
+                        float(strip_tle_altitude)
+                        if strip_tle_altitude is not None
+                        else float(NOMINAL_ALTITUDE_M)
+                    )
+                )
+                native_gsd_m = (_alt * _pp / _ff) if _ff > 0 else None
                 coarse_gcps = kh_panoramic.extract_reference_gcps(
                     sub_frame_path=sub_path,
                     reference_ortho_path=reference_path,
@@ -3982,6 +3998,13 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     match_res_m=coarse_match_res_m,
                     search_pad_m=search_pad_m,
                     dem_path=dem_path,
+                    native_gsd_m=native_gsd_m,
+                    mte_enabled=bool(
+                        seg_camera_params.get("preprocess_mte_enabled", False)
+                    ),
+                    mte_radius_px=float(
+                        seg_camera_params.get("preprocess_mte_radius_px", 500.0)
+                    ),
                 )
                 if coarse_gcps is not None and coarse_gcps.shape[0] >= 30:
                     _save_array_cache(coarse_cache_path, coarse_cache_key, coarse_gcps)

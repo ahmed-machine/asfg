@@ -198,6 +198,15 @@ class CameraParams:
     # is rejected if it moves f more than this many metres towards
     # the ±_F_FRAC_RANGE bound compared to the previous accepted pose.
     guided_refit_f_guard_m: float = 0.02
+    # Phase 7.2 — MTE (local-median residual consistency) filter for
+    # the panoramic coarse-GCP extraction. Disabled by default because
+    # cross-modal panoramic-vs-ortho matches carry systematic residual
+    # structure that MTE misclassifies as outliers (memory/
+    # per_segment_phase1_2_3_findings.md observed 60 % rejection rate
+    # with max_dev_px=3). Profile-driven so engineers can A/B it on
+    # Bahrain once Phase 3/4/5 have raised the noise floor.
+    preprocess_mte_enabled: bool = False
+    preprocess_mte_radius_px: float = 500.0
     # Feature matcher backend used by preprocessing-only correspondence
     # extraction (per-segment rectification and experimental BA .match files).
     preprocess_matcher: str = "roma"
@@ -258,6 +267,8 @@ class CameraParams:
             "bbox_policy": self.bbox_policy,
             "guided_refit_max_iter": self.guided_refit_max_iter,
             "guided_refit_f_guard_m": self.guided_refit_f_guard_m,
+            "preprocess_mte_enabled": self.preprocess_mte_enabled,
+            "preprocess_mte_radius_px": self.preprocess_mte_radius_px,
             "panoramic_seam_warp": self.panoramic_seam_warp,
             "panoramic_seam_feather_px": self.panoramic_seam_feather_px,
             "panoramic_seam_tps_smoothing": self.panoramic_seam_tps_smoothing,
