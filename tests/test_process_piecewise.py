@@ -968,11 +968,115 @@ def test_per_segment_precorrect_iterative_refit_stops_when_unimproving(tmp_path,
         reference_path=str(reference),
     )
     assert out is not None
-    # With Phase 2 iterative refit disabled (_PHASE2_MAX_ITER = 0), only
-    # the initial _fit_segment_staged runs — Stage A + Stage B = 2 fit
-    # calls. Re-enabling iteration will bump this to 4 (one re-fit with
-    # coarse + guided GCPs) then more on further iterations.
+    # Default profile has ``guided_refit_max_iter: 0`` (legacy), so
+    # only the initial ``_fit_segment_staged`` runs — Stage A + Stage B
+    # = 2 fit calls. Phase 5 turned the iteration count into a profile
+    # knob; this test exercises the legacy path (see
+    # ``test_phase5_guided_refit_runs_when_profile_enables`` for the
+    # ≥ 2-fit-call case).
     assert fit_calls["count"] == 2
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase5_guided_refit_runs_when_profile_enables(tmp_path, monkeypatch):
+    """Phase 5: setting ``guided_refit_max_iter: 1`` in camera_params
+    must re-enter ``_iterative_guided_refit`` after Stage A/B. On a
+    synthetic scene where each re-fit lowers RMS by 0.5 px, the fit
+    call count goes from 2 (Stage A + B) to at least 4 (Stage A + B
+    + combined coarse/guided refit's Stage A + B). If the loop were
+    ignored we'd still see 2."""
+    import numpy as np
+    import preprocess.camera_model as cm
+    import preprocess.kh_panoramic as kp
+    from osgeo import gdal, osr
+
+    frame = tmp_path / "TEST_PHASE5_0.tif"
+    drv = gdal.GetDriverByName("GTiff")
+    ds = drv.Create(str(frame), 64, 32, 1, gdal.GDT_Byte)
+    arr = np.zeros((32, 64), dtype=np.uint8)
+    arr[:, 8:56] = 180
+    ds.GetRasterBand(1).WriteArray(arr)
+    ds.FlushCache()
+    ds = None
+
+    def _coarse_gcps():
+        cols = np.linspace(4, 59, 6)
+        rows = np.linspace(4, 27, 5)
+        cc, rr = np.meshgrid(cols, rows)
+        x = 5600000.0 + cc.ravel() * 8.0
+        y = 3040000.0 - rr.ravel() * 8.0
+        z = np.zeros_like(x)
+        return np.column_stack([cc.ravel(), rr.ravel(), x, y, z]).astype(np.float64)
+
+    def _guided_gcps():
+        cols = np.linspace(8, 56, 24)
+        rows = np.linspace(6, 26, 24)
+        x = 5600000.0 + cols * 8.0
+        y = 3040000.0 - rows * 8.0
+        z = np.zeros_like(x)
+        return np.column_stack([cols, rows, x, y, z]).astype(np.float64)
+
+    fit_calls = {"count": 0}
+    rms_schedule = [4.0, 4.0, 3.5, 3.5]  # each call returns next value
+
+    def fake_fit_panoramic(sub_frame_gcps, initial, *a, **kw):
+        idx = fit_calls["count"]
+        fit_calls["count"] += 1
+        rms = rms_schedule[min(idx, len(rms_schedule) - 1)]
+        return type(
+            "FitResult", (),
+            {"params": initial, "reprojection_rms_px": rms,
+             "reprojection_rms_m": rms * 7e-6,
+             "success": True, "message": "synthetic"},
+        )()
+
+    def fake_mapproject(*a, **kw):
+        out = kw["out_path"]
+        drv = gdal.GetDriverByName("GTiff")
+        ds = drv.Create(out, 64, 32, 1, gdal.GDT_Float32)
+        ds.SetGeoTransform([5600000.0, 3.5, 0, 3040000.0, 0, -3.5])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(3857)
+        ds.SetProjection(srs.ExportToWkt())
+        arr = np.arange(64, dtype=np.float32)[None, :] + np.arange(32, dtype=np.float32)[:, None]
+        ds.GetRasterBand(1).WriteArray(arr)
+        ds.GetRasterBand(1).SetNoDataValue(-32768)
+        ds.FlushCache()
+        ds = None
+        return out
+
+    monkeypatch.setattr(kp, "extract_reference_gcps",
+                        lambda *a, **kw: _coarse_gcps())
+    monkeypatch.setattr(kp, "fit_panoramic", fake_fit_panoramic)
+    monkeypatch.setattr(kp, "extract_model_guided_gcps",
+                        lambda *a, **kw: _guided_gcps())
+    monkeypatch.setattr(kp, "extract_raw_subframe_tie_points",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "raw_tie_points_to_gcps",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "mapproject", fake_mapproject)
+
+    corners = {"NW": (26.3, 50.3), "NE": (26.1, 50.6),
+               "SE": (25.9, 50.6), "SW": (26.1, 50.3)}
+    cam_params = {"focal_length": 1.524, "pixel_pitch": 7e-6,
+                  "scan_time": 0.5, "speed": 7500, "forward_tilt": 0.0,
+                  "scan_dir": "right", "motion_compensation_factor": 1.0,
+                  "guided_refit_max_iter": 1}
+    reference = write_test_raster(tmp_path / "reference_phase5.tif", crs="EPSG:3857")
+
+    out = cm.opticalbar_per_segment_precorrect(
+        [str(frame)], cam_params, corners,
+        str(tmp_path / "segments_phase5"),
+        scene_id="TEST_PHASE5", is_aft=False,
+        reference_path=str(reference),
+    )
+    assert out is not None
+    # Stage A + Stage B + (at least one guided refit's Stage A + B) = ≥ 4
+    assert fit_calls["count"] >= 4, (
+        f"expected ≥ 4 fit calls with guided_refit_max_iter=1, "
+        f"got {fit_calls['count']}"
+    )
 
 
 @pytest.mark.fast

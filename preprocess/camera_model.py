@@ -3232,6 +3232,7 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         tol_px: float = 0.25,
         prev_ortho_path: str | None = None,
         seam_worsen_px: float = 1.0,
+        f_guard_m: float = 0.02,
     ):
         """2OC §4.4 iterative model-guided refit with seam-aware gate.
 
@@ -3363,9 +3364,39 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             if new_rms > rms_gate:
                 break
 
-            # Seam-aware gate: if we have a previous segment to check
-            # against, verify this iteration doesn't worsen the seam by
-            # more than ``seam_worsen_px``.
+            # Phase 5 focal-drift guard: reject the iteration if its f
+            # landed within ``f_guard_m`` of either ±_F_FRAC_RANGE bound
+            # AND the Stage-A/B pose was safely inside. The intent is to
+            # catch the historical f=1.07 collapse (30 % below nominal,
+            # right on the lower bound) without rejecting small drifts
+            # that the fit finds legitimately useful.
+            try:
+                from preprocess.kh_panoramic import _F_FRAC_RANGE as _F_RANGE
+            except Exception:
+                _F_RANGE = 0.30
+            try:
+                nominal_f = float(seg_camera_params["focal_length"])
+                new_f = float(new_fit.params.f)
+                f_bound_lo = nominal_f * (1.0 - _F_RANGE)
+                f_bound_hi = nominal_f * (1.0 + _F_RANGE)
+                new_margin = min(abs(new_f - f_bound_lo),
+                                 abs(new_f - f_bound_hi))
+                initial_margin = min(
+                    abs(float(initial_fit.params.f) - f_bound_lo),
+                    abs(float(initial_fit.params.f) - f_bound_hi),
+                )
+                if new_margin < f_guard_m < initial_margin:
+                    print(
+                        f"  [per_segment/14p] seg{seg_idx:02d} guided iter "
+                        f"{it} rejected: f={new_f:.4f}m within "
+                        f"{f_guard_m:.3f}m of ±{_F_RANGE*100:.0f}% bound "
+                        f"(Stage A/B was safely at f="
+                        f"{float(initial_fit.params.f):.4f}m)"
+                    )
+                    break
+            except Exception:
+                pass
+
             if prev_ortho_path is not None and np.isfinite(best_seam_px):
                 candidate_bbox = _bbox_from_gcps(combined_gcps)
                 if candidate_bbox is not None:
@@ -4012,22 +4043,17 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 failed_segments.append(i)
                 continue
 
-            # Phase 2 iterative refit disabled (max_iter=0) because the current
-            # acceptance gate (RMS improvement ≥ tol_px) accepts iterations
-            # that reduce overall reprojection RMS at the cost of degrading
-            # per-segment *geometric* accuracy (poses with small per-GCP
-            # residuals but large seam shifts — a 54 px seam regression on
-            # Bahrain seg 0-1 was observed after iteration). Re-enable with a
-            # tighter gate (tol_px≥3.0 + seam-aware acceptance) once the
-            # seam-divergence issue is diagnosed. Stage A/B + Phase 3 TPS
-            # warp is the effective pipeline today.
-            #
-            # When max_iter=0 the guided-GCP extraction is skipped entirely
-            # to save ~5 min / segment (render intermediate ortho + tile-match
-            # the reference). Keep this in sync with the refit helper: if
-            # max_iter ≥ 1 is restored, uncomment the guided-GCP branch
-            # below so the first iteration has a cached seed.
-            _PHASE2_MAX_ITER = 0
+            # Phase 5: 2OC §4.4 model-guided re-matching, profile-driven.
+            # ``guided_refit_max_iter: 0`` (legacy / production default)
+            # skips the loop entirely; ``1+`` re-enters the guided-GCP
+            # extract-and-refit path that many times after Stage A/B.
+            # The acceptance gates inside ``_iterative_guided_refit``
+            # (RMS-not-worsened, seam-not-worsened, f-not-at-bound) are
+            # what make iteration safe to re-enable — they were added
+            # earlier but kept dormant behind ``_PHASE2_MAX_ITER=0``.
+            _PHASE2_MAX_ITER = int(
+                seg_camera_params.get("guided_refit_max_iter", 0) or 0
+            )
             scene_telem.phase2_max_iter = int(_PHASE2_MAX_ITER)
             seg_t.guided_iter_max = int(_PHASE2_MAX_ITER)
             first_guided = None
@@ -4101,6 +4127,9 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 max_iter=_PHASE2_MAX_ITER,
                 tol_px=0.25,
                 prev_ortho_path=prev_ortho_for_gate,
+                f_guard_m=float(
+                    seg_camera_params.get("guided_refit_f_guard_m", 0.02) or 0.02
+                ),
             )
             # Count an accepted iteration if RMS actually improved vs Stage A/B.
             try:

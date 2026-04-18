@@ -182,6 +182,22 @@ class CameraParams:
     # "user set gcp_hull explicitly" from "nothing set, use the
     # experimental default".
     bbox_policy: str = ""
+    # Phase 5 — 2OC §4.4 model-guided re-matching.
+    #   0 = disabled (Stage A/B only; legacy behaviour; default)
+    #   1+ = re-enter _iterative_guided_refit this many times after
+    #       Stage A/B. Each iteration renders an intermediate ortho,
+    #       re-matches against the reference, and re-fits. Accepted
+    #       iterations must pass (a) Stage-A/B RMS × 1.25 soft gate,
+    #       (b) seam-shift-against-previous < tol, and (c) focal-length
+    #       does not move closer to ±_F_FRAC_RANGE bound than before.
+    # The paper reports 30-45 % accuracy gains from this loop; today
+    # it is off-by-default until Phases 3-4 clear enough upstream
+    # noise that iteration converges rather than deepens a bad basin.
+    guided_refit_max_iter: int = 0
+    # Soft tolerance for the Phase 5 focal-drift guard. An iteration
+    # is rejected if it moves f more than this many metres towards
+    # the ±_F_FRAC_RANGE bound compared to the previous accepted pose.
+    guided_refit_f_guard_m: float = 0.02
     # Feature matcher backend used by preprocessing-only correspondence
     # extraction (per-segment rectification and experimental BA .match files).
     preprocess_matcher: str = "roma"
@@ -240,6 +256,8 @@ class CameraParams:
             "ortho_strategy": self.ortho_strategy,
             "per_segment_ortho": self.per_segment_ortho,
             "bbox_policy": self.bbox_policy,
+            "guided_refit_max_iter": self.guided_refit_max_iter,
+            "guided_refit_f_guard_m": self.guided_refit_f_guard_m,
             "panoramic_seam_warp": self.panoramic_seam_warp,
             "panoramic_seam_feather_px": self.panoramic_seam_feather_px,
             "panoramic_seam_tps_smoothing": self.panoramic_seam_tps_smoothing,
