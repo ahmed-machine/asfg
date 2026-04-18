@@ -30,6 +30,13 @@ camera:
   # is empirical evidence that nominal-f models cannot fit the scan
   # geometry on KH-4B. Let ASP bundle_adjust float focal_length per frame.
   bundle_adjust_solve_intrinsics: true
+  # Phase 3c / Phase 9.1: tighten the 14-param fit's focal-length bounds
+  # to the published empirical spread (±2% covers 2OC Table 6 at 1.18%
+  # with margin) and strengthen the L2 prior so the LM fit defaults
+  # near the Petzval nominal (0.6096 m). These are mission-specific and
+  # only apply to KH-4/4A/4B. See ``memory/focal_length_priors.md``.
+  f_frac_range: 0.02
+  f_prior_frac_sigma: 0.003
   # Per-sub-frame Zs0 from ASP cam_gen (see kh9.yaml comment). Default on
   # for KH-4 too; cam_gen does per-frame altitude refinement via DEM
   # intersection, which matters more here because KH-4B orbits were

@@ -387,7 +387,8 @@ def test_phase4_resolve_render_bbox_gcp_hull_mode_skips_forward_project():
 
 
 def _phase3_altitude_test_fixture(tmp_path, monkeypatch, cam_gen_altitude_m,
-                                  tle_altitude_m):
+                                  tle_altitude_m, catalog_mean_m=None,
+                                  fit_rms_override=None):
     """Shared setup for the Phase 3 altitude-gate tests.
 
     Builds 3 minimal sub-frames, mocks the heavy helpers, and installs a
@@ -483,6 +484,12 @@ def _phase3_altitude_test_fixture(tmp_path, monkeypatch, cam_gen_altitude_m,
     monkeypatch.setattr(kp, "mapproject", fake_mapproject)
     monkeypatch.setattr(cm, "cam_gen_opticalbar_per_subframe", fake_cam_gen)
     monkeypatch.setattr(cm, "altitude_m_at", fake_altitude_m_at)
+    # Phase 3c: the catalog-mean altitude is looked up from
+    # ``data/kh_missions.yaml`` via ``catalog_mean_altitude_m``. In
+    # tests we control it explicitly — None means "no catalog_mean
+    # candidate", a float means "return this value in metres".
+    monkeypatch.setattr(cm, "catalog_mean_altitude_m",
+                        lambda *a, **kw: catalog_mean_m)
 
     corners = {"NW": (26.3, 50.3), "NE": (26.1, 50.6),
                "SE": (25.9, 50.6), "SW": (26.1, 50.3)}
@@ -634,6 +641,9 @@ def test_phase3_altitude_tiebreak_prefers_cam_gen_when_it_fits_better(tmp_path, 
     monkeypatch.setattr(cm, "cam_gen_opticalbar_per_subframe", fake_cam_gen)
     monkeypatch.setattr(cm, "altitude_m_at",
                         lambda *a, **kw: _FakeAltitudeResult())
+    # Phase 3b test: restrict to 2 candidates (no catalog_mean).
+    monkeypatch.setattr(cm, "catalog_mean_altitude_m",
+                        lambda *a, **kw: None)
 
     corners = {"NW": (26.3, 50.3), "NE": (26.1, 50.6),
                "SE": (25.9, 50.6), "SW": (26.1, 50.3)}
@@ -693,6 +703,168 @@ def test_phase3_altitude_gate_accepts_cam_gen_when_agrees_with_tle(tmp_path, mon
     assert telem["altitude_source_used"] == "cam_gen"
     assert telem["altitude_used_m"] == pytest.approx(168_000.0)
     assert telem.get("altitude_tiebreak_candidates") in (None, [])
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3c_catalog_mean_enters_tiebreak_candidate_list(tmp_path, monkeypatch):
+    """Phase 3c: when ``catalog_mean_altitude_m`` returns a value that
+    differs from the cam_gen/TLE candidates, the tiebreak includes it
+    as a third candidate. With a fake_fit_panoramic that returns RMS
+    based on altitude, the lowest-RMS candidate wins.
+
+    Setup: cam_gen @ 145 km → RMS 20 (bad); TLE @ 165 km → RMS 18 (ok);
+    catalog_mean @ 200 km → RMS 14 (best). Expected winner:
+    catalog_mean; altitude_source_used = 'catalog_mean'; status
+    'tiebreak_catalog_mean_wins'."""
+    import numpy as np
+    import preprocess.camera_model as cm
+    import preprocess.kh_panoramic as kp
+    from osgeo import gdal, osr
+    from pathlib import Path as _P
+    import json
+
+    frames = []
+    for idx in range(3):
+        p = tmp_path / f"TEST_PHASE3C_{idx}.tif"
+        drv = gdal.GetDriverByName("GTiff")
+        ds = drv.Create(str(p), 64, 32, 1, gdal.GDT_Byte)
+        arr = np.zeros((32, 64), dtype=np.uint8)
+        arr[:, 12:52] = 180
+        ds.GetRasterBand(1).WriteArray(arr)
+        ds.FlushCache()
+        ds = None
+        frames.append(str(p))
+
+    def _synthetic_gcps():
+        cols = np.linspace(4, 59, 6)
+        rows = np.linspace(4, 27, 5)
+        cc, rr = np.meshgrid(cols, rows)
+        x = 5600000.0 + cc.ravel() * 8.0
+        y = 3040000.0 - rr.ravel() * 8.0
+        z = np.zeros_like(x)
+        return np.column_stack([cc.ravel(), rr.ravel(), x, y, z]).astype(np.float64)
+
+    def fake_fit_panoramic(sub_frame_gcps, initial, *a, **kw):
+        # Altitude-dependent RMS: cam_gen @ 145 km → 20; TLE @ 165 → 18;
+        # catalog_mean @ 200 → 14.
+        zs0_km = float(initial.Zs0) / 1000.0
+        if abs(zs0_km - 145.0) < 3.0:
+            rms = 20.0
+        elif abs(zs0_km - 165.0) < 3.0:
+            rms = 18.0
+        elif abs(zs0_km - 200.0) < 3.0:
+            rms = 14.0
+        else:
+            rms = 25.0
+        return type(
+            "FitResult", (),
+            {"params": initial, "reprojection_rms_px": rms,
+             "reprojection_rms_m": rms * 7e-6,
+             "success": True, "message": "synthetic"},
+        )()
+
+    def fake_mapproject(*a, **kw):
+        out = kw["out_path"]
+        seg_idx = int(_P(out).stem.split("_seg", 1)[1][:2])
+        drv = gdal.GetDriverByName("GTiff")
+        ds = drv.Create(out, 64, 32, 1, gdal.GDT_Float32)
+        x_origin = 5600000.0 + seg_idx * (64 - 20) * 3.5
+        ds.SetGeoTransform([x_origin, 3.5, 0, 3040000.0, 0, -3.5])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(3857)
+        ds.SetProjection(srs.ExportToWkt())
+        cols = seg_idx * (64 - 20) + np.arange(64, dtype=np.float32)
+        rows = np.arange(32, dtype=np.float32)[:, None]
+        arr = rows * 4.0 + cols[None, :] * 2.0
+        ds.GetRasterBand(1).WriteArray(arr)
+        ds.GetRasterBand(1).SetNoDataValue(-32768)
+        ds.FlushCache()
+        ds = None
+        return out
+
+    def fake_cam_gen(*a, **kw):
+        return {
+            "altitude_m": 145_000.0,
+            "focal_length": 1.524,
+            "lat_rad": 0.458,
+            "lon_rad": 0.881,
+            "iC": [0.0, 0.0, 0.0],
+        }
+
+    class _FakeAltitudeResult:
+        altitude_m = 165_000.0
+        source = "from_tle_at_closest_pass"
+        tle_epoch_utc = "1977-08-27T00:00:00Z"
+        subpoint_distance_km = 12.3
+
+    monkeypatch.setattr(kp, "extract_reference_gcps",
+                        lambda *a, **kw: _synthetic_gcps())
+    monkeypatch.setattr(kp, "fit_panoramic", fake_fit_panoramic)
+    monkeypatch.setattr(kp, "extract_model_guided_gcps",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "extract_raw_subframe_tie_points",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "raw_tie_points_to_gcps",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "mapproject", fake_mapproject)
+    monkeypatch.setattr(cm, "cam_gen_opticalbar_per_subframe", fake_cam_gen)
+    monkeypatch.setattr(cm, "altitude_m_at",
+                        lambda *a, **kw: _FakeAltitudeResult())
+    monkeypatch.setattr(cm, "catalog_mean_altitude_m",
+                        lambda *a, **kw: 200_000.0)
+
+    corners = {"NW": (26.3, 50.3), "NE": (26.1, 50.6),
+               "SE": (25.9, 50.6), "SW": (26.1, 50.3)}
+    cam_params = {"focal_length": 1.524, "pixel_pitch": 7e-6,
+                  "scan_time": 0.5, "speed": 7500, "forward_tilt": 0.0,
+                  "scan_dir": "right", "motion_compensation_factor": 1.0,
+                  "cam_gen_altitude": True}
+    reference = write_test_raster(tmp_path / "ref_3c.tif", crs="EPSG:3857")
+    seg_dir = tmp_path / "segments_3c"
+
+    cm.opticalbar_per_segment_precorrect(
+        frames, cam_params, corners, str(seg_dir),
+        scene_id="D3C1213-200346A003",
+        is_aft=True, reference_path=str(reference),
+        acq_date=__import__("datetime").date(1977, 8, 27),
+    )
+    telem = json.loads((seg_dir / "per_segment_telemetry.json").read_text())
+
+    assert telem["strip_catalog_mean_altitude_m"] == pytest.approx(200_000.0)
+    assert telem["cam_gen_altitude_status"] == "tiebreak_catalog_mean_wins", (
+        f"catalog_mean @ RMS 14 should beat cam_gen (20) and TLE (18); "
+        f"got {telem['cam_gen_altitude_status']}"
+    )
+    assert telem["altitude_source_used"] == "catalog_mean"
+    assert telem["altitude_used_m"] == pytest.approx(200_000.0)
+    candidates = telem["altitude_tiebreak_candidates"]
+    sources = {c["source"] for c in candidates}
+    assert sources == {"cam_gen", "tle", "catalog_mean"}, (
+        f"expected 3 candidates, got {sources}"
+    )
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3c_catalog_mean_skipped_when_mission_missing(tmp_path, monkeypatch):
+    """Phase 3c: when catalog_mean_altitude_m returns None (non-catalog
+    scene or mission missing), the tiebreak runs with 2 candidates only
+    and falls back to Phase 3b behaviour. Bahrain's 17 km cam_gen/TLE
+    delta still triggers the tiebreak; TLE wins via hysteresis."""
+    out, telem = _phase3_altitude_test_fixture(
+        tmp_path, monkeypatch,
+        cam_gen_altitude_m=147_800.0,
+        tle_altitude_m=165_300.0,
+        catalog_mean_m=None,
+    )
+    assert telem.get("strip_catalog_mean_altitude_m") is None
+    assert telem["cam_gen_altitude_status"] == "tiebreak_tle_wins"
+    candidates = telem["altitude_tiebreak_candidates"]
+    sources = {c["source"] for c in candidates}
+    assert sources == {"cam_gen", "tle"}, (
+        f"catalog_mean absent → only 2 candidates; got {sources}"
+    )
 
 
 @pytest.mark.fast

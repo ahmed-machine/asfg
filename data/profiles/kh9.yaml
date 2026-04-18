@@ -45,6 +45,16 @@ camera:
   # spread is unmeasured in the paper; we assume similar-order drift and
   # let ASP bundle_adjust float focal_length per frame.
   bundle_adjust_solve_intrinsics: true
+  # Phase 3c note: unlike kh4.yaml we DO NOT override ``f_frac_range``
+  # or ``f_prior_frac_sigma`` here. The 2OC 1.18% is a KH-4B Petzval
+  # measurement; Dehecq 2020's ~1.4% is KH-9 MC (a frame camera, not
+  # the panoramic PC). Neither is a KH-9 PC measurement — transferring
+  # an empirical spread across different optical systems is not
+  # supported by physics. Our own Bahrain D3C1213 evidence shows f
+  # fits to 1.164 m (24% below nominal 1.524 m) in its healthy basin,
+  # which is itself proof that ±2-5% bounds would over-constrain
+  # KH-9 PC. Defaults of ±30% / 0.5% prior stay. See
+  # ``memory/focal_length_priors.md``.
   # Orthorectification strategy. Phase 1 of the recovery plan defaults
   # the production path to ``stitched`` (whole-strip cam_gen + mapproject)
   # because the per-segment branch still shows geometry failures on the

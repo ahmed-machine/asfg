@@ -36,6 +36,7 @@ __all__ = [
     "parse_entity_id",
     "load_mission_catalog",
     "altitude_m_at",
+    "catalog_mean_altitude_m",
     "NOMINAL_ALTITUDE_M",
     "Z_S0_MIN_M",
     "Z_S0_MAX_M",
@@ -211,6 +212,47 @@ def _catalog_nominal_altitude_m(
                 return float(km) * 1000.0
             except (TypeError, ValueError):
                 continue
+    return None
+
+
+def catalog_mean_altitude_m(
+    mission_id: str,
+    catalog_path: Optional[str] = None,
+) -> Optional[float]:
+    """Return ``(perigee + apogee) / 2`` for ``mission_id`` in metres.
+
+    Phase 3c tiebreak candidate: when both cam_gen and TLE land in a
+    wrong-altitude basin, catalog mean gives a third candidate grounded
+    in the mission's published orbital extremes rather than in a single
+    orbital pass. Falls through:
+
+        1. mission entry's ``perigee_km`` + ``apogee_km``
+        2. series defaults' ``perigee_km`` + ``apogee_km``
+        3. None (no data)
+
+    Unlike :func:`_catalog_nominal_altitude_m`, this function does NOT
+    consult ``nominal_altitude_km`` — the point of the mean is to have
+    a candidate distinct from the nominal seed and centred in the real
+    orbit's altitude range.
+    """
+    if not mission_id:
+        return None
+    catalog = load_mission_catalog(catalog_path)
+    if not catalog:
+        return None
+    mission_entry = _lookup_mission(catalog, mission_id)
+    series = (mission_entry or {}).get("series")
+    for src in (mission_entry or {}, _series_defaults(catalog, series)):
+        if not isinstance(src, dict):
+            continue
+        per = src.get("perigee_km")
+        apo = src.get("apogee_km")
+        if per is None or apo is None:
+            continue
+        try:
+            return (float(per) + float(apo)) / 2.0 * 1000.0
+        except (TypeError, ValueError):
+            continue
     return None
 
 

@@ -23,6 +23,7 @@ from .asp import find_asp_tool
 from .mission_altitude import (
     NOMINAL_ALTITUDE_M,
     altitude_m_at,
+    catalog_mean_altitude_m,
     parse_entity_id,
 )
 
@@ -87,13 +88,15 @@ class _SceneTelemetry:
     strip_tle_source: Optional[str] = None
     strip_cam_gen_altitude_m: Optional[float] = None
     cam_gen_altitude_delta_km: Optional[float] = None
+    strip_catalog_mean_altitude_m: Optional[float] = None  # Phase 3c
     # One of: 'not_attempted' | 'used' (≤ tight gate, no tiebreak)
     #       | 'rejected_out_of_range' (physical bounds)
     #       | 'rejected_extreme_disagreement' (> reject gate vs TLE)
-    #       | 'tiebreak_cam_gen_wins' | 'tiebreak_tle_wins' (resolver RMS outcome)
+    #       | 'tiebreak_cam_gen_wins' | 'tiebreak_tle_wins'
+    #       | 'tiebreak_catalog_mean_wins' (Phase 3c)
     #       | 'cam_gen_failed'
     cam_gen_altitude_status: Optional[str] = None
-    altitude_source_used: Optional[str] = None     # 'cam_gen' | 'tle' | 'nominal'
+    altitude_source_used: Optional[str] = None     # 'cam_gen' | 'tle' | 'catalog_mean' | 'nominal'
     altitude_used_m: Optional[float] = None
     # Phase 3b — fit-quality tiebreak candidates (populated only when the
     # tiebreak fired; each entry is a dict of source/alt_m/rms_px).
@@ -2838,6 +2841,29 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 f"TLE altitude: {strip_tle_altitude:,.0f} m{detail}"
             )
 
+    # Phase 3c catalog-mean altitude: (perigee + apogee) / 2 from
+    # ``data/kh_missions.yaml``. Used as a third candidate in the fit-
+    # quality tiebreak alongside TLE and cam_gen. Distinct from TLE
+    # (which gives the altitude at a specific orbital pass) and from
+    # cam_gen (which fits the 4 USGS corners): it's a scalar prior
+    # centred in the mission's published altitude range, useful when
+    # the other two sources both land in wrong-phase basins.
+    strip_catalog_mean_altitude = None
+    if mref is not None:
+        try:
+            cm_alt = catalog_mean_altitude_m(mref.mission_id)
+        except Exception as _exc:
+            cm_alt = None
+            print(f"  [per_segment] catalog_mean lookup failed: {_exc}")
+        if cm_alt is not None:
+            strip_catalog_mean_altitude = float(cm_alt)
+            scene_telem.strip_catalog_mean_altitude_m = strip_catalog_mean_altitude
+            print(
+                f"  [per_segment] {mref.system} mission {mref.mission_id} "
+                f"catalog-mean altitude: {strip_catalog_mean_altitude:,.0f} m "
+                f"(from perigee+apogee/2)"
+            )
+
     # One cam_gen run on the STRIP's USGS corners gives us the per-frame
     # altitude. Altitude is invariant across sub-frames within a 0.5 s
     # scan (spacecraft displacement < 1 m), so we derive it once here
@@ -2978,6 +3004,34 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
     else:
         scene_telem.altitude_source_used = "nominal"
         scene_telem.altitude_used_m = float(NOMINAL_ALTITUDE_M)
+
+    # Phase 3c: even when cam_gen and TLE already agree tightly (no Phase
+    # 3b tiebreak pending), the catalog-mean altitude may be materially
+    # different — e.g. both TLE and cam_gen land near perigee while the
+    # real orbit-mean is +30 km higher. Triggering the tiebreak in that
+    # case costs one extra Stage A/B fit (~15-30 s) and gives us per-
+    # candidate RMS in telemetry. We only need to do this when the
+    # tiebreak would surface new information, i.e. when catalog_mean
+    # differs from the currently-selected altitude by more than the
+    # ± 5 km tight-agreement window.
+    if (
+        not altitude_tiebreak_pending
+        and strip_catalog_mean_altitude is not None
+        and scene_telem.altitude_used_m is not None
+    ):
+        cm_delta_km = abs(
+            (strip_catalog_mean_altitude - scene_telem.altitude_used_m) / 1000.0
+        )
+        if cm_delta_km > 5.0:
+            altitude_tiebreak_pending = True
+            if scene_telem.cam_gen_altitude_status in (None, "used"):
+                scene_telem.cam_gen_altitude_status = "pending_tiebreak"
+            print(
+                f"  [per_segment] catalog-mean altitude "
+                f"{strip_catalog_mean_altitude:,.0f} m differs from selected "
+                f"{scene_telem.altitude_used_m:,.0f} m by {cm_delta_km:+.1f} km — "
+                f"will run Stage-A/B tiebreak on the first successful segment"
+            )
 
     active_indices = list(range(n))
     if reference_path and os.path.isfile(reference_path):
@@ -3232,21 +3286,31 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
 
     def _run_altitude_tiebreak(seg_idx: int, coarse_gcps: np.ndarray,
                                sf_w: int, sf_h: int):
-        """Phase 3b: pick the winning altitude by Stage A/B RMS.
+        """Phase 3b/3c: pick the winning altitude by Stage A/B RMS.
 
-        Runs ``_fit_segment_staged`` twice on ``coarse_gcps`` — once
-        with ``Zs0 = cam_gen_alt``, once with ``Zs0 = tle_alt`` — and
-        returns a tuple ``(winning_alt_m, winning_source, winning_fit,
-        candidates)`` where ``candidates`` is a list of dicts suitable
-        for serialising into the telemetry sidecar. The caller reuses
-        ``winning_fit`` as the segment's Stage A/B result so the
-        tiebreak is not extra net work on the winning candidate.
+        Runs ``_fit_segment_staged`` once per available candidate —
+        cam_gen, TLE, and (Phase 3c) catalog mean `(perigee+apogee)/2` —
+        and returns a tuple ``(winning_alt_m, winning_source,
+        winning_fit, candidates)`` where ``candidates`` is a list of
+        dicts suitable for serialising into the telemetry sidecar.
+        The caller reuses ``winning_fit`` as the segment's Stage A/B
+        result so the tiebreak is not extra net work on the winner.
+
+        Winner selection: lowest RMS. When two candidates are within
+        ``_TIEBREAK_HYSTERESIS_PX`` of each other, ties are broken in
+        the preference order ``tle > catalog_mean > cam_gen`` — TLE
+        is the safest default because its propagation noise is well-
+        bounded; catalog_mean is a scalar prior with no per-pass
+        signal; cam_gen is the most variable across executions.
         """
+        _TIEBREAK_HYSTERESIS_PX = 0.25
+        _PREFERENCE_ORDER = ("tle", "catalog_mean", "cam_gen")
         candidates = []
         results = {}
         for source, alt in (
             ("cam_gen", scene_telem.strip_cam_gen_altitude_m),
             ("tle", scene_telem.strip_tle_altitude_m),
+            ("catalog_mean", scene_telem.strip_catalog_mean_altitude_m),
         ):
             if alt is None:
                 continue
@@ -3278,29 +3342,32 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 results[source] = (alt, fit, rms)
         if not results:
             return None, None, None, candidates
-        # Prefer lower RMS. If both usable, require ≥ 0.25 px improvement
-        # for cam_gen to override TLE (small hysteresis prevents flipping
-        # on a sub-pixel preference).
-        if "cam_gen" in results and "tle" in results:
-            cg_alt, cg_fit, cg_rms = results["cam_gen"]
-            tle_alt, tle_fit, tle_rms = results["tle"]
-            if cg_rms <= tle_rms - 0.25:
-                print(
-                    f"  [per_segment/altitude] tiebreak: cam_gen wins "
-                    f"({cg_rms:.2f}px @ {cg_alt/1000:.1f}km vs "
-                    f"TLE {tle_rms:.2f}px @ {tle_alt/1000:.1f}km)"
-                )
-                return cg_alt, "cam_gen", cg_fit, candidates
-            print(
-                f"  [per_segment/altitude] tiebreak: TLE wins/tied "
-                f"({tle_rms:.2f}px @ {tle_alt/1000:.1f}km vs "
-                f"cam_gen {cg_rms:.2f}px @ {cg_alt/1000:.1f}km)"
-            )
-            return tle_alt, "tle", tle_fit, candidates
-        # Only one candidate ran usable — take it.
-        source = next(iter(results))
-        alt, fit, _ = results[source]
-        return alt, source, fit, candidates
+        # Find lowest RMS across usable candidates.
+        lowest_rms = min(r[2] for r in results.values())
+        # Prefer the highest-trust source that is within hysteresis of
+        # the lowest RMS. This defaults to TLE on a near-tie and only
+        # switches to catalog_mean or cam_gen when one of them is
+        # materially (> 0.25 px) better.
+        winner_source = None
+        for pref in _PREFERENCE_ORDER:
+            if pref in results and results[pref][2] <= lowest_rms + _TIEBREAK_HYSTERESIS_PX:
+                winner_source = pref
+                break
+        if winner_source is None:
+            # Shouldn't happen but fall back to the actual lowest.
+            winner_source = min(results, key=lambda k: results[k][2])
+        alt, fit, rms = results[winner_source]
+        others = [
+            f"{s}={results[s][2]:.2f}px@{results[s][0]/1000:.1f}km"
+            for s in results if s != winner_source
+        ]
+        print(
+            f"  [per_segment/altitude] tiebreak: {winner_source} wins "
+            f"({rms:.2f}px @ {alt/1000:.1f}km"
+            + (f"; runners-up {', '.join(others)}" if others else "")
+            + ")"
+        )
+        return alt, winner_source, fit, candidates
 
     def _do_mapproject(params, sub_path: str, bbox, sf_w: int, sf_h: int, out_path: str):
         if bbox is None:
@@ -4176,29 +4243,35 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     )
                     strip_cam_gen_altitude = None
                 else:
+                    # Phase 3c: three sources are possible now.
+                    # ``strip_cam_gen_altitude`` is the signal downstream
+                    # code reads; when the winner is TLE or catalog_mean
+                    # we clear it and set scene_telem.altitude_used_m
+                    # to the explicit winning value instead.
                     if winning_source == "cam_gen":
                         strip_cam_gen_altitude = float(winning_alt)
                         scene_telem.cam_gen_altitude_status = (
                             "tiebreak_cam_gen_wins"
                         )
-                    else:
+                        scene_telem.altitude_source_used = "cam_gen"
+                        scene_telem.altitude_used_m = float(winning_alt)
+                    elif winning_source == "catalog_mean":
+                        strip_cam_gen_altitude = float(winning_alt)
+                        scene_telem.cam_gen_altitude_status = (
+                            "tiebreak_catalog_mean_wins"
+                        )
+                        scene_telem.altitude_source_used = "catalog_mean"
+                        scene_telem.altitude_used_m = float(winning_alt)
+                    else:  # "tle"
                         strip_cam_gen_altitude = None
                         scene_telem.cam_gen_altitude_status = (
                             "tiebreak_tle_wins"
                         )
-                    # Propagate the authoritative altitude into the
-                    # scene-level telemetry so downstream code and
-                    # post-hoc diffs see the resolved source.
-                    resolved_alt = (
-                        strip_cam_gen_altitude
-                        if strip_cam_gen_altitude is not None
-                        else strip_tle_altitude
-                    )
-                    scene_telem.altitude_source_used = (
-                        "cam_gen" if strip_cam_gen_altitude is not None
-                        else "tle"
-                    )
-                    scene_telem.altitude_used_m = float(resolved_alt)
+                        scene_telem.altitude_source_used = "tle"
+                        scene_telem.altitude_used_m = float(
+                            winning_alt if winning_alt is not None
+                            else (strip_tle_altitude or NOMINAL_ALTITUDE_M)
+                        )
                     # Reuse the winning fit as the segment's Stage A/B
                     # result to avoid a pointless third fit.
                     fit_res = winning_fit
