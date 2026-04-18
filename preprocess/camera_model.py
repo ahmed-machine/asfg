@@ -3472,6 +3472,26 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         if prev_fit is None or prev_shape is None or prev_ortho is None:
             return fit_res, gcps
 
+        # Phase 6 reference-anchored guard #1: refuse to regularize against
+        # a previous segment whose own reference-fit RMS is already poor.
+        # Regularizing pulls the current segment toward the previous one's
+        # pose; if that pose is bad, we inherit the badness. The threshold
+        # is ``fit_rms_px_max * 2.0`` — inside the soft gate the fit is
+        # trustworthy, past it we defer to the reference fit unchanged.
+        prev_rms_guard = fit_rms_px_max * 2.0
+        try:
+            prev_rms = float(prev_fit.reprojection_rms_px)
+        except Exception:
+            prev_rms = float("inf")
+        if prev_rms > prev_rms_guard:
+            print(
+                f"  [per_segment/seam] seg{prev_idx:02d}-{seg_idx:02d}: "
+                f"skipping regularization — previous segment RMS "
+                f"{prev_rms:.2f}px > {prev_rms_guard:.2f}px gate "
+                f"(outlier upstream, would poison current)"
+            )
+            return fit_res, gcps
+
         baseline = _measure_single_seam(prev_ortho, ortho_path)
         if _seam_report_passes(baseline, seam_shift_px_max):
             return fit_res, gcps
@@ -3554,14 +3574,23 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     f"keeping reference fit"
                 )
                 return fit_res, gcps
-            if ortho_fit.reprojection_rms_px > max(
-                fit_res.reprojection_rms_px * 1.5,
-                fit_rms_px_max * 4.0,
-            ):
+            # Phase 6 reference-anchored guard #2: tighten the RMS gate.
+            # The old guard allowed up to max(fit_res*1.5, fit_rms_px_max*4)
+            # which (for kh9, fit_rms_px_max=4) permits 16 px RMS regardless
+            # of how good the reference fit was. Narrowing to
+            # ``max(fit_res*1.25, fit_rms_px_max*2)`` still admits ties that
+            # reduce a bad seam but rejects the degenerate case where
+            # the refit is chasing tie-point geometry at the cost of
+            # reference-anchored fidelity.
+            rms_ceiling = max(
+                fit_res.reprojection_rms_px * 1.25,
+                fit_rms_px_max * 2.0,
+            )
+            if ortho_fit.reprojection_rms_px > rms_ceiling:
                 print(
                     f"  [per_segment/seam] seg{seg_idx:02d}: ortho-tie fit RMS "
-                    f"{ortho_fit.reprojection_rms_px:.2f}px too high; "
-                    f"keeping reference fit"
+                    f"{ortho_fit.reprojection_rms_px:.2f}px > reference-anchored "
+                    f"ceiling {rms_ceiling:.2f}px; keeping reference fit"
                 )
                 return fit_res, gcps
 
@@ -3786,14 +3815,22 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 f"keeping reference fit"
             )
             return fit_res, gcps
-        if seam_fit.reprojection_rms_px > max(
-            fit_res.reprojection_rms_px * 1.75,
-            fit_rms_px_max * 4.0,
-        ):
+        # Phase 6 reference-anchored guard (raw-tie path). Tightened from
+        # max(fit_res*1.75, fit_rms_px_max*4) to max(fit_res*1.5,
+        # fit_rms_px_max*2.5). Raw ties are noisier than ortho ties
+        # (image-domain match error × altitude-dependent projection),
+        # so this path keeps a slightly looser ratio than the ortho-tie
+        # guard but still rejects refits that significantly worsen the
+        # reference fit.
+        raw_rms_ceiling = max(
+            fit_res.reprojection_rms_px * 1.5,
+            fit_rms_px_max * 2.5,
+        )
+        if seam_fit.reprojection_rms_px > raw_rms_ceiling:
             print(
                 f"  [per_segment/seam] seg{seg_idx:02d}: raw-tie fit RMS "
-                f"{seam_fit.reprojection_rms_px:.2f}px too high; "
-                f"keeping reference fit"
+                f"{seam_fit.reprojection_rms_px:.2f}px > reference-anchored "
+                f"ceiling {raw_rms_ceiling:.2f}px; keeping reference fit"
             )
             return fit_res, gcps
 
