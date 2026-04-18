@@ -1202,6 +1202,14 @@ def _seam_report_passes(report: dict | None, seam_shift_px_max: float) -> bool:
     overlap's signal is too weak to measure — the seam may be fine,
     it's just unmeasurable. ASP's whole-strip approach doesn't have
     this problem (no seams); we treat low_texture identically.
+
+    Phase 3f: add a sub-pixel-alignment accept rule. When the phase
+    shift is sub-2-px (tight geometry) AND ZNCC ≥ 0.3 (real content
+    correlation, imperfect but not noise), the seam is demonstrably
+    good even if neither the 0.4 ZNCC gate nor the 0.005 response
+    gate crosses. Motivated by cross-temporal imagery where real
+    terrain change (coastline reclamation, urban buildup, land-use
+    change) depresses ZNCC below 0.4 despite correct geometry.
     """
     if report is None:
         return False
@@ -1210,11 +1218,20 @@ def _seam_report_passes(report: dict | None, seam_shift_px_max: float) -> bool:
         return True
     if status != "ok":
         return False
-    if float(report.get("phase_shift_px", np.inf)) > float(seam_shift_px_max):
+    phase_shift = float(report.get("phase_shift_px", np.inf))
+    if phase_shift > float(seam_shift_px_max):
         return False
-    if float(report.get("zncc", -1.0)) >= 0.4:
+    zncc = float(report.get("zncc", -1.0))
+    if zncc >= 0.4:
         return True
     if float(report.get("response", float("-inf"))) >= 0.005:
+        return True
+    # Phase 3f sub-pixel-accept: tight geometry + real (not noise)
+    # correlation. Requires BOTH conditions — sub-pixel alone on
+    # low-texture would be caught by Phase 3e above; ZNCC 0.3+ alone
+    # on a large shift means good content far from alignment, still
+    # a failure.
+    if phase_shift < 2.0 and zncc >= 0.3:
         return True
     return False
 

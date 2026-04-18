@@ -707,6 +707,58 @@ def test_phase3_altitude_gate_accepts_cam_gen_when_agrees_with_tle(tmp_path, mon
 
 @pytest.mark.fast
 @pytest.mark.process
+def test_phase3f_subpixel_accept_rule():
+    """Phase 3f: a seam with sub-2-pixel shift AND ZNCC ≥ 0.3 passes
+    the gate even when ZNCC < 0.4 and response < 0.005. Motivated by
+    the observed Bahrain seam 0-1 after Phase 3d (shift 1.97 px,
+    ZNCC 0.388, response 0.001) — the geometry is demonstrably good
+    but cross-temporal terrain change depresses ZNCC below 0.4.
+
+    Must still reject large-shift seams even with high ZNCC, and
+    low-ZNCC seams even at sub-pixel shift (those are low_texture)."""
+    from preprocess.camera_model import _seam_report_passes
+
+    # Bahrain seam 0-1 after Phase 3d — the motivating case.
+    bahrain_01 = {
+        "status": "ok",
+        "zncc": 0.388,
+        "raw_zncc": 0.379,
+        "phase_shift_px": 1.97,
+        "response": 0.0009,
+    }
+    assert _seam_report_passes(bahrain_01, 80.0) is True
+
+    # Sub-pixel but ZNCC too low → still fails (below 0.3 rule).
+    subpx_low_zncc = {
+        "status": "ok",
+        "zncc": 0.22,
+        "raw_zncc": 0.22,
+        "phase_shift_px": 0.5,
+        "response": 0.001,
+    }
+    assert _seam_report_passes(subpx_low_zncc, 80.0) is False
+
+    # High ZNCC but large shift → fails (geometry bad).
+    high_zncc_big_shift = {
+        "status": "ok",
+        "zncc": 0.55,
+        "raw_zncc": 0.52,
+        "phase_shift_px": 15.0,
+        "response": 0.003,
+    }
+    assert _seam_report_passes(high_zncc_big_shift, 80.0) is True  # 0.55>=0.4
+    high_zncc_huge_shift = {
+        "status": "ok",
+        "zncc": 0.55,
+        "raw_zncc": 0.52,
+        "phase_shift_px": 200.0,
+        "response": 0.003,
+    }
+    assert _seam_report_passes(high_zncc_huge_shift, 80.0) is False  # above cap
+
+
+@pytest.mark.fast
+@pytest.mark.process
 def test_phase3e_low_texture_seam_treated_as_skipped():
     """Phase 3e: a seam report with low response and low |ZNCC|
     (cloud/ocean overlap — insufficient signal to measure) gets status
