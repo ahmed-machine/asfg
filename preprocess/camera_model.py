@@ -4449,6 +4449,20 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             "panoramic_seam_post_warp_rms_m_max", 30.0,
         ))
         try:
+            # Phase 10 reject-if-worsens guard. Measure seam quality on
+            # the pre-warp orthos, run TPS smoothing, then compare —
+            # reject the warped outputs if any seam's phase shift got
+            # larger. ``_phase3_smooth_seams`` rewrites orthos in place
+            # at ``..._seam.tif`` alongside originals; we compare the
+            # per-pair shift before flipping ``valid_orthos`` over.
+            pre_warp_reports = _measure_segment_seams(valid_orthos)
+            pre_shift_by_idx = {
+                r.get("index"): float(
+                    r.get("phase_corr", {}).get("shift_px", float("inf"))
+                )
+                for r in (pre_warp_reports or [])
+                if r.get("status") == "ok"
+            }
             smoothed = _phase3_smooth_seams(
                 valid_orthos,
                 sigmas_px=sigmas_px,
@@ -4461,12 +4475,39 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 max_residual_m=phase3_max_rms_m,
             )
             if smoothed and any(p != orig for p, orig in zip(smoothed, valid_orthos)):
-                print(
-                    f"  [phase3/seam] smoothed {len(smoothed)} segments "
-                    f"(feather={phase3_feather_px}px, smoothing={phase3_smoothing})"
-                )
-                scene_telem.phase3_seam_warp_fired = True
-                valid_orthos = smoothed
+                post_reports = _measure_segment_seams(smoothed)
+                worsened = []
+                for r in (post_reports or []):
+                    if r.get("status") != "ok":
+                        continue
+                    idx = r.get("index")
+                    pre_shift = pre_shift_by_idx.get(idx)
+                    post_shift = float(
+                        r.get("phase_corr", {}).get("shift_px", float("inf"))
+                    )
+                    if pre_shift is None or not np.isfinite(pre_shift):
+                        continue
+                    # Allow small numerical noise but reject anything
+                    # that materially worsens a measurable seam.
+                    if post_shift > pre_shift + 0.5:
+                        worsened.append((idx, pre_shift, post_shift))
+                if worsened:
+                    details = ", ".join(
+                        f"{idx}: {pre:.2f}→{post:.2f}px"
+                        for idx, pre, post in worsened
+                    )
+                    print(
+                        f"  [phase3/seam] REJECTED warp — seam(s) regressed "
+                        f"post-warp: {details}. Keeping unwarped orthos."
+                    )
+                else:
+                    print(
+                        f"  [phase3/seam] smoothed {len(smoothed)} segments "
+                        f"(feather={phase3_feather_px}px, "
+                        f"smoothing={phase3_smoothing}) — no seam regressed"
+                    )
+                    scene_telem.phase3_seam_warp_fired = True
+                    valid_orthos = smoothed
         except Exception as e:
             print(f"  [phase3/seam] smoothing failed ({e}); using unwarped orthos")
         finally:
