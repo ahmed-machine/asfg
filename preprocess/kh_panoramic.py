@@ -383,6 +383,135 @@ def ecef_to_local_xyz(iC_ecef, local_crs: str) -> tuple:
     return float(x_local), float(y_local), float(alt_m)
 
 
+def pano_params_to_opticalbar_tsai(
+    params,
+    pixel_pitch: float,
+    image_width_px: int,
+    image_height_px: int,
+    local_crs: str,
+    camera_params: dict,
+    out_path: str,
+    at_time: float = 0.5,
+) -> None:
+    """Write an ASP OpticalBar ``.tsai`` seed from 14-param pose at a
+    single scan time.
+
+    Phase 4: ASP's ``bundle_adjust`` needs seed cameras in its own
+    OpticalBar format; we produce one per sub-frame by snapshotting the
+    14-parameter pose at ``at_time`` (default scan-midpoint t=0.5). The
+    linear-in-time rate terms collapse to a single
+    ``(position, orientation)`` pair, so this is a LOSSY conversion —
+    acceptable only because ASP refits the pose from tie-points + GCPs;
+    the seed's job is to land in the right convergence basin.
+
+    Parameters
+    ----------
+    params
+        :class:`PanoramicParams` from a converged :func:`fit_panoramic`.
+    pixel_pitch, image_width_px, image_height_px
+        Sub-frame geometry in metres / pixels.
+    local_crs
+        pyproj CRS identifying ``params.Xs0``/``Ys0``'s horizontal
+        frame (typically an EPSG:326xx UTM zone).
+        ``params.Zs0`` is treated as elevation above the WGS84
+        ellipsoid.
+    camera_params
+        Dict supplying ``scan_time``, ``speed``, ``forward_tilt``,
+        ``scan_dir``, ``motion_compensation_factor`` — the OpticalBar
+        scan kinematics. These are copied through unchanged (BA refines
+        pose + focal length; scan mechanics are fixed).
+    out_path
+        Destination ``.tsai``.
+    at_time
+        Normalised scan time (0 = start, 1 = end, 0.5 = midpoint).
+    """
+    import math
+
+    from pyproj import Transformer
+
+    t = float(at_time)
+    Xs_t = float(params.Xs0) + float(params.Xs1) * t
+    Ys_t = float(params.Ys0) + float(params.Ys1) * t
+    Zs_t = float(params.Zs0) + float(params.Zs1) * t
+    omega_t = float(params.omega0) + float(params.omega1) * t
+    phi_t = float(params.phi0) + float(params.phi1) * t
+    kappa_t = float(params.kappa0) + float(params.kappa1) * t
+
+    tr = Transformer.from_crs(local_crs, "EPSG:4326", always_xy=True)
+    lon_deg, lat_deg = tr.transform(Xs_t, Ys_t)
+
+    # WGS84 (lat, lon, h-above-ellipsoid) → ECEF.
+    a_wgs = 6378137.0
+    f_flat = 1.0 / 298.257223563
+    e_sq = 2.0 * f_flat - f_flat * f_flat
+    lat_rad = math.radians(lat_deg)
+    lon_rad = math.radians(lon_deg)
+    sin_lat = math.sin(lat_rad)
+    cos_lat = math.cos(lat_rad)
+    sin_lon = math.sin(lon_rad)
+    cos_lon = math.cos(lon_rad)
+    N_rad = a_wgs / math.sqrt(1.0 - e_sq * sin_lat * sin_lat)
+    iC_x = (N_rad + Zs_t) * cos_lat * cos_lon
+    iC_y = (N_rad + Zs_t) * cos_lat * sin_lon
+    iC_z = (N_rad * (1.0 - e_sq) + Zs_t) * sin_lat
+
+    # Rotation matrix world(ENU) → camera. Same convention as
+    # forward_project — R = R_z(kappa) · R_y(phi) · R_x(omega).
+    co = math.cos(omega_t); so = math.sin(omega_t)
+    cp = math.cos(phi_t); sp = math.sin(phi_t)
+    ck = math.cos(kappa_t); sk = math.sin(kappa_t)
+    R_enu_to_cam = [
+        [cp * ck,                co * sk + so * sp * ck,   so * sk - co * sp * ck],
+        [-cp * sk,               co * ck - so * sp * sk,   so * ck + co * sp * sk],
+        [sp,                     -so * cp,                 co * cp],
+    ]
+    # Rotation ECEF → local ENU at (lat, lon).
+    R_ecef_to_enu = [
+        [-sin_lon,              cos_lon,                  0.0],
+        [-sin_lat * cos_lon,    -sin_lat * sin_lon,       cos_lat],
+        [cos_lat * cos_lon,     cos_lat * sin_lon,        sin_lat],
+    ]
+    # iR = ECEF → camera = ENU→camera · ECEF→ENU.
+    iR = [
+        [
+            sum(R_enu_to_cam[i][k] * R_ecef_to_enu[k][j] for k in range(3))
+            for j in range(3)
+        ]
+        for i in range(3)
+    ]
+    iR_flat = [iR[i][j] for i in range(3) for j in range(3)]
+
+    cx = image_width_px / 2.0
+    cy = image_height_px / 2.0
+    scan_time = float(camera_params.get("scan_time", 0.5))
+    forward_tilt = float(camera_params.get("forward_tilt", 0.0))
+    speed = float(camera_params.get("speed", 7800.0))
+    mcf = float(camera_params.get("motion_compensation_factor", 1.0))
+    scan_dir = str(camera_params.get("scan_dir", "right"))
+
+    iC_str = f"{iC_x:.4f} {iC_y:.4f} {iC_z:.4f}"
+    iR_str = " ".join(f"{v:.12f}" for v in iR_flat)
+
+    with open(out_path, "w") as fh:
+        fh.write(
+            "VERSION_4\n"
+            "OPTICAL_BAR\n"
+            f"image_size = {int(image_width_px)} {int(image_height_px)}\n"
+            f"image_center = {cx} {cy}\n"
+            f"pitch = {pixel_pitch}\n"
+            f"f = {float(params.f)}\n"
+            f"scan_time = {scan_time}\n"
+            f"forward_tilt = {forward_tilt}\n"
+            f"iC = {iC_str}\n"
+            f"iR = {iR_str}\n"
+            f"speed = {speed}\n"
+            "mean_earth_radius = 6371000\n"
+            "mean_surface_elevation = 0.0\n"
+            f"motion_compensation_factor = {mcf}\n"
+            f"scan_dir = {scan_dir}\n"
+        )
+
+
 def forward_project(params_t, X, Y, Z, x_p_obs, L: float):
     """Predict panoramic image coordinates (x_p, y_p) from ground points.
 

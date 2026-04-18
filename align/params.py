@@ -231,6 +231,19 @@ class CameraParams:
     # Per-segment f values within this relative threshold skip the
     # refit entirely (no heterogeneity problem to fix).
     shared_f_refit_min_spread_frac: float = 0.02
+    # Phase 4 — joint bundle-adjustment refinement via ASP ``bundle_adjust``.
+    # Runs AFTER Phase 3d as an optional cross-segment joint solve
+    # seeded with Phase 3d's pose + shared f. Uses RoMa-vs-reference
+    # absolute GCPs and ``--intrinsics-to-share focal_length`` to
+    # close the gauge-freedom loophole that sank prior BA attempts.
+    # Accepted per-strip only if aggregate seam quality improves over
+    # the Phase 3d baseline; rejections fall through unchanged.
+    # Off by default — opt-in until measured positive on ≥ 2 scenes.
+    joint_ba_refinement: bool = False
+    # Per-parameter bound around Phase 3d's shared-f for ``--intrinsics-limits``
+    # (ASP's bound is fractional around the seed). ±8 % matches the
+    # Phase 3d observed spread on Bahrain with margin.
+    joint_ba_f_frac_limit: float = 0.08
     # Feature matcher backend used by preprocessing-only correspondence
     # extraction (per-segment rectification and experimental BA .match files).
     preprocess_matcher: str = "roma"
@@ -297,6 +310,8 @@ class CameraParams:
             "f_prior_frac_sigma": self.f_prior_frac_sigma,
             "shared_f_refit_enabled": self.shared_f_refit_enabled,
             "shared_f_refit_min_spread_frac": self.shared_f_refit_min_spread_frac,
+            "joint_ba_refinement": self.joint_ba_refinement,
+            "joint_ba_f_frac_limit": self.joint_ba_f_frac_limit,
             "panoramic_seam_warp": self.panoramic_seam_warp,
             "panoramic_seam_feather_px": self.panoramic_seam_feather_px,
             "panoramic_seam_tps_smoothing": self.panoramic_seam_tps_smoothing,

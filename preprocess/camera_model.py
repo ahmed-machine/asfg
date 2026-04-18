@@ -111,6 +111,15 @@ class _SceneTelemetry:
     # considered). Each entry: seg_idx, original_f_m, original_rms_px,
     # refit_f_m, refit_rms_px, accepted (bool), reject_reason.
     phase3d_refit_per_segment: list = field(default_factory=list)
+    # Phase 4 — joint BA refinement via ASP bundle_adjust.
+    phase4_enabled: bool = False
+    phase4_applied: bool = False
+    phase4_skipped_reason: Optional[str] = None
+    phase4_gcp_count: Optional[int] = None
+    phase4_pre_seams: list = field(default_factory=list)
+    phase4_post_seams: list = field(default_factory=list)
+    phase4_shared_f_m_before: Optional[float] = None
+    phase4_shared_f_m_after: Optional[float] = None
     # Phase gates:
     phase2_max_iter: int = 0
     phase3_seam_warp_enabled: bool = False
@@ -3432,6 +3441,268 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         )
         return alt, winner_source, fit, candidates
 
+    def _run_phase4_joint_ba(
+        active_indices, seg_orthos_map, seg_fit_map, seg_shape_map,
+        seg_gcps_map, seg_sub_path_map, seg_base_corners_map,
+        seg_camera_params, local_crs, dem_path, output_dir, scene_id,
+        scene_telem, do_mapproject, measure_seams, bbox_policy,
+        mode_tag, preprocess_matcher, matcher_cache_tag,
+    ):
+        """Phase 4: joint BA refinement via ASP ``bundle_adjust``.
+
+        1. Snapshot every active segment's 14p fit at scan-midpoint →
+           ASP OpticalBar seed ``.tsai``.
+        2. Concatenate per-segment ``seg_gcps_map`` into one absolute
+           GCP file (ASP format).
+        3. Call ``run_strip_bundle_adjustment`` with shared focal
+           length, intrinsics limits, reference-terrain DEM weight.
+        4. Re-mapproject each refined camera → candidate new orthos.
+        5. Compare pre/post aggregate seam quality — keep winner.
+
+        Mutates ``seg_orthos_map`` and ``seg_fit_map`` in place iff BA
+        accepted. Records decision in ``scene_telem``.
+        """
+        from align.experimental.bundle_adjust import (
+            _write_absolute_gcp_file,
+            run_strip_bundle_adjustment,
+        )
+        from preprocess.kh_panoramic import pano_params_to_opticalbar_tsai
+
+        phase4_dir = os.path.join(output_dir, "phase4_joint_ba")
+        os.makedirs(phase4_dir, exist_ok=True)
+
+        # Gather inputs.
+        seed_tsai = []
+        ba_frames = []
+        gcp_entries = []
+        shared_f_pre = None
+        for i in active_indices:
+            fit = seg_fit_map.get(i)
+            if fit is None:
+                scene_telem.phase4_skipped_reason = (
+                    "missing_fit_in_seg_fit_map"
+                )
+                return False
+            gcps = seg_gcps_map.get(i)
+            if gcps is None or gcps.shape[0] == 0:
+                scene_telem.phase4_skipped_reason = "missing_gcps"
+                return False
+            sub_path = seg_sub_path_map.get(i)
+            shape = seg_shape_map.get(i)
+            if sub_path is None or shape is None:
+                scene_telem.phase4_skipped_reason = "missing_sub_path_or_shape"
+                return False
+            sf_w_i, sf_h_i = shape
+            seed_path = os.path.join(
+                phase4_dir, f"{scene_id}_seg{i:02d}_seed.tsai",
+            )
+            try:
+                pano_params_to_opticalbar_tsai(
+                    fit.params,
+                    pixel_pitch=float(seg_camera_params["pixel_pitch"]),
+                    image_width_px=int(sf_w_i),
+                    image_height_px=int(sf_h_i),
+                    local_crs=local_crs,
+                    camera_params=seg_camera_params,
+                    out_path=seed_path,
+                    at_time=0.5,
+                )
+            except Exception as _seed_exc:
+                scene_telem.phase4_skipped_reason = (
+                    f"seed_write_failed:{_seed_exc}"
+                )
+                return False
+            seed_tsai.append(seed_path)
+            ba_frames.append(sub_path)
+            gcp_entries.append((os.path.basename(sub_path), gcps))
+            if shared_f_pre is None:
+                shared_f_pre = float(fit.params.f)
+        scene_telem.phase4_shared_f_m_before = shared_f_pre
+
+        gcp_file = os.path.join(phase4_dir, f"{scene_id}_absolute.gcp")
+        try:
+            n_gcps = _write_absolute_gcp_file(
+                gcp_entries, local_crs, gcp_file,
+            )
+        except Exception as _gcp_exc:
+            scene_telem.phase4_skipped_reason = f"gcp_write_failed:{_gcp_exc}"
+            return False
+        scene_telem.phase4_gcp_count = int(n_gcps)
+        if n_gcps < 10:
+            scene_telem.phase4_skipped_reason = (
+                f"too_few_gcps:{n_gcps}"
+            )
+            return False
+
+        # Pre-BA seam snapshot.
+        pre_orthos = [seg_orthos_map[i] for i in active_indices]
+        pre_seams = measure_seams(pre_orthos) or []
+        scene_telem.phase4_pre_seams = [
+            {k: v for k, v in r.items() if k != "overlap_bounds"}
+            for r in pre_seams
+        ]
+
+        # Run ASP bundle_adjust.
+        f_nominal = float(seg_camera_params["focal_length"])
+        f_frac_limit = float(
+            seg_camera_params.get("joint_ba_f_frac_limit", 0.08)
+        )
+        intrinsics_limits = (
+            max(0.01, 1.0 - f_frac_limit),
+            1.0 + f_frac_limit,
+        )
+        print(
+            f"  [per_segment/phase4] launching ASP bundle_adjust on "
+            f"{len(ba_frames)} segments, {n_gcps} absolute GCPs, "
+            f"shared-f bounds ±{f_frac_limit * 100:.1f}%"
+        )
+        adjusted = run_strip_bundle_adjustment(
+            frames=ba_frames,
+            camera_params=seg_camera_params,
+            corners_list=[],  # unused when initial_tsai_paths supplied
+            output_dir=phase4_dir,
+            initial_tsai_paths=seed_tsai,
+            absolute_gcp_file=gcp_file,
+            dem_path=dem_path,
+            solve_intrinsics=True,
+            shared_intrinsics=True,
+            intrinsics_limits=intrinsics_limits,
+            reference_terrain_weight=(1000.0 if dem_path else None),
+            robust_threshold=2.0,
+            camera_weight=0,
+        )
+        if not adjusted or len(adjusted) != len(ba_frames):
+            scene_telem.phase4_skipped_reason = "bundle_adjust_failed"
+            return False
+
+        # Map-project each adjusted camera to candidate new orthos.
+        # We reuse ASP's own mapproject wrapper because the output must
+        # stay compatible with our blend pipeline downstream.
+        cand_orthos = {}
+        for seg_idx, adj_tsai, sub_path_i in zip(
+            active_indices, adjusted, ba_frames
+        ):
+            sf_w_i, sf_h_i = seg_shape_map[seg_idx]
+            gcps_i = seg_gcps_map[seg_idx]
+            final_bbox, _pred, _gcp = _resolve_render_bbox(
+                bbox_policy=bbox_policy,
+                gcps=gcps_i,
+                fit_params=seg_fit_map[seg_idx].params,
+                pixel_pitch=float(seg_camera_params["pixel_pitch"]),
+                image_width_px=int(sf_w_i),
+                image_height_px=int(sf_h_i),
+            )
+            cand_path = os.path.join(
+                phase4_dir, f"{scene_id}_seg{seg_idx:02d}_ortho_ba.tif",
+            )
+            new_ortho = mapproject_image(
+                image_path=sub_path_i,
+                camera_path=adj_tsai,
+                dem_path=dem_path,
+                output_path=cand_path,
+                resolution=_auto_output_resolution_m(
+                    reference_path=reference_path,
+                    bbox_xy=final_bbox,
+                    image_width_px=int(sf_w_i),
+                    image_height_px=int(sf_h_i),
+                ),
+                t_srs=t_srs,
+                bbox=final_bbox,
+            )
+            if new_ortho is None or not os.path.isfile(new_ortho):
+                scene_telem.phase4_skipped_reason = (
+                    f"mapproject_failed_seg{seg_idx:02d}"
+                )
+                return False
+            cand_orthos[seg_idx] = new_ortho
+
+        # Post-BA seam measurement.
+        post_orthos = [cand_orthos[i] for i in active_indices]
+        post_seams = measure_seams(post_orthos) or []
+        scene_telem.phase4_post_seams = [
+            {k: v for k, v in r.items() if k != "overlap_bounds"}
+            for r in post_seams
+        ]
+
+        # Aggregate seam quality: count accepted seams (ZNCC ≥ 0.4 OR
+        # sub-pixel + ZNCC ≥ 0.3 OR low_texture), break ties on mean
+        # ZNCC of "ok" seams.
+        def _score(seams):
+            n_acc = 0
+            znccs = []
+            for r in seams:
+                status = r.get("status")
+                if status in ("low_texture", "no_overlap",
+                              "no_valid_overlap", "overlap_too_small"):
+                    n_acc += 1
+                    continue
+                if status != "ok":
+                    continue
+                z = float(r.get("zncc", -1.0))
+                shift = float(r.get("phase_shift_px", 1e9))
+                if z >= 0.4 or (shift < 2.0 and z >= 0.3):
+                    n_acc += 1
+                znccs.append(z)
+            mean_z = sum(znccs) / len(znccs) if znccs else float("-inf")
+            return (n_acc, mean_z)
+
+        pre_score = _score(pre_seams)
+        post_score = _score(post_seams)
+        print(
+            f"  [per_segment/phase4] seam score pre={pre_score} "
+            f"post={post_score}"
+        )
+        if post_score <= pre_score:
+            scene_telem.phase4_applied = False
+            scene_telem.phase4_skipped_reason = (
+                f"no_improvement:pre={pre_score} post={post_score}"
+            )
+            return False
+
+        # Accept: swap orthos + update seg_fit_map with refined f (pose
+        # stays 14p — ASP's 7-DoF OpticalBar lacks the rate terms).
+        for seg_idx in active_indices:
+            seg_orthos_map[seg_idx] = cand_orthos[seg_idx]
+            # Parse refined f from the adjusted tsai for telemetry.
+            try:
+                adj_tsai = adjusted[active_indices.index(seg_idx)]
+                with open(adj_tsai) as fh_t:
+                    for ln in fh_t:
+                        if ln.startswith("f = "):
+                            scene_telem.phase4_shared_f_m_after = float(
+                                ln.split("=", 1)[1].strip()
+                            )
+                            break
+            except Exception:
+                pass
+            # Refresh sidecar so the new ortho cache key matches the
+            # BA-refined pose + the shared f.
+            base_corners_ri = seg_base_corners_map.get(seg_idx)
+            if base_corners_ri is not None:
+                meta_ri = {
+                    "mode": mode_tag,
+                    "local_crs": local_crs,
+                    "preprocess_matcher": preprocess_matcher,
+                    "matcher_cache_tag": matcher_cache_tag,
+                    "zs0_m": float(seg_fit_map[seg_idx].params.Zs0),
+                    "altitude_source": scene_telem.altitude_source_used,
+                    "phase4_joint_ba": True,
+                    "phase4_shared_f_m": scene_telem.phase4_shared_f_m_after,
+                }
+                _save_ortho_corners(
+                    cand_orthos[seg_idx],
+                    base_corners_ri,
+                    base_corners_ri,
+                    metadata=meta_ri,
+                )
+        scene_telem.phase4_applied = True
+        print(
+            f"  [per_segment/phase4] accepted — seams improved "
+            f"{pre_score} → {post_score}; f {shared_f_pre:.4f} → "
+            f"{scene_telem.phase4_shared_f_m_after}"
+        )
+        return True
+
     def _do_mapproject(params, sub_path: str, bbox, sf_w: int, sf_h: int, out_path: str):
         if bbox is None:
             return None
@@ -4154,6 +4425,26 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             # so changing altitude sources without invalidating the
             # cache would leave downstream reads of a stale geographic
             # projection. Reject when |cached.zs0 - planned zs0| > 1km.
+            # Cache-altitude check: the cached ortho's Zs0 (as recorded
+            # in the sidecar) must match at least one altitude that the
+            # current run's Phase 3b/3c tiebreak could plausibly pick.
+            # When the tiebreak fires on the first live segment it may
+            # select cam_gen, TLE, or catalog_mean; if the cached orthos
+            # were written from any one of those candidates in a prior
+            # run we can reuse them. Without this widening, partial
+            # cache invalidation breaks Phase 3d (only some seg fits
+            # populated → spread=0 → no shared-f refit → heterogeneous
+            # orthos on disk → seam QA blows up).
+            plausible_altitudes_m = [
+                float(a)
+                for a in (
+                    strip_cam_gen_altitude,
+                    strip_tle_altitude,
+                    strip_catalog_mean_altitude,
+                    NOMINAL_ALTITUDE_M,
+                )
+                if a is not None
+            ]
             planned_zs0_m = (
                 float(strip_cam_gen_altitude)
                 if strip_cam_gen_altitude is not None
@@ -4166,7 +4457,10 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             cached_zs0_m = cached_meta.get("zs0_m")
             altitude_cache_ok = (
                 cached_zs0_m is None
-                or abs(float(cached_zs0_m) - planned_zs0_m) <= 1_000.0
+                or any(
+                    abs(float(cached_zs0_m) - a) <= 1_000.0
+                    for a in plausible_altitudes_m
+                )
             )
             if (os.path.isfile(seg_ortho_path) and cached is not None
                     and cached_meta.get("mode") == mode_tag
@@ -4934,6 +5228,53 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     )
     elif scene_telem.phase3d_enabled:
         scene_telem.phase3d_skipped_reason = "fewer_than_2_active_segments"
+
+    # ------------------------------------------------------------------
+    # Phase 4 — joint BA refinement via ASP ``bundle_adjust``.
+    # ------------------------------------------------------------------
+    # Off-by-default, opt-in via profile. Runs AFTER Phase 3d's shared-f
+    # refit and BEFORE seam QA. Seeds ASP's OpticalBar solve from the
+    # 14-param fit (position + pose at scan-midpoint + shared f), supplies
+    # per-sub-frame absolute GCPs from RoMa-vs-reference, and forces
+    # ``--intrinsics-to-share focal_length`` so f cannot gauge-collapse
+    # per camera. If ASP produces a better seam set than Phase 3d's
+    # orthos (more accepted seams + higher mean ZNCC), the BA orthos
+    # replace the Phase 3d ones; otherwise the Phase 3d orthos stay.
+    scene_telem.phase4_enabled = bool(
+        seg_camera_params.get("joint_ba_refinement", False)
+    )
+    if scene_telem.phase4_enabled and len(active_indices) >= 2:
+        try:
+            _phase4_result = _run_phase4_joint_ba(
+                active_indices=active_indices,
+                seg_orthos_map=seg_orthos_map,
+                seg_fit_map=seg_fit_map,
+                seg_shape_map=seg_shape_map,
+                seg_gcps_map=seg_gcps_map,
+                seg_sub_path_map=seg_sub_path_map,
+                seg_base_corners_map=seg_base_corners_map,
+                seg_camera_params=seg_camera_params,
+                local_crs=local_crs,
+                dem_path=dem_path,
+                output_dir=output_dir,
+                scene_id=scene_id,
+                scene_telem=scene_telem,
+                do_mapproject=_do_mapproject,
+                measure_seams=_measure_segment_seams,
+                bbox_policy=bbox_policy,
+                mode_tag=mode_tag,
+                preprocess_matcher=preprocess_matcher,
+                matcher_cache_tag=matcher_cache_tag,
+            )
+            # _run_phase4_joint_ba mutates seg_orthos_map / seg_fit_map
+            # in place when the refit is accepted. scene_telem records
+            # the decision regardless.
+        except Exception as _phase4_exc:
+            print(f"  [per_segment/phase4] failed: {_phase4_exc}")
+            scene_telem.phase4_applied = False
+            scene_telem.phase4_skipped_reason = f"exception:{_phase4_exc}"
+    elif scene_telem.phase4_enabled:
+        scene_telem.phase4_skipped_reason = "fewer_than_2_active_segments"
 
     seg_orthos = [seg_orthos_map[i] for i in active_indices]
     seam_reports = _measure_segment_seams(seg_orthos)

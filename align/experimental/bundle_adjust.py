@@ -18,19 +18,84 @@ from preprocess.asp import find_asp_tool
 from preprocess.camera_model import generate_camera
 
 
-def _write_gcp_file(gcps, output_path, image_name):
-    """Write GCPs in ASP format for bundle_adjust.
+def _write_absolute_gcp_file(
+    per_image_gcps,
+    local_crs,
+    out_path,
+    pixel_sigma=1.5,
+    xy_sigma_m=10.0,
+    z_sigma_m=20.0,
+):
+    """Write ASP `bundle_adjust` GCP file from per-image absolute GCPs.
 
-    ASP GCP format (one per line):
-        lon lat height sigma_lon sigma_lat sigma_height image_name col row sigma_col sigma_row
+    Each GCP from :func:`preprocess.kh_panoramic.extract_reference_gcps`
+    is a RoMa-derived match of a raw sub-frame pixel against a
+    georeferenced reference ortho. Per-segment processing means every
+    such GCP is visible in exactly ONE sub-frame image, so each output
+    row carries a single image observation. ASP accepts multi-image
+    observations by appending ``image col row sigma_col sigma_row``
+    quintuples, but we don't need that here.
+
+    ASP GCP format (whitespace-separated, one GCP per line)::
+
+        <id> <lat> <lon> <height_above_datum>
+             <sigma_east_m> <sigma_north_m> <sigma_up_m>
+             <image_name> <col> <row> <sigma_col_px> <sigma_row_px>
+
+    Parameters
+    ----------
+    per_image_gcps : list[tuple[str, numpy.ndarray]]
+        ``(image_name, gcps)`` pairs. Each ``gcps`` is an (N, 5) array
+        with columns ``[col, row, X_local, Y_local, Z_local]``.
+        ``image_name`` is the basename ASP will match against the
+        ``bundle_adjust`` image list.
+    local_crs : str
+        pyproj CRS string for the GCPs' XY columns (e.g. an EPSG:326xx
+        UTM zone). Converted to WGS84 lat/lon before writing.
+    out_path : str
+        Destination CSV.
+    pixel_sigma : float
+        Per-observation pixel uncertainty (column/row). RoMa is
+        sub-pixel so 1.5 px is conservative.
+    xy_sigma_m : float
+        Per-GCP horizontal uncertainty (covers DEM lateral error +
+        reference-image georef error).
+    z_sigma_m : float
+        Per-GCP vertical uncertainty.
+
+    Returns
+    -------
+    int
+        Number of GCPs written.
     """
-    with open(output_path, "w") as f:
-        for gcp in gcps:
-            lon, lat = gcp["lon"], gcp["lat"]
-            col, row = gcp["col"], gcp["row"]
-            sigma = gcp.get("sigma", 10.0)
-            f.write(f"{lon} {lat} 0.0  {sigma} {sigma} 50.0  "
-                    f"{image_name} {col} {row} 1.5 1.5\n")
+    from pyproj import Transformer
+
+    tr = Transformer.from_crs(local_crs, "EPSG:4326", always_xy=True)
+    n_written = 0
+    gcp_id = 0
+    with open(out_path, "w") as fh:
+        for image_name, gcps in per_image_gcps:
+            if gcps is None:
+                continue
+            arr = np.asarray(gcps)
+            if arr.size == 0 or arr.shape[-1] < 5:
+                continue
+            for row in arr:
+                col_px = float(row[0])
+                row_px = float(row[1])
+                x_local = float(row[2])
+                y_local = float(row[3])
+                z_local = float(row[4])
+                lon, lat = tr.transform(x_local, y_local)
+                fh.write(
+                    f"{gcp_id} {lat:.8f} {lon:.8f} {z_local:.3f} "
+                    f"{xy_sigma_m:.3f} {xy_sigma_m:.3f} {z_sigma_m:.3f} "
+                    f"{image_name} {col_px:.3f} {row_px:.3f} "
+                    f"{pixel_sigma:.3f} {pixel_sigma:.3f}\n"
+                )
+                gcp_id += 1
+                n_written += 1
+    return n_written
 
 
 def _read_focal_length(tsai_path):
@@ -55,7 +120,14 @@ def _read_focal_length(tsai_path):
 def run_strip_bundle_adjustment(frames, camera_params, corners_list,
                                 gcps_per_frame=None, dem_path=None,
                                 output_dir=None, match_prefix=None,
-                                solve_intrinsics=False):
+                                solve_intrinsics=False,
+                                initial_tsai_paths=None,
+                                absolute_gcp_file=None,
+                                shared_intrinsics=False,
+                                intrinsics_limits=None,
+                                reference_terrain_weight=None,
+                                robust_threshold=None,
+                                camera_weight=10):
     """Run ASP bundle_adjust on a strip of frames.
 
     Parameters
@@ -65,12 +137,14 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
     camera_params : dict
         Camera intrinsics (shared across frames).
     corners_list : list of dict
-        Per-frame corner coordinates for cam_gen.
+        Per-frame corner coordinates for cam_gen. Ignored when
+        ``initial_tsai_paths`` supplies pre-built cameras.
     gcps_per_frame : list of list of dict, optional
-        Per-frame GCPs from neural matching. Each GCP is
-        {"lon": float, "lat": float, "col": float, "row": float, "sigma": float}.
+        DEPRECATED — was the old per-frame GCP dict format. Kept for
+        backward compatibility with callers that haven't migrated to
+        ``absolute_gcp_file``. Phase 4 prefers the absolute GCP file.
     dem_path : str, optional
-        DEM for height constraint.
+        DEM for height or reference-terrain constraint.
     output_dir : str, optional
         Output directory for adjusted cameras.
     match_prefix : str, optional
@@ -79,9 +153,43 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
         match files directly via --match-files-prefix.
     solve_intrinsics : bool
         When True, pass --solve-intrinsics --intrinsics-to-float
-        focal_length to bundle_adjust. Enables the adaptive focal length
-        fit from 2OC (Hou et al. 2023). Fitted focal lengths are logged
-        per frame on return.
+        focal_length to bundle_adjust.
+    initial_tsai_paths : list of str, optional
+        Phase 4: pre-built OpticalBar .tsai seeds (one per frame) to
+        use instead of running ``cam_gen`` fresh. Typically produced
+        from the per-segment 14-param fit via
+        ``preprocess.kh_panoramic.pano_params_to_opticalbar_tsai``.
+        When supplied, ``cam_gen`` is skipped entirely.
+    absolute_gcp_file : str, optional
+        Phase 4: path to an ASP GCP file written by
+        ``_write_absolute_gcp_file``. Gives BA absolute-lat/lon
+        observations per raw-image pixel, preventing the gauge-collapse
+        mode that killed previous inter-frame-tie-only attempts.
+    shared_intrinsics : bool
+        Phase 4: when True, pass
+        ``--intrinsics-to-share "focal_length"``. Only effective with
+        ``solve_intrinsics=True``. Forces all cameras to share a single
+        fitted focal length — closes the per-camera f-collapse loophole
+        recorded in memory/per_segment_ab_results.md.
+    intrinsics_limits : tuple of floats, optional
+        Phase 4: per-intrinsic fractional bounds, e.g. ``(0.92, 1.08)``
+        for ±8 % on focal length. Only effective with
+        ``solve_intrinsics=True``. Passed to
+        ``--intrinsics-limits "lo hi ..."``.
+    reference_terrain_weight : float, optional
+        Phase 4: when > 0 AND ``dem_path`` is supplied, pass
+        ``--reference-terrain DEM --reference-terrain-weight W`` instead
+        of the weaker ``--heights-from-dem``. Dehecq et al. 2020 used
+        weight 1000 to break the altitude/focal-length gauge on KH-9.
+    robust_threshold : float, optional
+        Phase 4: override ASP's default ``--robust-threshold`` (0.5 px).
+        Raise to 2-3 px on cross-temporal imagery where RoMa-filtered
+        tie points already have sub-pixel precision but reference-
+        content mismatch adds measurement noise.
+    camera_weight : float
+        Weight on the camera-pose prior. 0 lets extrinsics float
+        freely (Dehecq's approach); 10 keeps pose near the seed
+        (legacy default; useful when seeds are noisy).
 
     Returns
     -------
@@ -97,23 +205,53 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
         output_dir = tempfile.mkdtemp(prefix="ba_")
     os.makedirs(output_dir, exist_ok=True)
 
-    # Step 1: Generate camera models for each frame
+    # Step 1: Camera seeds — either caller-supplied (Phase 4 preferred)
+    # or freshly generated via cam_gen (legacy path).
     camera_files = []
-    for i, (frame, corners) in enumerate(zip(frames, corners_list)):
-        cam = generate_camera(frame, camera_params, corners, dem_path)
-        if cam is None:
-            print(f"  [BundleAdjust] cam_gen failed for frame {i}")
+    if initial_tsai_paths is not None:
+        if len(initial_tsai_paths) != len(frames):
+            print(
+                f"  [BundleAdjust] initial_tsai_paths length "
+                f"{len(initial_tsai_paths)} ≠ frames length {len(frames)}"
+            )
             return None
-        camera_files.append(cam)
+        for p in initial_tsai_paths:
+            if not os.path.isfile(p):
+                print(f"  [BundleAdjust] seed camera missing: {p}")
+                return None
+            camera_files.append(p)
+        print(
+            f"  [BundleAdjust] using {len(camera_files)} caller-supplied "
+            f"OpticalBar seeds (skipping cam_gen)"
+        )
+    else:
+        for i, (frame, corners) in enumerate(zip(frames, corners_list)):
+            cam = generate_camera(frame, camera_params, corners, dem_path)
+            if cam is None:
+                print(f"  [BundleAdjust] cam_gen failed for frame {i}")
+                return None
+            camera_files.append(cam)
 
-    # Step 2: Write GCP files
+    # Step 2: GCP inputs.
     gcp_files = []
-    if gcps_per_frame:
-        for i, (frame, gcps) in enumerate(zip(frames, gcps_per_frame)):
-            if gcps:
-                gcp_path = os.path.join(output_dir, f"frame_{i}.gcp")
-                _write_gcp_file(gcps, gcp_path, os.path.basename(frame))
-                gcp_files.append(gcp_path)
+    if absolute_gcp_file is not None:
+        if not os.path.isfile(absolute_gcp_file):
+            print(
+                f"  [BundleAdjust] absolute_gcp_file not found: "
+                f"{absolute_gcp_file}"
+            )
+            return None
+        gcp_files.append(absolute_gcp_file)
+    elif gcps_per_frame:
+        # Legacy per-frame dict GCPs — not used by Phase 4 but kept
+        # for backward compatibility. Requires the dead _write_gcp_file
+        # helper which Phase 4 removed; callers hitting this branch
+        # should migrate to absolute_gcp_file.
+        print(
+            "  [BundleAdjust] legacy gcps_per_frame dict format is no "
+            "longer supported; pass absolute_gcp_file instead"
+        )
+        return None
 
     # Step 3: Run bundle_adjust
     ba_prefix = os.path.join(output_dir, "ba")
@@ -128,26 +266,52 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
     cmd.extend([
         "-t", "opticalbar",
         "--inline-adjustments",
-        "--camera-weight", "10",
+        "--camera-weight", str(camera_weight),
         "--datum", "WGS84",
         "-o", ba_prefix,
     ])
 
     if solve_intrinsics:
-        # 2OC paper: adaptive focal length fit per strip is worth ~30-45%
-        # of reported accuracy gain. ASP floats `focal_length` across the
-        # strip while keeping extrinsics the primary free variables.
         cmd.extend([
             "--solve-intrinsics",
             "--intrinsics-to-float", "focal_length",
         ])
+        if shared_intrinsics:
+            # Forces all cameras to share the fitted focal length
+            # instead of each drifting independently. The key fix for
+            # the gauge-collapse failure mode in prior BA attempts.
+            cmd.extend(["--intrinsics-to-share", "focal_length"])
+        if intrinsics_limits:
+            # Format: "lo_f hi_f lo_cx hi_cx lo_cy hi_cy ..."
+            limits_str = " ".join(f"{v}" for v in intrinsics_limits)
+            cmd.extend(["--intrinsics-limits", limits_str])
         nominal_f = camera_params.get("focal_length")
         if nominal_f:
-            print(f"  [BundleAdjust] solve_intrinsics=ON; nominal f={nominal_f:.6f} m")
+            print(
+                f"  [BundleAdjust] solve_intrinsics=ON; shared={shared_intrinsics} "
+                f"limits={intrinsics_limits!r}; nominal f={nominal_f:.6f} m"
+            )
 
     if dem_path and os.path.isfile(dem_path):
-        cmd.extend(["--heights-from-dem", dem_path,
-                     "--heights-from-dem-uncertainty", "10.0"])
+        if reference_terrain_weight and reference_terrain_weight > 0:
+            # Stronger DEM coupling: penalises reprojection residuals
+            # against the DEM, not just heights. Dehecq's gauge-breaker.
+            cmd.extend([
+                "--reference-terrain", dem_path,
+                "--reference-terrain-weight", str(reference_terrain_weight),
+            ])
+            print(
+                f"  [BundleAdjust] --reference-terrain-weight "
+                f"{reference_terrain_weight}"
+            )
+        else:
+            cmd.extend([
+                "--heights-from-dem", dem_path,
+                "--heights-from-dem-uncertainty", "10.0",
+            ])
+
+    if robust_threshold is not None:
+        cmd.extend(["--robust-threshold", str(float(robust_threshold))])
 
     # Reuse cached IP / match files from a previous BA run if available.
     # ipfind is the most expensive phase (~5 min for 3 large frames);
