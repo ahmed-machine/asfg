@@ -643,12 +643,11 @@ def stitch_with_asp(frames: list, output_path: str, camera_name: str,
     else:
         ordered = frames
 
-    # Detect Aft vs Forward camera from entity ID
-    is_aft = False
-    if camera_upper.startswith("KH4"):
-        parts = entity_id.upper()
-        if "DA" in parts and "DF" not in parts:
-            is_aft = True
+    # Detect Aft vs Forward camera from entity ID.
+    # Aft-looking cameras capture imagery 180°-rotated relative to Forward;
+    # image_mosaic --rotate compensates before stitching.
+    from .camera_model import is_aft_camera
+    is_aft = is_aft_camera(entity_id, camera_name)
 
     cmd = [asp_bin] + ordered + [
         "-o", output_path,
@@ -702,10 +701,12 @@ def verify_tiff_decodes_nonempty(path: str, label: str = "TIFF", sample_size: in
     wide KH-9 panoramic inputs). Such a file passes ``gdal.Open`` and reports
     dimensions correctly, but every decoded pixel reads as NoData.
 
-    This helper opens the file, reads a small corner window, and returns
-    False if any of: the file fails to open, the probe read returns None, or
-    the probe max is 0. It's deliberately cheap so it can be used as a
-    pre-flight gate on long-running pipelines.
+    To catch that while tolerating legitimate nodata padding (reference
+    satellite images often have ocean/no-coverage areas at their corners),
+    this helper probes five small regions — four corners + centre — and
+    returns True as soon as any region decodes to nonzero data. It only
+    returns False if EVERY probed region is all-zero, which is the unique
+    signature of the ASP TileOffsets bug.
 
     Parameters
     ----------
@@ -715,32 +716,61 @@ def verify_tiff_decodes_nonempty(path: str, label: str = "TIFF", sample_size: in
         Prefix used in warning prints so the caller's context is visible.
     sample_size : int
         Edge of the square probe window. Default 64 is enough to detect the
-        all-NoData failure mode without touching more than one tile.
+        all-NoData failure mode without touching more than one tile per
+        region.
     """
     try:
         from osgeo import gdal
+    except ImportError:
+        # GDAL Python bindings not available — can't verify, assume valid.
+        # Returning False here would cause the caller to delete a good file.
+        print(f"  {label}: osgeo not available, skipping decode check ({path})")
+        return True
+
+    try:
         gdal.UseExceptions()
         ds = gdal.Open(path)
         if ds is None:
             print(f"  {label}: gdal.Open returned None ({path})")
             return False
         band = ds.GetRasterBand(1)
-        w = min(sample_size, ds.RasterXSize)
-        h = min(sample_size, ds.RasterYSize)
-        probe = band.ReadAsArray(0, 0, w, h)
+        w = ds.RasterXSize
+        h = ds.RasterYSize
+
+        # Five probe locations: four corners + centre. A TIFF with legitimate
+        # nodata padding may have one or two all-zero corners, but the ASP
+        # TileOffsets bug makes EVERY region read as zero, so we accept as
+        # soon as we see one nonzero sample.
+        half = sample_size // 2
+        locations = [
+            (0, 0),
+            (max(0, w - sample_size), 0),
+            (0, max(0, h - sample_size)),
+            (max(0, w - sample_size), max(0, h - sample_size)),
+            (max(0, w // 2 - half), max(0, h // 2 - half)),
+        ]
+        for x, y in locations:
+            px = min(sample_size, w - x)
+            py = min(sample_size, h - y)
+            if px <= 0 or py <= 0:
+                continue
+            probe = band.ReadAsArray(x, y, px, py)
+            if probe is None:
+                continue
+            try:
+                if int(probe.max()) > 0:
+                    ds = None
+                    return True
+            except (ValueError, TypeError):
+                continue
         ds = None
     except Exception as e:
         print(f"  {label}: output not readable: {e} ({path})")
         return False
 
-    if probe is None:
-        print(f"  {label}: probe read returned None ({path})")
-        return False
-    if int(probe.max()) == 0:
-        print(f"  {label}: decodes as all-zero in sampled corner "
-              f"(likely zeroed TileOffsets / unfinalized TIFF) ({path})")
-        return False
-    return True
+    print(f"  {label}: decodes as all-zero across 5 sampled regions "
+          f"(likely zeroed TileOffsets / unfinalized TIFF) ({path})")
+    return False
 
 
 def stitch_frames(frames: list, output_path: str, output_dir: str,

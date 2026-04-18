@@ -1,16 +1,89 @@
-"""Generate ASP-compatible .match files from RoMa v2 dense correspondences.
+"""Generate ASP-compatible .match files from preprocessing correspondences.
 
-Replaces ASP's CPU-based ipfind + ipmatch with GPU-accelerated neural
-matching for inter-frame tie points used by bundle_adjust.  The output
-binary .match files follow ASP's IPRecord format and can be consumed
-directly via ``bundle_adjust --match-files-prefix``.
+Supports multiple matcher backends for inter-frame tie points used by
+bundle_adjust and panoramic preprocessing. The output binary .match
+files follow ASP's IPRecord format and can be consumed directly via
+``bundle_adjust --match-files-prefix``.
 """
 
 import os
 import struct
+from dataclasses import dataclass
+from typing import Optional
 
 import cv2
 import numpy as np
+
+from align.types import MatcherType
+
+
+@dataclass
+class PreprocessMatcherRuntime:
+    """Reusable backend-specific runtime for preprocessing matchers."""
+
+    matcher_name: str
+    device: str
+    model_cache: object | None = None
+    owns_cache: bool = False
+
+    def close(self) -> None:
+        cache = self.model_cache
+        self.model_cache = None
+        if self.owns_cache and cache is not None:
+            try:
+                cache.close()
+            except Exception:
+                pass
+
+
+def normalize_preprocess_matcher(name: str | None) -> str:
+    """Return the canonical preprocessing matcher name."""
+    if not name:
+        return MatcherType.ROMA.value
+    value = str(name).strip().lower()
+    if value in (MatcherType.ROMA.value, MatcherType.NIFT.value):
+        return value
+    raise ValueError(
+        f"Unsupported preprocess matcher '{name}'. "
+        f"Expected one of: {MatcherType.ROMA.value}, {MatcherType.NIFT.value}"
+    )
+
+
+def preprocess_matcher_cache_tag(name: str | None) -> str:
+    """Stable cache version tag for a preprocessing matcher backend."""
+    matcher = normalize_preprocess_matcher(name)
+    if matcher == MatcherType.NIFT.value:
+        return "nift_sparse_v1"
+    return "roma_tiled_v1"
+
+
+def create_preprocess_matcher_runtime(
+    matcher_name: str = MatcherType.ROMA.value,
+    device_override: str | None = None,
+) -> PreprocessMatcherRuntime:
+    """Create a reusable runtime for the selected preprocessing matcher."""
+    matcher = normalize_preprocess_matcher(matcher_name)
+    from align.models import get_torch_device
+
+    device = get_torch_device(
+        override=device_override if device_override not in (None, "", "auto") else None
+    )
+    if matcher == MatcherType.ROMA.value:
+        from align.models import ModelCache
+
+        cache = ModelCache(device)
+        return PreprocessMatcherRuntime(
+            matcher_name=matcher,
+            device=device,
+            model_cache=cache,
+            owns_cache=True,
+        )
+    return PreprocessMatcherRuntime(
+        matcher_name=matcher,
+        device=device,
+        model_cache=None,
+        owns_cache=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +283,9 @@ _ROMA_SIZE = 640
 _NUM_CORRESP = 600
 _CONFIDENCE_THRESH = 0.55
 _MIN_VALID_FRAC = 0.30
+_NIFT_RATIO_THRESH = 0.82
+_NIFT_MIN_KEYPOINTS = 24
+_NIFT_CELL_PX = 40
 
 
 def _run_roma_tiled(crop_a: np.ndarray, crop_b: np.ndarray, model,
@@ -366,6 +442,152 @@ def _run_roma_tiled(crop_a: np.ndarray, crop_b: np.ndarray, model,
             np.array(all_conf, dtype=np.float32))
 
 
+def _create_nift_extractor(max_features: int):
+    """Return a classical sparse feature extractor for the NIFT backend."""
+    if hasattr(cv2, "SIFT_create"):
+        return (
+            cv2.SIFT_create(
+                nfeatures=max_features,
+                contrastThreshold=0.01,
+                edgeThreshold=12,
+                sigma=1.2,
+            ),
+            cv2.NORM_L2,
+        )
+    return (
+        cv2.AKAZE_create(
+            descriptor_type=cv2.AKAZE_DESCRIPTOR_MLDB,
+            threshold=1e-4,
+            nOctaves=6,
+            nOctaveLayers=4,
+        ),
+        cv2.NORM_HAMMING,
+    )
+
+
+def _run_nift_sparse(crop_a: np.ndarray, crop_b: np.ndarray,
+                     max_matches: int = 5000,
+                     max_tiles: int = 300) -> tuple:
+    """Run a sparse classical matcher over two overlap crops.
+
+    This backend is intentionally CPU-friendly and deterministic. It
+    normalizes the crops, resizes them to a common grid, extracts sparse
+    features, performs mutual ratio-test matching, and returns crop-local
+    pixel coordinates plus heuristic confidences.
+    """
+    del max_tiles  # sparse backend does not tile
+
+    a_u8 = _clahe_u8(crop_a)
+    b_u8 = _clahe_u8(crop_b)
+
+    h = min(a_u8.shape[0], b_u8.shape[0])
+    w = min(a_u8.shape[1], b_u8.shape[1])
+    if a_u8.shape != (h, w):
+        a_u8 = cv2.resize(a_u8, (w, h), interpolation=cv2.INTER_AREA)
+    if b_u8.shape != (h, w):
+        b_u8 = cv2.resize(b_u8, (w, h), interpolation=cv2.INTER_AREA)
+
+    if min(h, w) < 96:
+        return None, None, None
+
+    extractor, norm = _create_nift_extractor(
+        max_features=max(2_000, min(max_matches * 6, 20_000))
+    )
+    kps_a, desc_a = extractor.detectAndCompute(a_u8, None)
+    kps_b, desc_b = extractor.detectAndCompute(b_u8, None)
+    if (
+        desc_a is None
+        or desc_b is None
+        or len(kps_a) < _NIFT_MIN_KEYPOINTS
+        or len(kps_b) < _NIFT_MIN_KEYPOINTS
+    ):
+        return None, None, None
+
+    matcher = cv2.BFMatcher(norm)
+    knn_ab = matcher.knnMatch(desc_a, desc_b, k=2)
+    knn_ba = matcher.knnMatch(desc_b, desc_a, k=2)
+
+    reverse_best = {}
+    for pair in knn_ba:
+        if len(pair) < 2:
+            continue
+        m, n = pair
+        if m.distance >= _NIFT_RATIO_THRESH * max(n.distance, 1e-6):
+            continue
+        reverse_best[m.queryIdx] = m.trainIdx
+
+    pts_a = []
+    pts_b = []
+    conf = []
+    for pair in knn_ab:
+        if len(pair) < 2:
+            continue
+        m, n = pair
+        if m.distance >= _NIFT_RATIO_THRESH * max(n.distance, 1e-6):
+            continue
+        if reverse_best.get(m.trainIdx) != m.queryIdx:
+            continue
+        ratio_conf = 1.0 - (m.distance / max(n.distance, 1e-6))
+        pts_a.append(kps_a[m.queryIdx].pt)
+        pts_b.append(kps_b[m.trainIdx].pt)
+        conf.append(float(max(0.0, min(1.0, ratio_conf))))
+
+    if len(pts_a) < 6:
+        return None, None, None
+
+    pts_a = np.asarray(pts_a, dtype=np.float32)
+    pts_b = np.asarray(pts_b, dtype=np.float32)
+    conf = np.asarray(conf, dtype=np.float32)
+
+    pts_a, pts_b, conf = _dedup_spatial(pts_a, pts_b, conf, cell_px=_NIFT_CELL_PX)
+    if len(pts_a) > max_matches:
+        order = np.argsort(-conf)[:max_matches]
+        pts_a = pts_a[order]
+        pts_b = pts_b[order]
+        conf = conf[order]
+    return pts_a, pts_b, conf
+
+
+def run_preprocess_matcher(
+    crop_a: np.ndarray,
+    crop_b: np.ndarray,
+    matcher_name: str = MatcherType.ROMA.value,
+    matcher_runtime: Optional[PreprocessMatcherRuntime] = None,
+    max_matches: int = 5000,
+    max_tiles: int = 300,
+    batch_size: int = 8,
+) -> tuple:
+    """Run the selected preprocessing matcher on two overlap crops."""
+    matcher = normalize_preprocess_matcher(
+        matcher_runtime.matcher_name if matcher_runtime is not None else matcher_name
+    )
+    own_runtime = matcher_runtime is None
+    runtime = matcher_runtime or create_preprocess_matcher_runtime(matcher)
+    try:
+        if matcher == MatcherType.NIFT.value:
+            return _run_nift_sparse(
+                crop_a,
+                crop_b,
+                max_matches=max_matches,
+                max_tiles=max_tiles,
+            )
+        cache = runtime.model_cache
+        if cache is None:
+            raise RuntimeError("RoMa preprocessing runtime missing model cache")
+        return _run_roma_tiled(
+            crop_a,
+            crop_b,
+            cache.roma,
+            runtime.device,
+            batch_size=batch_size,
+            max_matches=max_matches,
+            max_tiles=max_tiles,
+        )
+    finally:
+        if own_runtime:
+            runtime.close()
+
+
 # ---------------------------------------------------------------------------
 # Per-pair match file generation
 # ---------------------------------------------------------------------------
@@ -374,7 +596,8 @@ def generate_pair_matches(frame_a: str, frame_b: str,
                           corners_a: dict, corners_b: dict,
                           output_path: str,
                           max_matches: int = 3000,
-                          model_cache=None) -> str | None:
+                          matcher_name: str = MatcherType.ROMA.value,
+                          matcher_runtime: Optional[PreprocessMatcherRuntime] = None) -> str | None:
     """Generate an ASP .match file for one pair of overlapping frames.
 
     Parameters
@@ -387,8 +610,10 @@ def generate_pair_matches(frame_a: str, frame_b: str,
         Where to write the .match file.
     max_matches : int
         Maximum matches to retain after RANSAC and de-duplication.
-    model_cache : ModelCache, optional
-        Shared model cache.  Created internally if None.
+    matcher_name : str
+        Preprocessing matcher backend (`roma` or `nift`).
+    matcher_runtime : PreprocessMatcherRuntime, optional
+        Shared matcher runtime. Created internally if None.
 
     Returns
     -------
@@ -410,42 +635,32 @@ def generate_pair_matches(frame_a: str, frame_b: str,
     arr_a = _read_crop(frame_a, crop_a)
     arr_b = _read_crop(frame_b, crop_b)
 
-    # Lazy-load RoMa if no cache provided
-    own_cache = False
-    if model_cache is None:
-        from align.models import ModelCache, get_torch_device
-        device = get_torch_device()
-        model_cache = ModelCache(device)
-        own_cache = True
-
-    device = model_cache.device
-    model = model_cache.roma
-
-    pts_a, pts_b, conf = _run_roma_tiled(arr_a, arr_b, model, device,
-                                         max_matches=max_matches)
+    matcher = normalize_preprocess_matcher(matcher_name)
+    pts_a, pts_b, conf = run_preprocess_matcher(
+        arr_a,
+        arr_b,
+        matcher_name=matcher,
+        matcher_runtime=matcher_runtime,
+        max_matches=max_matches,
+    )
 
     if pts_a is None:
-        print(f"  [MatchIP] Too few matches for pair")
-        if own_cache:
-            model_cache.close()
+        print(f"  [MatchIP] Too few {matcher.upper()} matches for pair")
         return None
 
-    # RANSAC affine filter
-    src = pts_a.reshape(-1, 1, 2)
-    dst = pts_b.reshape(-1, 1, 2)
-    _, inliers = cv2.estimateAffinePartial2D(
-        src, dst, method=cv2.RANSAC, ransacReprojThreshold=8.0)
-
-    if inliers is None or inliers.sum() < 10:
-        print(f"  [MatchIP] RANSAC failed — {0 if inliers is None else int(inliers.sum())} inliers")
-        if own_cache:
-            model_cache.close()
+    pts_a, pts_b, conf, _M = apply_geometric_filters(
+        pts_a, pts_b, conf,
+        affine_reproj_px=8.0,
+        sampson_enabled=True, sampson_tau_px=3.0,
+        # MTE disabled globally for Phase-1 defaults — see rationale in
+        # camera_model._phase3_extract_ortho_pair_ties_world comment.
+        mte_enabled=False,
+        min_inliers=10,
+    )
+    if pts_a is None:
+        print(f"  [MatchIP] Geometric filters rejected all matches")
         return None
 
-    mask = inliers.ravel().astype(bool)
-    pts_a, pts_b, conf = pts_a[mask], pts_b[mask], conf[mask]
-
-    # Spatial de-duplication: keep best per 50 px cell
     pts_a, pts_b, conf = _dedup_spatial(pts_a, pts_b, conf, cell_px=50)
 
     # Cap at max_matches (keep highest confidence)
@@ -480,9 +695,6 @@ def generate_pair_matches(frame_a: str, frame_b: str,
     write_asp_match_file(full_a, full_b, output_path)
     print(f"  [MatchIP] Wrote {len(full_a)} matches → {os.path.basename(output_path)}")
 
-    if own_cache:
-        model_cache.close()
-
     return output_path
 
 
@@ -503,6 +715,230 @@ def _dedup_spatial(pts_a, pts_b, conf, cell_px=50):
 
 
 # ---------------------------------------------------------------------------
+# Phase 1 geometric-verification filters
+#
+# Raw dense matcher outputs (RoMa confidence, NIFT ratio-test) are necessary
+# but not sufficient to identify correct correspondences. These helpers add
+# three complementary geometric gates used at every tie-point site in the
+# per-segment preprocessing:
+#
+#   * robust_affine_filter  — MAGSAC++ affine (falls back to vanilla RANSAC
+#                             on older OpenCV). Replaces cv2.RANSAC for the
+#                             first-pass outlier rejection. MAGSAC++ uses a
+#                             marginalised scoring that is robust to the
+#                             choice of a single reprojection threshold.
+#   * sampson_distance_filter — fundamental-matrix Sampson distance on the
+#                               matches surviving the affine stage. Catches
+#                               matches that sit on wrong epipolar lines,
+#                               which affine-only verification can't reject.
+#   * mte_local_consistency_filter — Hou et al. 2023 §4.3 MTE in the
+#                                     residual domain. Each match's residual
+#                                     w.r.t. the global affine is compared to
+#                                     the mean residual of its k nearest
+#                                     neighbours; matches that are locally
+#                                     inconsistent (e.g. land-cover change)
+#                                     are dropped.
+#
+# The composite helper apply_geometric_filters() wires the three stages
+# together with per-site thresholds.
+# ---------------------------------------------------------------------------
+
+# OpenCV's estimateAffinePartial2D only supports RANSAC and LMEDS; MAGSAC++
+# is exposed via findHomography / findFundamentalMat. So we use RANSAC for
+# affine outlier rejection and MAGSAC++ (when available) for the Sampson F
+# matrix estimation where it actually works.
+_AFFINE_RANSAC_METHOD = cv2.RANSAC
+_F_MATRIX_METHOD = cv2.USAC_MAGSAC if hasattr(cv2, "USAC_MAGSAC") else cv2.FM_RANSAC
+
+# Fixed seed for cv2's internal RNG so RANSAC / MAGSAC runs are reproducible.
+# cv2.setRNGSeed is module-global, so each call site seeds immediately before
+# the estimator call. Without this seed, two runs on the same RoMa output can
+# pick different inlier sets and land scipy-LM in different pose basins
+# (observed 12 px vs 21 px RMS swing on Bahrain seg00 between runs).
+_CV2_RANSAC_SEED = 0xDEC1A55  # "DEC1ASS" — declass pipeline signature
+
+
+def _seed_cv2_rng(data: np.ndarray | None = None) -> None:
+    """Seed cv2's RNG with a deterministic value.
+
+    ``data`` is optionally incorporated so different call sites see
+    different (but still deterministic) random draws — otherwise
+    consecutive RANSACs share the same seed and can correlate.
+    """
+    seed = _CV2_RANSAC_SEED
+    if data is not None and data.size:
+        # Fold a cheap hash of the point cloud in so different inputs
+        # don't all share the same seed. Mask to a signed int32 range
+        # (cv2.setRNGSeed wants int; negative values wrap around in
+        # Python hash).
+        seed ^= hash(data.tobytes()[:256]) & 0x7FFFFFFF
+    cv2.setRNGSeed(int(seed & 0x7FFFFFFF))
+
+
+def robust_affine_filter(pts_a, pts_b, conf,
+                         reproj_px=3.0,
+                         min_inliers=10):
+    """RANSAC affine outlier rejection.
+
+    Returns (pts_a, pts_b, conf, M_affine) of the inlier set, or
+    (None, None, None, None) if fewer than ``min_inliers`` survive.
+    """
+    if pts_a is None or len(pts_a) < max(min_inliers, 4):
+        return None, None, None, None
+    src = pts_a.reshape(-1, 1, 2).astype(np.float32)
+    dst = pts_b.reshape(-1, 1, 2).astype(np.float32)
+    _seed_cv2_rng(src)
+    M, inliers = cv2.estimateAffinePartial2D(
+        src, dst,
+        method=_AFFINE_RANSAC_METHOD,
+        ransacReprojThreshold=float(reproj_px),
+    )
+    if M is None or inliers is None or int(inliers.sum()) < min_inliers:
+        return None, None, None, None
+    mask = inliers.ravel().astype(bool)
+    return pts_a[mask], pts_b[mask], conf[mask], np.asarray(M, dtype=np.float64)
+
+
+def sampson_distance_filter(pts_a, pts_b, conf,
+                            tau_px=2.0,
+                            min_inliers=10):
+    """Reject matches whose Sampson distance from the fundamental matrix
+    exceeds ``tau_px``. Uses MAGSAC++ for the F estimation when available
+    (cv2.USAC_MAGSAC) which is robust to the threshold choice. No-op if
+    fewer than 8 matches or if F estimation is unstable.
+    """
+    if pts_a is None or len(pts_a) < max(min_inliers, 8):
+        return pts_a, pts_b, conf
+    _seed_cv2_rng(pts_a)
+    F, _ = cv2.findFundamentalMat(
+        pts_a.astype(np.float32),
+        pts_b.astype(np.float32),
+        method=_F_MATRIX_METHOD,
+        ransacReprojThreshold=float(tau_px),
+        confidence=0.999,
+    )
+    if F is None or F.shape != (3, 3):
+        return pts_a, pts_b, conf
+    ones = np.ones((len(pts_a), 1), dtype=np.float64)
+    a_h = np.hstack([pts_a.astype(np.float64), ones])
+    b_h = np.hstack([pts_b.astype(np.float64), ones])
+    Fa = a_h @ F.T
+    Ftb = b_h @ F
+    numerator = np.einsum("ij,ij->i", b_h, Fa) ** 2
+    denominator = Fa[:, 0] ** 2 + Fa[:, 1] ** 2 + Ftb[:, 0] ** 2 + Ftb[:, 1] ** 2
+    sampson_sq = numerator / np.maximum(denominator, 1e-12)
+    mask = sampson_sq < (float(tau_px) ** 2)
+    if int(mask.sum()) < min_inliers:
+        return pts_a, pts_b, conf
+    return pts_a[mask], pts_b[mask], conf[mask]
+
+
+def mte_local_consistency_filter(pts_a, pts_b, conf, M_global,
+                                 radius_px=500.0,
+                                 k_neighbors=16,
+                                 max_local_dev_px=3.0,
+                                 min_inliers=10):
+    """MTE-style residual-consistency filter (Hou et al. 2023 §4.3 variant).
+
+    Each match's residual against the global affine ``M_global`` is compared
+    to the mean residual of its k nearest neighbours in image-A pixel space.
+    Matches whose residual deviates from the neighbourhood mean by more than
+    ``max_local_dev_px`` are dropped. This catches systematically-biased
+    groups of matches (e.g. land-cover change regions) that would otherwise
+    pass the global affine RANSAC.
+    """
+    if (pts_a is None
+            or M_global is None
+            or len(pts_a) < max(min_inliers, k_neighbors + 1)):
+        return pts_a, pts_b, conf
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        return pts_a, pts_b, conf
+
+    pts_a64 = pts_a.astype(np.float64)
+    pts_b64 = pts_b.astype(np.float64)
+    ones = np.ones((len(pts_a64), 1), dtype=np.float64)
+    pred_b = np.hstack([pts_a64, ones]) @ M_global.T
+    residual = pts_b64 - pred_b
+    residual_norm = np.linalg.norm(residual, axis=1)
+
+    tree = cKDTree(pts_a64)
+    k = min(k_neighbors + 1, len(pts_a64))
+    _, nn_idx = tree.query(pts_a64, k=k, distance_upper_bound=float(radius_px))
+
+    # Global robust scale of residuals — matches in genuinely noisy regions
+    # still see deviations on the order of this scale, not the local mean.
+    global_mad = float(np.median(np.abs(residual_norm - np.median(residual_norm))))
+    global_scale = max(1.4826 * global_mad, 0.5)
+
+    # Global-scale rejection catches matches whose residual magnitude is
+    # far beyond the typical noise — even when they are densely clustered
+    # with other outliers (so the local neighbourhood mean/median is also
+    # biased, leaving them looking "locally consistent").
+    global_reject_threshold = max(4.0 * global_scale, 2.0 * max_local_dev_px)
+
+    n = len(pts_a64)
+    mask = np.ones(n, dtype=bool)
+    for i in range(n):
+        if residual_norm[i] > global_reject_threshold:
+            mask[i] = False
+            continue
+        nb = nn_idx[i][1:]
+        nb = nb[nb < n]
+        if len(nb) < 4:
+            continue
+        # Compare this match's residual to the MEDIAN of its neighbours
+        # (robust to clustered outliers among the neighbours).
+        local_med = np.median(residual[nb], axis=0)
+        dev = float(np.linalg.norm(residual[i] - local_med))
+        if dev > max_local_dev_px:
+            mask[i] = False
+
+    if int(mask.sum()) < min_inliers:
+        return pts_a, pts_b, conf
+    return pts_a[mask], pts_b[mask], conf[mask]
+
+
+def apply_geometric_filters(pts_a, pts_b, conf,
+                            affine_reproj_px=3.0,
+                            sampson_enabled=True,
+                            sampson_tau_px=2.0,
+                            mte_enabled=True,
+                            mte_radius_px=500.0,
+                            mte_k_neighbors=16,
+                            mte_max_dev_px=3.0,
+                            min_inliers=10):
+    """Composite Phase-1 filter: MAGSAC++ affine → Sampson → MTE.
+
+    Returns (pts_a, pts_b, conf, M_affine) of surviving matches, or
+    (None, None, None, None) if fewer than ``min_inliers`` survive the
+    affine stage (the other stages fall back to no-op when under-determined
+    so the pipeline can continue on low-sample tile pairs).
+    """
+    pts_a, pts_b, conf, M = robust_affine_filter(
+        pts_a, pts_b, conf,
+        reproj_px=affine_reproj_px, min_inliers=min_inliers,
+    )
+    if pts_a is None:
+        return None, None, None, None
+    if sampson_enabled:
+        pts_a, pts_b, conf = sampson_distance_filter(
+            pts_a, pts_b, conf,
+            tau_px=sampson_tau_px, min_inliers=min_inliers,
+        )
+    if mte_enabled:
+        pts_a, pts_b, conf = mte_local_consistency_filter(
+            pts_a, pts_b, conf, M,
+            radius_px=mte_radius_px,
+            k_neighbors=mte_k_neighbors,
+            max_local_dev_px=mte_max_dev_px,
+            min_inliers=min_inliers,
+        )
+    return pts_a, pts_b, conf, M
+
+
+# ---------------------------------------------------------------------------
 # Strip-level match file generation
 # ---------------------------------------------------------------------------
 
@@ -513,11 +949,198 @@ def asp_match_filename(prefix: str, frame_a: str, frame_b: str) -> str:
     return f"{prefix}-{stem_a}__{stem_b}.match"
 
 
+def generate_subframe_pair_matches(frame_a: str, frame_b: str,
+                                    output_path: str,
+                                    overlap_frac: float = 0.20,
+                                    max_matches: int = 8000,
+                                    max_tiles: int = 1000,
+                                    matcher_name: str = MatcherType.ROMA.value,
+                                    matcher_runtime: Optional[PreprocessMatcherRuntime] = None) -> str | None:
+    """Generate an ASP .match file for a pair of adjacent sub-frames.
+
+    Unlike :func:`generate_pair_matches`, which derives the overlap from
+    USGS corners, this function crops the pair by pixel fraction: the
+    RIGHT ``overlap_frac`` of ``frame_a`` is matched against the LEFT
+    ``overlap_frac`` of ``frame_b``. This bypasses the corner-based
+    overlap detection entirely, which fails for sub-frames whose
+    interpolated corners share a common boundary line (zero bbox
+    intersection).
+
+    Caller is responsible for ensuring the two sub-frames are arranged
+    so that frame_a's right edge and frame_b's left edge correspond to
+    the same ground region (i.e. stitch order, post-rotation for Aft).
+
+    Parameters
+    ----------
+    frame_a, frame_b : str
+        Paths to the adjacent sub-frame images. For Aft cameras these
+        should already be the 180°-rotated versions.
+    output_path : str
+        Where to write the .match file.
+    overlap_frac : float
+        Fraction of each frame's width to include in the overlap crop.
+        Default 0.20 captures the KH panoramic camera's ~10% physical
+        overlap plus a 10% buffer for cam_gen corner inaccuracy.
+    max_matches : int
+        Maximum matches to retain after RANSAC + de-duplication.
+    matcher_name : str
+        Preprocessing matcher backend (`roma` or `nift`).
+    matcher_runtime : PreprocessMatcherRuntime, optional
+        Shared matcher runtime; lazily created if None.
+
+    Returns
+    -------
+    str or None
+        Path to the written .match file, or None on failure.
+    """
+    dims_a = _image_dims(frame_a)
+    dims_b = _image_dims(frame_b)
+
+    w_a, h_a = dims_a
+    w_b, h_b = dims_b
+
+    crop_w_a = max(256, int(round(w_a * overlap_frac)))
+    crop_w_b = max(256, int(round(w_b * overlap_frac)))
+
+    # Right slab of frame_a, left slab of frame_b.
+    crop_a = (w_a - crop_w_a, 0, w_a, h_a)
+    crop_b = (0, 0, crop_w_b, h_b)
+
+    print(f"  [MatchIP/subframe] Pixel crops: "
+          f"A={_crop_str(crop_a)} B={_crop_str(crop_b)}")
+
+    arr_a = _read_crop(frame_a, crop_a)
+    arr_b = _read_crop(frame_b, crop_b)
+
+    matcher = normalize_preprocess_matcher(matcher_name)
+    pts_a, pts_b, conf = run_preprocess_matcher(
+        arr_a,
+        arr_b,
+        matcher_name=matcher,
+        matcher_runtime=matcher_runtime,
+        max_matches=max_matches,
+        max_tiles=max_tiles,
+    )
+
+    if pts_a is None:
+        print(f"  [MatchIP/subframe] Too few {matcher.upper()} matches for "
+              f"{os.path.basename(frame_a)} ↔ {os.path.basename(frame_b)}")
+        return None
+
+    pts_a, pts_b, conf, _M = apply_geometric_filters(
+        pts_a, pts_b, conf,
+        affine_reproj_px=8.0,
+        sampson_enabled=True, sampson_tau_px=3.0,
+        # MTE disabled globally for Phase-1 defaults — see rationale in
+        # camera_model._phase3_extract_ortho_pair_ties_world comment.
+        mte_enabled=False,
+        min_inliers=10,
+    )
+    if pts_a is None:
+        print(f"  [MatchIP/subframe] Geometric filters rejected all matches")
+        return None
+
+    pts_a, pts_b, conf = _dedup_spatial(pts_a, pts_b, conf, cell_px=50)
+
+    if len(pts_a) > max_matches:
+        order = np.argsort(-conf)[:max_matches]
+        pts_a, pts_b, conf = pts_a[order], pts_b[order], conf[order]
+
+    # _run_roma_tiled resizes both crops to a common (w, h) before
+    # matching, so scale pts_a/pts_b back to each crop's original size,
+    # then add the crop offset to put them in full-frame coordinates.
+    crop_a_w = crop_a[2] - crop_a[0]
+    crop_a_h = crop_a[3] - crop_a[1]
+    crop_b_w = crop_b[2] - crop_b[0]
+    crop_b_h = crop_b[3] - crop_b[1]
+    common_w = min(arr_a.shape[1], arr_b.shape[1])
+    common_h = min(arr_a.shape[0], arr_b.shape[0])
+
+    full_a = pts_a.copy()
+    full_a[:, 0] = pts_a[:, 0] * (crop_a_w / common_w) + crop_a[0]
+    full_a[:, 1] = pts_a[:, 1] * (crop_a_h / common_h) + crop_a[1]
+
+    full_b = pts_b.copy()
+    full_b[:, 0] = pts_b[:, 0] * (crop_b_w / common_w) + crop_b[0]
+    full_b[:, 1] = pts_b[:, 1] * (crop_b_h / common_h) + crop_b[1]
+
+    write_asp_match_file(full_a, full_b, output_path)
+    print(f"  [MatchIP/subframe] Wrote {len(full_a)} matches → "
+          f"{os.path.basename(output_path)}")
+
+    return output_path
+
+
+def generate_subframe_strip_matches(frames: list[str],
+                                     output_dir: str,
+                                     match_prefix: str = "roma_sub",
+                                     overlap_frac: float = 0.20,
+                                     max_matches_per_pair: int = 8000,
+                                     max_tiles_per_pair: int = 1000,
+                                     matcher_name: str = MatcherType.ROMA.value,
+                                     ) -> str | None:
+    """Generate ASP .match files for all adjacent sub-frame pairs.
+
+    Sub-frame variant of :func:`generate_strip_matches` that uses
+    pixel-based overlap cropping (see
+    :func:`generate_subframe_pair_matches`) instead of corner-derived
+    geographic overlap. Required for sub-frames whose interpolated
+    corners share a boundary line rather than an overlap region.
+    """
+    if len(frames) < 2:
+        print("  [MatchIP/subframe] Need at least 2 sub-frames")
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    prefix_path = os.path.join(output_dir, match_prefix)
+
+    matcher = normalize_preprocess_matcher(matcher_name)
+    runtime = create_preprocess_matcher_runtime(matcher)
+
+    produced = 0
+    try:
+        for i in range(len(frames) - 1):
+            fa, fb = frames[i], frames[i + 1]
+            match_name = asp_match_filename(match_prefix, fa, fb)
+            match_path = os.path.join(output_dir, match_name)
+
+            if os.path.exists(match_path):
+                print(f"  [MatchIP/subframe] Skipping existing: {match_name}")
+                produced += 1
+                continue
+
+            print(f"  [MatchIP/subframe] Matching pair {i+1}/{len(frames)-1}: "
+                  f"{os.path.basename(fa)} ↔ {os.path.basename(fb)} "
+                  f"[{matcher.upper()}]")
+
+            result = generate_subframe_pair_matches(
+                fa, fb, match_path,
+                overlap_frac=overlap_frac,
+                max_matches=max_matches_per_pair,
+                max_tiles=max_tiles_per_pair,
+                matcher_name=matcher,
+                matcher_runtime=runtime,
+            )
+            if result is not None:
+                produced += 1
+    finally:
+        runtime.close()
+
+    if produced == 0:
+        print("  [MatchIP/subframe] No match files produced")
+        return None
+
+    print(f"  [MatchIP/subframe] Generated {produced}/{len(frames)-1} "
+          f"match files → prefix={prefix_path}")
+    return prefix_path
+
+
 def generate_strip_matches(frames: list[str],
                            corners_list: list[dict],
                            output_dir: str,
                            match_prefix: str = "roma",
-                           max_matches_per_pair: int = 3000) -> str | None:
+                           max_matches_per_pair: int = 3000,
+                           matcher_name: str = MatcherType.ROMA.value) -> str | None:
     """Generate ASP .match files for all adjacent frame pairs in a strip.
 
     Parameters
@@ -546,36 +1169,37 @@ def generate_strip_matches(frames: list[str],
     os.makedirs(output_dir, exist_ok=True)
     prefix_path = os.path.join(output_dir, match_prefix)
 
-    # Share a single ModelCache across all pairs
-    from align.models import ModelCache, get_torch_device
-    device = get_torch_device()
-    cache = ModelCache(device)
+    matcher = normalize_preprocess_matcher(matcher_name)
+    runtime = create_preprocess_matcher_runtime(matcher)
 
     produced = 0
-    for i in range(len(frames) - 1):
-        fa, fb = frames[i], frames[i + 1]
-        ca, cb = corners_list[i], corners_list[i + 1]
+    try:
+        for i in range(len(frames) - 1):
+            fa, fb = frames[i], frames[i + 1]
+            ca, cb = corners_list[i], corners_list[i + 1]
 
-        match_name = asp_match_filename(match_prefix, fa, fb)
-        match_path = os.path.join(output_dir, match_name)
+            match_name = asp_match_filename(match_prefix, fa, fb)
+            match_path = os.path.join(output_dir, match_name)
 
-        if os.path.exists(match_path):
-            print(f"  [MatchIP] Skipping existing: {match_name}")
-            produced += 1
-            continue
+            if os.path.exists(match_path):
+                print(f"  [MatchIP] Skipping existing: {match_name}")
+                produced += 1
+                continue
 
-        print(f"  [MatchIP] Matching pair {i+1}/{len(frames)-1}: "
-              f"{os.path.basename(fa)} ↔ {os.path.basename(fb)}")
+            print(f"  [MatchIP] Matching pair {i+1}/{len(frames)-1}: "
+                  f"{os.path.basename(fa)} ↔ {os.path.basename(fb)} "
+                  f"[{matcher.upper()}]")
 
-        result = generate_pair_matches(
-            fa, fb, ca, cb, match_path,
-            max_matches=max_matches_per_pair,
-            model_cache=cache,
-        )
-        if result is not None:
-            produced += 1
-
-    cache.close()
+            result = generate_pair_matches(
+                fa, fb, ca, cb, match_path,
+                max_matches=max_matches_per_pair,
+                matcher_name=matcher,
+                matcher_runtime=runtime,
+            )
+            if result is not None:
+                produced += 1
+    finally:
+        runtime.close()
 
     if produced == 0:
         print("  [MatchIP] No match files produced")

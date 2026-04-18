@@ -16,6 +16,7 @@ import numpy as np
 class MatcherType(str, Enum):
     """Dense feature matcher backend."""
     ROMA = "roma"
+    NIFT = "nift"
 
 
 class MaskProvider(str, Enum):
@@ -271,5 +272,4 @@ class BlockManifest:
     manifest_path: str
     jobs: list[AlignmentJob]
     shared_options: dict[str, Any] = field(default_factory=dict)
-
 

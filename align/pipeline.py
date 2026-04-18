@@ -283,8 +283,11 @@ def _ensure_overviews(path, width, height):
     if has_overviews:
         return
     print(f"  Building GDAL overviews for {os.path.basename(path)}...")
+    # Prefer homebrew gdaladdo to match rasterio's GDAL version; ASP's
+    # bundled GDAL 3.8.1 on PATH can produce .ovr files that 3.11 can't reopen.
+    _gdaladdo = "/opt/homebrew/bin/gdaladdo" if os.path.isfile("/opt/homebrew/bin/gdaladdo") else "gdaladdo"
     result = subprocess.run(
-        ["gdaladdo", "-r", "average", path, "2", "4", "8", "16"],
+        [_gdaladdo, "-r", "average", path, "2", "4", "8", "16"],
         capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  WARNING: gdaladdo failed: {result.stderr.strip()}")

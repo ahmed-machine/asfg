@@ -36,7 +36,7 @@ E2E_CONFIG = PROJECT_ROOT / "scripts" / "test" / "e2e_configs" / "bahrain_kh9_pc
 ENTITY_ID = "D3C1213-200346A003"  # Bahrain KH-9 PC Aft scene
 
 
-def ensure_target_built() -> str:
+def ensure_target_built(preprocess_matcher: str = "roma") -> str:
     """Materialize the per-segment orthorectified target for the Bahrain KH-9
     PC scene and return its path. Runs process.py --skip-align --skip-mosaic
     against the shared output/ cache, so downloads/extracted/georef stages
@@ -57,26 +57,45 @@ def ensure_target_built() -> str:
     catalogs = [str(PROJECT_ROOT / c) for c in cfg["catalogs"]]
 
     # Candidate output paths (see paths.py :: ortho_path, ortho_segments_dir
-    # and preprocess/camera_model.py line ~474 for the VRT filename).
+    # and preprocess/camera_model.py for the per-segment output).
     ortho_tif = CACHE_DIR / "ortho" / f"{ENTITY_ID}_ortho.tif"
-    ortho_vrt_dir = CACHE_DIR / "ortho" / f"{ENTITY_ID}_segments"
-    existing_vrts = sorted(ortho_vrt_dir.glob("*_per_segment.vrt")) if ortho_vrt_dir.exists() else []
+    ortho_seg_dir = CACHE_DIR / "ortho" / f"{ENTITY_ID}_segments"
+    selected_matcher = str(preprocess_matcher).strip().lower() or "roma"
+    # Prefer materialized TIF over VRT (VRT chains cause GDAL version issues).
+    existing_tifs = sorted(ortho_seg_dir.glob("*_per_segment.tif")) if ortho_seg_dir.exists() else []
+    existing_vrts = sorted(ortho_seg_dir.glob("*_per_segment.vrt")) if ortho_seg_dir.exists() and not existing_tifs else []
 
     def _resolve_existing() -> str | None:
+        if existing_tifs:
+            return str(existing_tifs[-1])
         if existing_vrts:
             return str(existing_vrts[-1])
         if ortho_tif.exists():
             return str(ortho_tif)
         return None
 
-    # Fast path: a per-segment VRT already exists. Prefer it over any
-    # single-image _ortho.tif because per-segment is what we're trying to
-    # produce now. Still crop to the reference overlap before returning.
-    if existing_vrts:
-        print(f"  [ensure_target_built] Using cached per-segment VRT: {existing_vrts[-1]}")
-        cropped = _crop_ortho_to_reference(str(existing_vrts[-1]), ref_path, ortho_vrt_dir)
+    metadata_path = CACHE_DIR / "georef" / f"{ENTITY_ID}_metadata.json"
+    metadata = None
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except Exception:
+            metadata = None
+    cached_matcher = str((metadata or {}).get("preprocess_matcher", "roma")).strip().lower() or "roma"
+
+    # Fast path: a per-segment mosaic already exists. Prefer materialized
+    # TIF over VRT. Crop to the reference overlap before returning.
+    per_seg = existing_tifs or existing_vrts
+    if per_seg and cached_matcher == selected_matcher:
+        print(f"  [ensure_target_built] Using cached per-segment mosaic: {per_seg[-1]}")
+        cropped = _crop_ortho_to_reference(str(per_seg[-1]), ref_path, ortho_seg_dir)
         print(f"  [ensure_target_built] Cropped target: {cropped}")
         return cropped
+    if per_seg and cached_matcher != selected_matcher:
+        print(
+            f"  [ensure_target_built] Cached per-segment target uses matcher "
+            f"{cached_matcher}; rebuilding with {selected_matcher}"
+        )
 
     # Stale single-image ortho sitting in the cache would short-circuit
     # process.py's _path_is_stale check and block per-segment regeneration.
@@ -89,7 +108,6 @@ def ensure_target_built() -> str:
     # Also clear the asp_ortho_path key from the scene metadata so
     # _ensure_scene_asp_ortho doesn't short-circuit on the old single-image
     # path. Keep the rest of the georef metadata intact.
-    metadata_path = CACHE_DIR / "georef" / f"{ENTITY_ID}_metadata.json"
     if metadata_path.exists():
         try:
             meta = json.loads(metadata_path.read_text())
@@ -110,6 +128,7 @@ def ensure_target_built() -> str:
         "--output-dir", str(CACHE_DIR / "preprocess_run"),
         "--skip-align",
         "--skip-mosaic",
+        "--preprocess-matcher", preprocess_matcher,
     ]
     if cfg.get("prefer_camera"):
         cmd.extend(["--prefer-camera", cfg["prefer_camera"]])
@@ -119,19 +138,19 @@ def ensure_target_built() -> str:
     subprocess.run(cmd, check=True, cwd=str(PROJECT_ROOT))
 
     # Re-scan after preprocessing.
-    existing_vrts = sorted(ortho_vrt_dir.glob("*_per_segment.vrt")) if ortho_vrt_dir.exists() else []
+    existing_tifs = sorted(ortho_seg_dir.glob("*_per_segment.tif")) if ortho_seg_dir.exists() else []
+    existing_vrts = sorted(ortho_seg_dir.glob("*_per_segment.vrt")) if ortho_seg_dir.exists() and not existing_tifs else []
     resolved = _resolve_existing()
     if not resolved:
         raise RuntimeError(
-            f"Preprocessing did not produce an ortho under {ortho_vrt_dir} or at {ortho_tif}"
+            f"Preprocessing did not produce an ortho under {ortho_seg_dir} or at {ortho_tif}"
         )
 
-    # The per-segment VRT spans the full ~200 km KH-9 strip, but the
-    # reference only covers ~60 km (Bahrain). Crop the VRT to the
-    # reference's footprint plus ~5 km margin so coarse offset detection
-    # and feature matching don't waste effort on regions with no reference
-    # coverage. The pre-stitched v173 target was already cropped this way.
-    cropped = _crop_ortho_to_reference(resolved, ref_path, ortho_vrt_dir)
+    # The per-segment mosaic spans the full ~200 km KH-9 strip, but the
+    # reference only covers ~60 km (Bahrain). Crop to the reference's
+    # footprint plus ~5 km margin so coarse offset detection and feature
+    # matching don't waste effort on regions with no reference coverage.
+    cropped = _crop_ortho_to_reference(resolved, ref_path, ortho_seg_dir)
     print(f"  [ensure_target_built] Cropped target: {cropped}")
     return cropped
 
@@ -159,9 +178,9 @@ def _crop_ortho_to_reference(ortho_path: str, reference_path: str,
     MARGIN_M = 5000.0
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cropped_vrt = out_dir / f"{ENTITY_ID}_cropped.vrt"
+    cropped_tif = out_dir / f"{ENTITY_ID}_cropped.tif"
 
-    # Determine target CRS from the ortho VRT.
+    # Determine target CRS from the ortho.
     with rasterio.open(ortho_path) as ortho_src:
         target_crs = ortho_src.crs.to_string() if ortho_src.crs else "EPSG:3857"
 
@@ -175,12 +194,11 @@ def _crop_ortho_to_reference(ortho_path: str, reference_path: str,
         ref_bounds_native.right, ref_bounds_native.top,
     )
 
-    # Enumerate sub-segment tifs (siblings of the VRT) and compute the
+    # Enumerate sub-segment tifs (siblings of the ortho) and compute the
     # union of segment bounds that intersect the reference bounds.
     seg_dir = Path(ortho_path).parent
     seg_tifs = sorted(seg_dir.glob("*_seg*_ortho.tif"))
     if not seg_tifs:
-        # Fall back to the whole ortho's bounds if no per-segment tifs found.
         with rasterio.open(ortho_path) as src:
             src_bounds = src.bounds
         seg_union = (src_bounds.left, src_bounds.bottom,
@@ -190,7 +208,6 @@ def _crop_ortho_to_reference(ortho_path: str, reference_path: str,
         for tif in seg_tifs:
             with rasterio.open(tif) as s:
                 b = s.bounds
-            # Does this segment overlap the reference bounds?
             if (b.right < ref_left or b.left > ref_right or
                     b.top < ref_bottom or b.bottom > ref_top):
                 continue
@@ -199,7 +216,7 @@ def _crop_ortho_to_reference(ortho_path: str, reference_path: str,
             rights.append(b.right)
             tops.append(b.top)
         if not lefts:
-            print(f"  [crop] No segments overlap reference — using full VRT extent")
+            print(f"  [crop] No segments overlap reference — using full extent")
             with rasterio.open(ortho_path) as src:
                 src_bounds = src.bounds
             seg_union = (src_bounds.left, src_bounds.bottom,
@@ -215,29 +232,52 @@ def _crop_ortho_to_reference(ortho_path: str, reference_path: str,
 
     if east <= west or north <= south:
         print(f"  [crop] Empty intersection (ref={ref_left:.0f},{ref_bottom:.0f},"
-              f"{ref_right:.0f},{ref_top:.0f} segs={seg_union}) — using VRT as-is")
+              f"{ref_right:.0f},{ref_top:.0f} segs={seg_union}) — using as-is")
         return ortho_path
 
-    # Reuse existing cropped VRT if it's newer than the source.
+    # Reuse existing cropped TIF if it's newer than the source.
     try:
-        if cropped_vrt.exists() and cropped_vrt.stat().st_mtime > Path(ortho_path).stat().st_mtime:
-            return str(cropped_vrt)
+        if cropped_tif.exists() and cropped_tif.stat().st_mtime > Path(ortho_path).stat().st_mtime:
+            return str(cropped_tif)
     except OSError:
         pass
 
+    # Materialize crop as a real GeoTIFF (not a VRT).  VRT chains cause
+    # rasterio/GDAL version mismatch failures when the CLI writer (ASP
+    # GDAL 3.8) differs from the Python reader (homebrew GDAL 3.11).
+    gdal_translate = "/opt/homebrew/bin/gdal_translate" if os.path.isfile(
+        "/opt/homebrew/bin/gdal_translate") else "gdal_translate"
     cmd = [
-        "gdalbuildvrt", "-overwrite",
-        "-te", f"{west}", f"{south}", f"{east}", f"{north}",
-        str(cropped_vrt), ortho_path,
+        gdal_translate,
+        "-projwin", f"{west}", f"{north}", f"{east}", f"{south}",
+        "-co", "COMPRESS=LZW", "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER",
+        ortho_path, str(cropped_tif),
     ]
-    print(f"  [crop] gdalbuildvrt -te {west:.1f} {south:.1f} {east:.1f} {north:.1f} "
+    print(f"  [crop] gdal_translate -projwin {west:.1f} {north:.1f} {east:.1f} {south:.1f} "
           f"(width={east-west:.0f}m height={north-south:.0f}m)")
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0 or not cropped_vrt.exists():
-        print(f"  [crop] gdalbuildvrt failed: {result.stderr[:400]}")
+    if result.returncode != 0 or not cropped_tif.exists():
+        print(f"  [crop] gdal_translate failed: {result.stderr[:400]}")
         return ortho_path
 
-    return str(cropped_vrt)
+    # Diagnostic: check that the crop has meaningful content.
+    try:
+        with rasterio.open(str(cropped_tif)) as src:
+            w, h = src.width, src.height
+            cx, cy = w // 2, h // 2
+            sz = min(128, w, h)
+            window = rasterio.windows.Window(cx - sz // 2, cy - sz // 2, sz, sz)
+            patch = src.read(1, window=window)
+            nd = src.nodata if src.nodata is not None else -32768
+            valid_frac = float((patch != nd).sum()) / max(1, patch.size)
+            print(f"  [crop] Cropped TIF: {w}x{h}px, centre valid={valid_frac:.1%}")
+            if valid_frac < 0.05:
+                print(f"  [crop] WARNING: <5% valid pixels in centre — "
+                      f"possible orientation mismatch or wrong crop region")
+    except Exception as e:
+        print(f"  [crop] Content check skipped: {e}")
+
+    return str(cropped_tif)
 
 
 def detect_next_version():
@@ -974,11 +1014,28 @@ def main():
                         help="Version number (default: auto-detect next)")
     parser.add_argument("--timeout", "-t", type=int, default=9000,
                         help="Timeout in seconds (default: 9000 = 150 min)")
+    parser.add_argument("--stage", choices=["preprocess", "align", "all"],
+                        default="all",
+                        help="Which stage to run. 'preprocess' builds the "
+                             "per-segment ortho target (download/extract/"
+                             "stitch/ortho/crop). 'align' runs auto-align "
+                             "on the cached target. 'all' runs both (default).")
+    parser.add_argument("--preprocess-matcher", choices=["roma", "nift"],
+                        default="roma",
+                        help="Matcher backend for preprocessing target generation")
     args = parser.parse_args()
 
     version = args.version if args.version is not None else detect_next_version()
-    run_pipeline(version, args.timeout)
-    cleanup_old_runs(version)
+
+    if args.stage in ("preprocess", "all"):
+        target = ensure_target_built(args.preprocess_matcher)
+        print(f"\n=== Preprocess complete: {target} ===\n")
+        if args.stage == "preprocess":
+            return
+
+    if args.stage in ("align", "all"):
+        run_pipeline(version, args.timeout)
+        cleanup_old_runs(version)
 
 
 if __name__ == "__main__":

@@ -31,8 +31,9 @@ from preprocess.mosaic import build_all_mosaics, build_mosaic
 from preprocess.georef import fetch_sentinel2_reference, build_composite_reference
 from preprocess.orientation import swap_corners_180, detect_orientation, verify_orientation_against_reference
 from preprocess.auto_anchors import generate_auto_anchors
-from preprocess.experimental.match_ip import generate_strip_matches
+from preprocess.experimental.match_ip import generate_strip_matches, normalize_preprocess_matcher
 from preprocess.camera_model import generate_camera, mapproject_image
+from preprocess.mission_altitude import altitude_m_at, parse_entity_id
 from preprocess.dem import fetch_and_prepare_dem
 from align.experimental.bundle_adjust import run_strip_bundle_adjustment
 from align.params import load_profile
@@ -73,12 +74,50 @@ def _save_scene_metadata(cache_dir: str, entity_id: str, payload: dict) -> str:
     return path
 
 
+def _parse_acquisition_date(raw: str):
+    """Convert USGS ``acquisition_date`` ('YYYY/MM/DD') to :class:`datetime.date`.
+
+    Returns ``None`` when the string is missing or unparseable; downstream
+    code then falls back to catalog-nominal or 170 km.
+    """
+    from datetime import date, datetime
+    if not raw:
+        return None
+    raw = raw.strip()
+    for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _altitude_seed_for_scene(scene) -> float | None:
+    """Best-effort per-mission altitude seed for cam_gen Zs0.
+
+    Returns ``None`` when mission catalog / TLE are unavailable so the
+    caller falls through to the 170 km nominal baked into ``cam_gen``.
+    """
+    mref = parse_entity_id(scene.entity_id) if scene.entity_id else None
+    if mref is None:
+        return None
+    acq = _parse_acquisition_date(scene.acquisition_date)
+    ctr = getattr(scene, "center", None)
+    lat = lon = None
+    if isinstance(ctr, (list, tuple)) and len(ctr) >= 2:
+        lat = float(ctr[0])
+        lon = float(ctr[1])
+    res = altitude_m_at(mref.mission_id, acq, lat, lon)
+    return float(res.altitude_m) if res is not None else None
+
+
 def _default_scene_metadata(scene, cache_dir: str) -> dict:
     eid = scene.entity_id
     return {
         "entity_id": eid,
         "camera_designation": _camera_designation(scene),
         "profile": _profile_name_for_scene(scene),
+        "preprocess_matcher": "roma",
         "gcp_corners": {k: list(v) for k, v in scene.corners.items()},
         "georef_path": os.path.abspath(paths.georef_path(cache_dir, eid)),
         "stitched_path": os.path.abspath(paths.stitched_path(cache_dir, eid)),
@@ -133,11 +172,21 @@ def _profile_name_for_scene(scene) -> str:
     raise ValueError(f"Unsupported camera system for {scene.entity_id}")
 
 
-def _camera_params_for_scene(scene) -> dict | None:
+def _metadata_preprocess_matcher(metadata: dict | None, fallback: str = "roma") -> str:
+    try:
+        return normalize_preprocess_matcher((metadata or {}).get("preprocess_matcher", fallback))
+    except Exception:
+        return normalize_preprocess_matcher(fallback)
+
+
+def _camera_params_for_scene(scene, preprocess_matcher: str | None = None) -> dict | None:
     profile = load_profile(_profile_name_for_scene(scene))
     if not profile.camera.is_panoramic:
         return None
     params = copy.deepcopy(profile.camera.to_dict())
+    params["preprocess_matcher"] = normalize_preprocess_matcher(
+        preprocess_matcher or params.get("preprocess_matcher", "roma")
+    )
     designation = _camera_designation(scene)
     if designation == "A":
         params["forward_tilt"] = -abs(params.get("forward_tilt", 0.0))
@@ -196,10 +245,69 @@ def _path_is_stale(path: str | None, *dependencies: str | None) -> bool:
     return False
 
 
+def _primary_input_update(georef_path: str | None, asp_ortho_path: str | None) -> dict:
+    if asp_ortho_path and os.path.exists(asp_ortho_path):
+        return {
+            "primary_input_kind": "asp_ortho",
+            "primary_input_path": os.path.abspath(asp_ortho_path),
+        }
+    if georef_path and os.path.exists(georef_path):
+        return {
+            "primary_input_kind": "georef",
+            "primary_input_path": os.path.abspath(georef_path),
+        }
+    return {
+        "primary_input_kind": None,
+        "primary_input_path": None,
+    }
+
+
 def _alignment_crop_path(cache_dir: str, entity_id: str, input_kind: str) -> str:
     crop_dir = "ortho" if input_kind == "asp_ortho" else "georef"
     safe_kind = re.sub(r"[^a-z0-9_]+", "_", input_kind.lower())
     return os.path.join(cache_dir, crop_dir, f"{entity_id}_{safe_kind}_cropped.tif")
+
+
+def _filter_frames_to_bbox(frames: list[str], corners: dict, scene, reference: str) -> list[str] | None:
+    """Return the subset of *frames* whose geographic extent overlaps the reference bbox.
+
+    Each frame covers 1/N of the strip.  For Aft cameras the geographic
+    order is reversed (last delivered frame = geographic west).  Uses a
+    generous margin so adjacent frames that partially overlap are included.
+    """
+    try:
+        import rasterio
+        from rasterio.warp import transform_bounds
+        from preprocess.camera_model import is_aft_camera, interpolate_segment_corners
+    except ImportError:
+        return None
+
+    n = len(frames)
+    if n < 3:
+        return None  # not worth filtering
+
+    with rasterio.open(reference) as ref:
+        ref_4326 = transform_bounds(ref.crs, "EPSG:4326", *ref.bounds)
+    margin = 0.02  # ~2 km
+    ref_west, ref_east = ref_4326[0] - margin, ref_4326[2] + margin
+
+    cam_name = (scene.camera_system.name or "").upper().replace("-", "")
+    aft = is_aft_camera(scene.entity_id, cam_name)
+
+    keep = []
+    for i in range(n):
+        # In delivery order, frame i maps to segment index seg_i.
+        # For Aft, image_mosaic --rotate reverses the mosaic, so
+        # delivery frame 0 (='a') ends up at the geographic east end.
+        seg_i = (n - 1 - i) if aft else i
+        seg_corners = interpolate_segment_corners(corners, n, seg_i)
+        lc = {str(k).lower(): v for k, v in seg_corners.items()}
+        seg_west = min(lc["nw"][1], lc["sw"][1])
+        seg_east = max(lc["ne"][1], lc["se"][1])
+        if seg_east > ref_west and seg_west < ref_east:
+            keep.append(frames[i])
+
+    return keep if keep else None
 
 
 def _per_segment_sub_frames(scene, cache_dir: str) -> list[str] | None:
@@ -221,12 +329,15 @@ def _per_segment_sub_frames(scene, cache_dir: str) -> list[str] | None:
 
 
 def _maybe_generate_asp_ortho(scene, cache_dir: str, stitched_path: str,
-                              corners: dict, reference: str | None) -> str | None:
-    camera_params = _camera_params_for_scene(scene)
+                              corners: dict, reference: str | None,
+                              preprocess_matcher: str | None = None) -> str | None:
+    selected_matcher = normalize_preprocess_matcher(preprocess_matcher)
+    camera_params = _camera_params_for_scene(scene, selected_matcher)
     if camera_params is None:
         return None
-    if not os.path.exists(stitched_path):
-        return None
+    skip_stitched_fallback = os.environ.get(
+        "DECLASS_SKIP_STITCHED_FALLBACK", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     bbox = _bbox_from_corners(corners)
     dem_path = fetch_and_prepare_dem(
@@ -236,33 +347,68 @@ def _maybe_generate_asp_ortho(scene, cache_dir: str, stitched_path: str,
 
     # 2OC §3.1: per-sub-image processing if the profile asks for it. Each
     # sub-frame gets its own cam_gen + mapproject, and the resulting
-    # orthos are mosaicked via gdalbuildvrt. Falls back to the stitched
-    # path if sub-frames aren't on disk (e.g. archive not extracted).
+    # orthos are blended via distance-to-edge tessellation.
+    # opticalbar_per_segment_precorrect handles Pass 1 (initial cam_gen +
+    # mapproject), Pass 2 (median reference NCC shift for global offset),
+    # and Pass 2.5 (pairwise phase-correlation seam alignment to fix the
+    # inter-segment disagreement left over from the 4-corner cam_gen fit).
+    # Falls back to the stitched cam_gen if sub-frames aren't on disk.
     profile = load_profile(_profile_name_for_scene(scene))
     use_per_segment = bool(getattr(profile.camera, "per_segment_ortho", False))
     if use_per_segment:
         sub_frames = _per_segment_sub_frames(scene, cache_dir)
         if sub_frames and len(sub_frames) > 1:
-            from preprocess.camera_model import opticalbar_per_segment_precorrect
+            from preprocess.camera_model import opticalbar_per_segment_precorrect, is_aft_camera
             seg_dir = paths.ortho_segments_dir(cache_dir, scene.entity_id)
-            print(f"  [per_segment_ortho] {len(sub_frames)} sub-frames found for {scene.entity_id}")
+            cam_name = (scene.camera_system.name or "").upper().replace("-", "")
+            aft = is_aft_camera(scene.entity_id, cam_name)
+            print(f"  [per_segment_ortho] {len(sub_frames)} sub-frames found for {scene.entity_id}"
+                  f"{' (Aft camera)' if aft else ''}")
             vrt_path = opticalbar_per_segment_precorrect(
                 sub_frames=sub_frames,
                 camera_params=camera_params,
                 strip_corners=corners,
                 output_dir=seg_dir,
                 dem_path=dem_path,
-                resolution=_reference_resolution(reference),
+                resolution=_reference_resolution(reference),  # TODO: switch to 0.87 for native
                 t_srs="EPSG:3857",
                 scene_id=scene.entity_id,
+                is_aft=aft,
+                reference_path=reference,
+                acq_date=_parse_acquisition_date(scene.acquisition_date),
             )
             if vrt_path:
                 return vrt_path
+            if skip_stitched_fallback:
+                print("  [per_segment_ortho] failed; stitched fallback suppressed "
+                      "by DECLASS_SKIP_STITCHED_FALLBACK")
+                return None
             print(f"  [per_segment_ortho] failed; falling back to stitched cam_gen")
         else:
+            if skip_stitched_fallback:
+                print("  [per_segment_ortho] no usable sub-frames; stitched fallback "
+                      "suppressed by DECLASS_SKIP_STITCHED_FALLBACK")
+                return None
             print(f"  [per_segment_ortho] no usable sub-frames for {scene.entity_id}; falling back to stitched cam_gen")
 
-    cam_path = generate_camera(stitched_path, camera_params, corners, dem_path=dem_path)
+    # Single-camera fallback requires the stitched image.
+    if not os.path.exists(stitched_path):
+        entity_dir = paths.extracted_dir(cache_dir, scene.entity_id)
+        frames = list_frames(entity_dir)
+        if frames:
+            stitched_path = _stitch_if_needed(
+                frames,
+                scene.entity_id,
+                scene.camera_system,
+                stitched_path,
+                cache_dir,
+            )
+    if not os.path.exists(stitched_path):
+        return None
+    cam_path = generate_camera(
+        stitched_path, camera_params, corners, dem_path=dem_path,
+        altitude_m=_altitude_seed_for_scene(scene),
+    )
     if cam_path is None:
         return None
 
@@ -277,11 +423,13 @@ def _maybe_generate_asp_ortho(scene, cache_dir: str, stitched_path: str,
 
 
 def _ensure_scene_asp_ortho(scene, cache_dir: str, reference: str | None,
-                            metadata: dict | None = None, file_map: dict | None = None) -> dict:
+                            metadata: dict | None = None, file_map: dict | None = None,
+                            preprocess_matcher: str | None = None) -> dict:
     metadata = metadata or (_load_scene_metadata(cache_dir, scene.entity_id) or _default_scene_metadata(scene, cache_dir))
+    selected_matcher = normalize_preprocess_matcher(preprocess_matcher)
     if not reference or not os.path.exists(reference):
         return metadata
-    if _camera_params_for_scene(scene) is None:
+    if _camera_params_for_scene(scene, selected_matcher) is None:
         return metadata
 
     asp_ortho_path = metadata.get("asp_ortho_path")
@@ -290,7 +438,8 @@ def _ensure_scene_asp_ortho(scene, cache_dir: str, reference: str | None,
 
     georef_path = metadata.get("georef_path") or paths.georef_path(cache_dir, scene.entity_id)
     stitched_path = metadata.get("stitched_path") or paths.stitched_path(cache_dir, scene.entity_id)
-    if not _path_is_stale(asp_ortho_path, stitched_path, georef_path):
+    matcher_changed = _metadata_preprocess_matcher(metadata) != selected_matcher
+    if not matcher_changed and not _path_is_stale(asp_ortho_path, stitched_path, georef_path):
         return metadata
 
     if not os.path.exists(stitched_path):
@@ -313,7 +462,14 @@ def _ensure_scene_asp_ortho(scene, cache_dir: str, reference: str | None,
         os.remove(asp_ortho_path)
 
     corners = _corners_from_metadata(scene, metadata)
-    asp_ortho_path = _maybe_generate_asp_ortho(scene, cache_dir, stitched_path, corners, reference)
+    asp_ortho_path = _maybe_generate_asp_ortho(
+        scene,
+        cache_dir,
+        stitched_path,
+        corners,
+        reference,
+        preprocess_matcher=selected_matcher,
+    )
     if not asp_ortho_path:
         return metadata
 
@@ -324,12 +480,18 @@ def _ensure_scene_asp_ortho(scene, cache_dir: str, reference: str | None,
         stitched_path=os.path.abspath(stitched_path),
         asp_camera_path=os.path.abspath(asp_camera_path) if os.path.exists(asp_camera_path) else None,
         asp_ortho_path=os.path.abspath(asp_ortho_path),
+        preprocess_matcher=selected_matcher,
+        **_primary_input_update(georef_path, asp_ortho_path),
     )
 
 
 def _preferred_alignment_input_info(cache_dir: str, entity_id: str) -> tuple[str | None, str | None]:
     metadata = _load_scene_metadata(cache_dir, entity_id)
     if metadata:
+        primary_kind = metadata.get("primary_input_kind")
+        primary_path = metadata.get("primary_input_path")
+        if primary_kind and primary_path and os.path.exists(primary_path):
+            return (primary_kind, primary_path)
         ortho_path = metadata.get("asp_ortho_path")
         if ortho_path and os.path.exists(ortho_path):
             return ("asp_ortho", ortho_path)
@@ -485,7 +647,8 @@ def _stitch_if_needed(frames: list[str], eid: str, camera,
 def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, reference: str,
                                 progress: dict, dry_run: bool = False,
                                 cache_dir: str | None = None,
-                                preserve_stitched: bool = False) -> bool:
+                                preserve_stitched: bool = False,
+                                preprocess_matcher: str | None = None) -> bool:
     """Run the extract → stitch → georef cascade on a single scene.
 
     Preprocessing outputs (extracted, stitched, georef) go under *cache_dir*
@@ -496,6 +659,7 @@ def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, referenc
     cd = cache_dir or output_dir
     eid = scene.entity_id
     camera = scene.camera_system
+    selected_matcher = normalize_preprocess_matcher(preprocess_matcher)
 
     # Check if already completed
     georef_path = paths.georef_path(cd, eid)
@@ -504,6 +668,7 @@ def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, referenc
             cd,
             scene,
             georef_path=os.path.abspath(georef_path),
+            preprocess_matcher=selected_matcher,
         )
         metadata = _ensure_scene_asp_ortho(
             scene,
@@ -511,6 +676,16 @@ def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, referenc
             reference,
             metadata=metadata,
             file_map=file_map,
+            preprocess_matcher=selected_matcher,
+        )
+        metadata = _merge_scene_metadata(
+            cd,
+            scene,
+            preprocess_matcher=selected_matcher,
+            **_primary_input_update(
+                metadata.get("georef_path"),
+                metadata.get("asp_ortho_path"),
+            ),
         )
         print(f"  [skip] Already georeferenced: {eid}")
         progress["completed"][eid] = {"stage": "georef"}
@@ -539,66 +714,125 @@ def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, referenc
             progress["failed"][eid] = "no_frames"
             return False
 
-        # Step 4: Stitch in raw film coordinates (always horizontal)
         corners = scene.corners
-        stitched_path = paths.stitched_path(cd, eid)
-        input_for_orient = _stitch_if_needed(frames, eid, camera, stitched_path, cd)
+        profile = load_profile(_profile_name_for_scene(scene))
+        use_per_segment = bool(getattr(profile.camera, "per_segment_ortho", False))
 
-        # Step 4b: Orientation detection — returns GCP corners, no pixel rotation
-        print(f"\n  --- Orientation: {eid} ---")
-        rotation, gcp_corners = detect_orientation(
-            input_for_orient, corners, camera, reference_path=reference)
+        # --- Fast path (A+B+C): skip stitch/georef for per-segment mode ---
+        # Per-segment ortho uses raw sub-frames directly (not the stitched
+        # image).  Orientation is determined from is_aft_camera() (entity ID
+        # parsing), which is reliable for KH-4/KH-9.  This eliminates the
+        # expensive stitch → orient → georef → verify cascade (~20 min).
+        if use_per_segment and reference and os.path.exists(reference):
+            from preprocess.camera_model import is_aft_camera
+            cam_name = (camera.name or "").upper().replace("-", "")
+            aft = is_aft_camera(eid, cam_name)
+            # Do NOT swap corners here — opticalbar_per_segment_precorrect
+            # handles Aft internally (frame reversal + 180° rotation).  The
+            # strip corners stay in their original USGS orientation.
+            gcp_corners = corners
+            print(f"\n  --- Fast-path orientation: {eid} ---")
+            print(f"  Camera: {'Aft' if aft else 'Forward'} "
+                  f"(per-segment handles rotation internally)")
 
-        if rotation != 0:
-            print(f"  Orientation: {rotation} CW (via GCP assignment, no image rotation)")
+            # Create a tiny georef placeholder — per-segment doesn't use the
+            # georef file, but metadata needs the path for cache checks.
+            if not os.path.exists(georef_path):
+                os.makedirs(os.path.dirname(georef_path), exist_ok=True)
+                from osgeo import gdal as _gdal_ph
+                _gdal_ph.UseExceptions()
+                drv = _gdal_ph.GetDriverByName("GTiff")
+                ds = drv.Create(georef_path, 1, 1, 1, _gdal_ph.GDT_Byte)
+                ds.FlushCache()
+                ds = None
 
-        # Step 5: Georef — GDAL handles rotation via affine warp from GCP corners
-        # KH-4 panoramic cameras need intermediate GCPs to model the non-uniform
-        # GSD across the 70° scan arc.
-        is_panoramic = camera.program == "CORONA"  # KH-4/4A/4B
-        print(f"\n  --- Georef: {eid} ---")
-        georef_with_corners(input_for_orient, georef_path, gcp_corners,
-                            panoramic=is_panoramic)
-
-        # Step 5b: Post-georef verification — auto-correct if 180° flip needed
-        if reference and os.path.exists(reference):
-            print(f"\n  --- Post-georef orientation check: {eid} ---")
-            correction = verify_orientation_against_reference(georef_path, reference)
-            if correction == 180:
-                print(f"  Auto-correcting: re-georeferencing with 180° flipped corners")
-                flipped_corners = swap_corners_180(gcp_corners)
-                os.remove(georef_path)
-                georef_with_corners(input_for_orient, georef_path, flipped_corners,
-                                    panoramic=is_panoramic)
-                gcp_corners = flipped_corners
-
-        asp_ortho_path = None
-        if reference and os.path.exists(reference):
+            asp_ortho_path = None
             print(f"\n  --- ASP orthorectify: {eid} ---")
             try:
+                stitched_path = paths.stitched_path(cd, eid)
                 asp_ortho_path = _maybe_generate_asp_ortho(
-                    scene, cd, input_for_orient, gcp_corners, reference)
+                    scene,
+                    cd,
+                    stitched_path,
+                    gcp_corners,
+                    reference,
+                    preprocess_matcher=selected_matcher,
+                )
                 if asp_ortho_path:
                     print(f"  ASP ortho ready: {os.path.basename(asp_ortho_path)}")
             except Exception as e:
                 print(f"  WARNING: ASP orthorectification failed for {eid}: {e}")
 
-        asp_camera_path = paths.ba_camera_path(input_for_orient)
-        _merge_scene_metadata(
-            cd,
-            scene,
-            gcp_corners={k: list(v) for k, v in gcp_corners.items()},
-            georef_path=os.path.abspath(georef_path),
-            stitched_path=os.path.abspath(input_for_orient),
-            asp_camera_path=os.path.abspath(asp_camera_path) if os.path.exists(asp_camera_path) else None,
-            asp_ortho_path=os.path.abspath(asp_ortho_path) if asp_ortho_path else None,
-        )
+            _merge_scene_metadata(
+                cd, scene,
+                preprocess_matcher=selected_matcher,
+                gcp_corners={k: list(v) for k, v in gcp_corners.items()},
+                georef_path=os.path.abspath(georef_path),
+                asp_ortho_path=os.path.abspath(asp_ortho_path) if asp_ortho_path else None,
+                **_primary_input_update(georef_path, asp_ortho_path),
+            )
 
-        # Clean up stitched intermediates to save disk
-        stitched_int = paths.stitched_path(cd, eid)
-        if os.path.exists(stitched_int) and not preserve_stitched:
-            os.remove(stitched_int)
-            print(f"  Removed intermediate: {os.path.basename(stitched_int)}")
+        else:
+            # --- Standard path: stitch → orient → georef → verify ---
+            stitched_path = paths.stitched_path(cd, eid)
+            input_for_orient = _stitch_if_needed(frames, eid, camera, stitched_path, cd)
+
+            print(f"\n  --- Orientation: {eid} ---")
+            rotation, gcp_corners = detect_orientation(
+                input_for_orient, corners, camera, reference_path=reference)
+            if rotation != 0:
+                print(f"  Orientation: {rotation} CW (via GCP assignment, no image rotation)")
+
+            is_panoramic = camera.program == "CORONA"
+            print(f"\n  --- Georef: {eid} ---")
+            georef_with_corners(input_for_orient, georef_path, gcp_corners,
+                                panoramic=is_panoramic)
+
+            if reference and os.path.exists(reference):
+                print(f"\n  --- Post-georef orientation check: {eid} ---")
+                correction = verify_orientation_against_reference(georef_path, reference)
+                if correction == 180:
+                    print(f"  Auto-correcting: re-georeferencing with 180° flipped corners")
+                    flipped_corners = swap_corners_180(gcp_corners)
+                    os.remove(georef_path)
+                    georef_with_corners(input_for_orient, georef_path, flipped_corners,
+                                        panoramic=is_panoramic)
+                    gcp_corners = flipped_corners
+
+            asp_ortho_path = None
+            if reference and os.path.exists(reference):
+                print(f"\n  --- ASP orthorectify: {eid} ---")
+                try:
+                    asp_ortho_path = _maybe_generate_asp_ortho(
+                        scene,
+                        cd,
+                        input_for_orient,
+                        gcp_corners,
+                        reference,
+                        preprocess_matcher=selected_matcher,
+                    )
+                    if asp_ortho_path:
+                        print(f"  ASP ortho ready: {os.path.basename(asp_ortho_path)}")
+                except Exception as e:
+                    print(f"  WARNING: ASP orthorectification failed for {eid}: {e}")
+
+            asp_camera_path = paths.ba_camera_path(input_for_orient)
+            _merge_scene_metadata(
+                cd, scene,
+                preprocess_matcher=selected_matcher,
+                gcp_corners={k: list(v) for k, v in gcp_corners.items()},
+                georef_path=os.path.abspath(georef_path),
+                stitched_path=os.path.abspath(input_for_orient),
+                asp_camera_path=os.path.abspath(asp_camera_path) if os.path.exists(asp_camera_path) else None,
+                asp_ortho_path=os.path.abspath(asp_ortho_path) if asp_ortho_path else None,
+                **_primary_input_update(georef_path, asp_ortho_path),
+            )
+
+            # Clean up stitched intermediates to save disk
+            stitched_int = paths.stitched_path(cd, eid)
+            if os.path.exists(stitched_int) and not preserve_stitched:
+                os.remove(stitched_int)
+                print(f"  Removed intermediate: {os.path.basename(stitched_int)}")
 
         progress["completed"][eid] = {"stage": "georef"}
         progress["failed"].pop(eid, None)
@@ -1136,6 +1370,7 @@ class PipelineContext:
     output_dir: str
     cache_dir: str
     progress: dict
+    preprocess_matcher: str = "roma"
     reference: Optional[str] = None            # composite when built, primary otherwise
     primary_reference: Optional[str] = None    # always the original reference (used for alignment)
     target_bbox: Optional[tuple] = None
@@ -1196,8 +1431,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefer-camera", default=None,
                         help="Preferred camera designation (A=Aft, F=Forward) for scene selection")
     parser.add_argument("--bundle-adjust", action="store_true",
-                        help="Enable strip bundle adjustment with RoMa tie points "
+                        help="Enable strip bundle adjustment with preprocessing tie points "
                              "(experimental, requires ASP + --experimental)")
+    parser.add_argument("--preprocess-matcher", default="roma",
+                        choices=["roma", "nift"],
+                        help="Feature matcher used by panoramic preprocessing and "
+                             "experimental BA match generation (default: roma)")
     parser.add_argument("--experimental", action="store_true",
                         help="Opt in to experimental features (currently: --bundle-adjust). "
                              "In-progress research threads are gated behind this flag so "
@@ -1244,6 +1483,7 @@ def _init_context(args: argparse.Namespace) -> PipelineContext:
         output_dir=output_dir,
         cache_dir=cache_dir,
         progress=progress,
+        preprocess_matcher=normalize_preprocess_matcher(args.preprocess_matcher),
         crop_bbox=_parse_crop_bbox(args.crop_bbox),
     )
 
@@ -1324,6 +1564,7 @@ def stage_preprocess_scenes(ctx: PipelineContext) -> None:
         ok = extract_stitch_georef_scene(
             scene, ctx.output_dir, ctx.file_map, ctx.reference, ctx.progress,
             cache_dir=ctx.cache_dir, preserve_stitched=preserve_stitched,
+            preprocess_matcher=ctx.preprocess_matcher,
         )
         if ok:
             ctx.success_count += 1
@@ -1368,7 +1609,8 @@ def _collect_strip_frames(strip, cache_dir: str):
     return strip_scenes, strip_frames, strip_corners
 
 
-def _record_ba_ortho_metadata(scene, cache_dir: str, frame_path: str, remapped: str) -> None:
+def _record_ba_ortho_metadata(scene, cache_dir: str, frame_path: str, remapped: str,
+                              matcher_name: str = "roma") -> None:
     metadata = _load_scene_metadata(cache_dir, scene.entity_id) or {}
     metadata["asp_ortho_path"] = os.path.abspath(remapped)
     metadata.setdefault("georef_path", paths.georef_path(cache_dir, scene.entity_id))
@@ -1377,18 +1619,22 @@ def _record_ba_ortho_metadata(scene, cache_dir: str, frame_path: str, remapped: 
     metadata.setdefault("camera_designation", _camera_designation(scene))
     metadata.setdefault("profile", _profile_name_for_scene(scene))
     metadata.setdefault("gcp_corners", {k: list(v) for k, v in scene.corners.items()})
+    metadata["preprocess_matcher"] = normalize_preprocess_matcher(matcher_name)
+    metadata.update(_primary_input_update(metadata.get("georef_path"), remapped))
     _save_scene_metadata(cache_dir, scene.entity_id, metadata)
 
 
 def _bundle_adjust_strip(strip, ctx: PipelineContext) -> None:
-    """Run RoMa → ASP bundle_adjust → mapproject on one strip."""
+    """Run selected matcher → ASP bundle_adjust → mapproject on one strip."""
     strip_scenes, strip_frames, strip_corners = _collect_strip_frames(strip, ctx.cache_dir)
     if len(strip_frames) < 2:
         return
 
+    matcher = normalize_preprocess_matcher(ctx.preprocess_matcher)
     match_prefix = generate_strip_matches(
         strip_frames, strip_corners, paths.match_files_dir(ctx.output_dir),
-        match_prefix=f"roma_{strip.mission}_{strip.date}".replace("/", "_"),
+        match_prefix=f"{matcher}_{strip.mission}_{strip.date}".replace("/", "_"),
+        matcher_name=matcher,
     )
     if not match_prefix:
         return
@@ -1396,7 +1642,7 @@ def _bundle_adjust_strip(strip, ctx: PipelineContext) -> None:
     strip._match_prefix = match_prefix
     print(f"  Strip {strip.mission} {strip.date}: match prefix → {match_prefix}")
 
-    camera_params = _camera_params_for_scene(strip_scenes[0])
+    camera_params = _camera_params_for_scene(strip_scenes[0], matcher)
     if camera_params is None:
         return
     profile = load_profile(_profile_name_for_scene(strip_scenes[0]))
@@ -1426,12 +1672,14 @@ def _bundle_adjust_strip(strip, ctx: PipelineContext) -> None:
             t_srs="EPSG:3857",
         )
         if remapped:
-            _record_ba_ortho_metadata(scene, ctx.cache_dir, frame_path, remapped)
+            _record_ba_ortho_metadata(scene, ctx.cache_dir, frame_path, remapped, matcher_name=matcher)
 
 
 def stage_bundle_adjust_strips(ctx: PipelineContext) -> None:
-    """Experimental: inter-frame RoMa tie points + ASP bundle_adjust (2OC P2)."""
-    _print_stage_banner("Stage 5b: Inter-frame match generation (RoMa → ASP)")
+    """Experimental: inter-frame matcher tie points + ASP bundle_adjust (2OC P2)."""
+    _print_stage_banner(
+        f"Stage 5b: Inter-frame match generation ({ctx.preprocess_matcher.upper()} → ASP)"
+    )
     for strip in ctx.strips:
         if len(strip.scenes) < 2:
             continue

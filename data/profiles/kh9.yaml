@@ -18,20 +18,57 @@ camera:
   forward_tilt: 0.1745         # 10° for Fore/Aft stereo pairs (sign flipped by process.py based on A/F designation)
   scan_dir: right
   motion_compensation_factor: 1.0
+  preprocess_matcher: roma
+  panoramic_local_crs: ""
+  gcp_search_pad_m: 10000
+  gcp_match_res_m_coarse: 4.0
+  gcp_match_res_m_fine: 2.0
+  panoramic_fit_rms_px_max: 4.0
+  # Hard gate relaxed from 20 → 25 to accommodate scenes where Stage B
+  # converges at 20-25 px on water-dominant / low-feature sub-frames.
+  # seg00 on Bahrain D3C1213 sits around 21 px with 208 coarse GCPs; the
+  # single-camera fallback below is far worse than a slightly-loose fit.
+  panoramic_fit_rms_px_hard_max: 25.0
+  # Relaxed from 2.0 → 80.0 so segments with >10 px seam shift reach
+  # Phase 3 TPS seam-warping (the whole point of Phase 3 is to fix
+  # mismatched seams that Stage A/B couldn't). Single-camera fallback
+  # is reserved for wholly pathological fits (e.g. runaway pose).
+  panoramic_seam_shift_px_max: 80.0
   # Physical scan arc is ~120° but align/grid_optim.py set_panoramic_prior
   # uses a 1/cos²(θ) approximation that breaks at wide arcs (peak edge
   # displacement > 1.0 normalised at 120°). ASP mapproject already corrects
   # the true bow-tie distortion before grid_optim runs, so we disable the
   # in-house prior by setting scan_arc_deg: 0.0. Revisit if ASP is bypassed.
   scan_arc_deg: 0.0
-  # 2OC paper adaptive focal length fit. KH-9 PC nominal 1.524 m may drift
-  # ~0.1% across sub-images; let ASP bundle_adjust float it.
+  # 2OC paper (Hou et al. 2023, Table 6) measured 1.18% focal-length spread
+  # across KH-4B sub-images of a single strip (0.6025-0.6096 m). KH-9 PC
+  # spread is unmeasured in the paper; we assume similar-order drift and
+  # let ASP bundle_adjust float focal_length per frame.
   bundle_adjust_solve_intrinsics: true
   # 2OC §3.1: orthorectify each USGS sub-frame independently with its own
-  # OpticalBar camera model, then gdalbuildvrt the results into a single
-  # target mosaic. Avoids leaking per-segment offsets into a single-camera
-  # fit — consumed by preprocess/camera_model.py::opticalbar_per_segment_precorrect.
+  # OpticalBar camera model, then blend the results into a single target
+  # mosaic. Avoids leaking per-segment offsets into a single-camera fit.
+  # opticalbar_per_segment_precorrect handles (a) initial per-segment
+  # cam_gen + mapproject, (b) median reference NCC shift (global offset),
+  # and (c) pairwise phase-correlation seam alignment (fixes inter-segment
+  # disagreement from the cam_gen 4-corner fit freedom).
   per_segment_ortho: true
+  # Per-sub-frame Zs0 from ASP cam_gen. Runs cam_gen on each sub-frame's
+  # interpolated corners, parses the refined ECEF iC, and feeds
+  # altitude-above-ellipsoid into the 14-parameter LM fit as a fixed Zs0.
+  # Eliminates the f/Zs0 gauge-freedom basin that collapsed f to the lower
+  # bound on Bahrain KH-9 D3C1213 seg00 (see
+  # memory/per_segment_phase1_2_3_findings.md). When true, the per-
+  # segment loop also passes fix_f=True into Stage A/B.
+  cam_gen_altitude: true
+  # Phase 3 (smooth-vector-field seam reconciliation) — post-hoc TPS half-
+  # warp applied to each segment's seam band. feather_px controls how far
+  # into the segment interior the warp tapers; tps_smoothing regularises
+  # the RBF; post_warp_rms_m_max is the hard reject threshold (falls back
+  # to the unwarped blend if the TPS residual exceeds this).
+  panoramic_seam_feather_px: 400
+  panoramic_seam_tps_smoothing: 100.0
+  panoramic_seam_post_warp_rms_m_max: 30.0
 
 coarse:
   coarse_res: 10.0

@@ -128,7 +128,7 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
     cmd.extend([
         "-t", "opticalbar",
         "--inline-adjustments",
-        "--camera-weight", "0",
+        "--camera-weight", "10",
         "--datum", "WGS84",
         "-o", ba_prefix,
     ])
@@ -146,7 +146,18 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
             print(f"  [BundleAdjust] solve_intrinsics=ON; nominal f={nominal_f:.6f} m")
 
     if dem_path and os.path.isfile(dem_path):
-        cmd.extend(["--heights-from-dem", dem_path])
+        cmd.extend(["--heights-from-dem", dem_path,
+                     "--heights-from-dem-uncertainty", "10.0"])
+
+    # Reuse cached IP / match files from a previous BA run if available.
+    # ipfind is the most expensive phase (~5 min for 3 large frames);
+    # skipping it on re-runs saves most of the BA wall clock.
+    cached_matches = any(
+        f.endswith(".match") for f in os.listdir(output_dir)
+    ) if os.path.isdir(output_dir) else False
+    if cached_matches:
+        cmd.append("--force-reuse-match-files")
+        print(f"  [BundleAdjust] Reusing cached match files from {output_dir}")
 
     # Use pre-computed RoMa match files if available (skips ipfind)
     if match_prefix:
@@ -171,6 +182,8 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
         asp_root = os.path.dirname(os.path.dirname(ba_tool))
         if os.path.isfile(os.path.join(asp_root, "IsisPreferences")):
             env["ISISROOT"] = asp_root
+    # ASP's ipfind uses OpenMP; set thread count for parallel IP detection.
+    env.setdefault("OMP_NUM_THREADS", str(min(4, os.cpu_count() or 4)))
 
     print(f"  [BundleAdjust] Running on {len(frames)} frames...")
     try:
@@ -182,11 +195,16 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
         print(f"  [BundleAdjust] Error: {e}")
         return None
 
-    # Step 4: Collect adjusted camera files
+    # Step 4: Collect adjusted camera files.
+    # Despite --inline-adjustments, ASP writes adjusted cameras to the output
+    # prefix (ba/ba-<name>.tsai) rather than modifying the originals in place
+    # for OpticalBar cameras.  Prefer the ba-prefixed files.
     adjusted = []
     for cam in camera_files:
-        # bundle_adjust with --inline-adjustments modifies cameras in place
-        if os.path.isfile(cam):
+        ba_cam = os.path.join(output_dir, "ba-" + os.path.basename(cam))
+        if os.path.isfile(ba_cam):
+            adjusted.append(ba_cam)
+        elif os.path.isfile(cam):
             adjusted.append(cam)
         else:
             print(f"  [BundleAdjust] Missing adjusted camera: {cam}")

@@ -1,5 +1,5 @@
 numpy
-opencv-python
+opencv-contrib-python
 rasterio
 scipy
 scikit-image
@@ -8,3 +8,8 @@ torch
 torchvision
 kornia
 safetensors
+GDAL
+pyproj
+einops
+pyyaml
+skyfield

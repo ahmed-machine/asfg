@@ -14,11 +14,34 @@ camera:
   forward_tilt: 0.2618         # radians (15° for forward camera)
   scan_dir: right
   motion_compensation_factor: 1.0
+  preprocess_matcher: roma
   scan_arc_deg: 70.0
+  panoramic_local_crs: ""
+  gcp_search_pad_m: 5000
+  gcp_match_res_m_coarse: 2.5
+  gcp_match_res_m_fine: 1.5
+  panoramic_fit_rms_px_max: 4.0
+  panoramic_fit_rms_px_hard_max: 20.0
+  panoramic_seam_shift_px_max: 2.0
   # 2OC (Hou et al. 2023, Table 6) reports fitted f drifting 0.6025-0.6096 m
-  # across sub-images of the same strip — ~30-45% of their accuracy gain
-  # came from this adaptive fit. Let ASP bundle_adjust float focal_length.
+  # across sub-images of the same strip (a 1.18% spread). The paper's
+  # headline "30-45% accuracy gain" in §5.1 is from §4.4 model-guided
+  # re-matching, not from the focal length fit — but the spread in Table 6
+  # is empirical evidence that nominal-f models cannot fit the scan
+  # geometry on KH-4B. Let ASP bundle_adjust float focal_length per frame.
   bundle_adjust_solve_intrinsics: true
+  # Per-sub-frame Zs0 from ASP cam_gen (see kh9.yaml comment). Default on
+  # for KH-4 too; cam_gen does per-frame altitude refinement via DEM
+  # intersection, which matters more here because KH-4B orbits were
+  # eccentric (perigee 154 km, apogee 276 km) and the nominal 170 km is
+  # wrong for many frames in a pass.
+  cam_gen_altitude: true
+  # Phase 3 (smooth-vector-field seam reconciliation) — post-hoc TPS half-
+  # warp applied to each segment's seam band. KH-4 sub-frames are narrower
+  # than KH-9, so use a smaller feather by default.
+  panoramic_seam_feather_px: 300
+  panoramic_seam_tps_smoothing: 100.0
+  panoramic_seam_post_warp_rms_m_max: 40.0
 
 coarse:
   min_ncc: 0.08

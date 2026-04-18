@@ -145,9 +145,12 @@ class CameraParams:
     scan_arc_deg: float = 70.0            # total scan arc in degrees
     # When True, ASP bundle_adjust is called with --solve-intrinsics
     # --intrinsics-to-float focal_length. 2OC (Hou et al. 2023, Table 6)
-    # reports fitted focal lengths drifting ~0.1% from nominal across
-    # sub-images of the same strip; this per-strip adaptive fit is
-    # responsible for ~30-45% of the paper's reported accuracy gain.
+    # reports fitted focal lengths drifting 0.6025-0.6096 m (a 1.18%
+    # spread) across sub-images of DS1101-1069DF090, so a per-sub-image
+    # adaptive fit is physically motivated. Note: the paper's headline
+    # "30-45% accuracy gain" quoted in §5.1 comes from §4.4 model-guided
+    # re-matching, NOT from the focal length fit — the focal length
+    # contribution is not separately ablated in the paper.
     bundle_adjust_solve_intrinsics: bool = False
     # When True, _maybe_generate_asp_ortho processes each USGS sub-image
     # (a, b, c, d for KH-4; a..g for KH-9 PC) independently — separate
@@ -155,6 +158,37 @@ class CameraParams:
     # the resulting orthos. 2OC §3.1: stitching first leaks per-segment
     # offsets into the single-camera fit. Default false; gate per profile.
     per_segment_ortho: bool = False
+    # Feature matcher backend used by preprocessing-only correspondence
+    # extraction (per-segment rectification and experimental BA .match files).
+    preprocess_matcher: str = "roma"
+    # Local planar CRS for the 14-parameter panoramic model. Empty means
+    # "auto-pick scene UTM from the strip centroid".
+    panoramic_local_crs: str = ""
+    # Expand the interpolated-corner reference search window by this many
+    # metres before coarse RoMa matching.
+    gcp_search_pad_m: float = 10_000.0
+    # Coarse raw→reference matching resolution for the first GCP pass.
+    gcp_match_res_m_coarse: float = 4.0
+    # Fine ortho→reference matching resolution for model-guided rematching.
+    gcp_match_res_m_fine: float = 2.0
+    # Reject per-segment 14p fits above this final reprojection RMS.
+    panoramic_fit_rms_px_max: float = 4.0
+    # Absolute fail-safe RMS ceiling. Fits above this are rejected even if
+    # seam QA would otherwise allow the strip through.
+    panoramic_fit_rms_px_hard_max: float = 20.0
+    # Reject the whole per-segment mosaic when any seam exceeds this shift.
+    panoramic_seam_shift_px_max: float = 2.0
+    # Derive per-frame altitude (Zs0) once via ASP cam_gen on the stitched
+    # frame's USGS corners, then inject into every sub-frame's LM init.
+    # Breaks the f/Zs0 gauge-freedom basin observed on Bahrain KH-9.
+    cam_gen_altitude: bool = False
+    # Phase 3 seam warp tunables (already honoured by camera_model.py even
+    # when absent from the dataclass, but declaring them here documents
+    # the profile contract and lets them round-trip through to_dict).
+    panoramic_seam_warp: bool = False
+    panoramic_seam_feather_px: int = 400
+    panoramic_seam_tps_smoothing: float = 100.0
+    panoramic_seam_post_warp_rms_m_max: float = 30.0
 
     @property
     def is_panoramic(self) -> bool:
@@ -170,6 +204,19 @@ class CameraParams:
             "forward_tilt": self.forward_tilt,
             "scan_dir": self.scan_dir,
             "motion_compensation_factor": self.motion_compensation_factor,
+            "preprocess_matcher": self.preprocess_matcher,
+            "panoramic_local_crs": self.panoramic_local_crs,
+            "gcp_search_pad_m": self.gcp_search_pad_m,
+            "gcp_match_res_m_coarse": self.gcp_match_res_m_coarse,
+            "gcp_match_res_m_fine": self.gcp_match_res_m_fine,
+            "panoramic_fit_rms_px_max": self.panoramic_fit_rms_px_max,
+            "panoramic_fit_rms_px_hard_max": self.panoramic_fit_rms_px_hard_max,
+            "panoramic_seam_shift_px_max": self.panoramic_seam_shift_px_max,
+            "cam_gen_altitude": self.cam_gen_altitude,
+            "panoramic_seam_warp": self.panoramic_seam_warp,
+            "panoramic_seam_feather_px": self.panoramic_seam_feather_px,
+            "panoramic_seam_tps_smoothing": self.panoramic_seam_tps_smoothing,
+            "panoramic_seam_post_warp_rms_m_max": self.panoramic_seam_post_warp_rms_m_max,
         }
 
 

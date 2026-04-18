@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Declassified satellite image alignment tools"
 authors = ["mish"]
 readme = "README.md"
+package-mode = false
 
 [tool.poetry.dependencies]
 python = ">=3.12,<3.14"
@@ -16,6 +17,12 @@ kornia = "^0.8.2"
 torch = "^2.10.0"
 torchvision = "^0.25.0"
 opencv-contrib-python = "^4.13.0.92"
+GDAL = "3.11.1"
+pyproj = "^3.7.0"
+einops = "^0.8.0"
+pyyaml = "^6.0"
+safetensors = "^0.7.0"
+skyfield = "^1.49"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.5"
