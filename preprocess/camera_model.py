@@ -87,9 +87,17 @@ class _SceneTelemetry:
     strip_tle_source: Optional[str] = None
     strip_cam_gen_altitude_m: Optional[float] = None
     cam_gen_altitude_delta_km: Optional[float] = None
-    cam_gen_altitude_status: Optional[str] = None  # 'used' | 'rejected_out_of_range' | 'not_attempted'
+    # One of: 'not_attempted' | 'used' (≤ tight gate, no tiebreak)
+    #       | 'rejected_out_of_range' (physical bounds)
+    #       | 'rejected_extreme_disagreement' (> reject gate vs TLE)
+    #       | 'tiebreak_cam_gen_wins' | 'tiebreak_tle_wins' (resolver RMS outcome)
+    #       | 'cam_gen_failed'
+    cam_gen_altitude_status: Optional[str] = None
     altitude_source_used: Optional[str] = None     # 'cam_gen' | 'tle' | 'nominal'
     altitude_used_m: Optional[float] = None
+    # Phase 3b — fit-quality tiebreak candidates (populated only when the
+    # tiebreak fired; each entry is a dict of source/alt_m/rms_px).
+    altitude_tiebreak_candidates: list = field(default_factory=list)
     # Phase gates:
     phase2_max_iter: int = 0
     phase3_seam_warp_enabled: bool = False
@@ -2838,6 +2846,7 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
     # collides with the 180° rotation we apply to Aft sub-frames and the
     # refined altitude comes back wrong (observed 33–83 km on Bahrain).
     strip_cam_gen_altitude = None
+    altitude_tiebreak_pending = False
     if bool(camera_params.get("cam_gen_altitude", False)):
         # cam_gen needs a RAW panoramic image paired with its ground
         # corners. The raw stitched strip (``stitched/{scene_id}_stitched
@@ -2886,44 +2895,62 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             if delta_km is not None:
                 scene_telem.cam_gen_altitude_delta_km = delta_km
 
-            # Phase 3 altitude authority gate. Accept cam_gen's refined
-            # altitude iff all of:
-            #   a) 140 <= alt_m <= 280 km  (physical orbit range)
-            #   b) if a TLE altitude is available, |cam_gen - TLE| <= 5 km
-            # Otherwise trust TLE (or fall through to nominal when TLE
-            # is also unavailable). This closes the Bahrain failure mode
-            # where cam_gen landed at 147.8 km vs TLE 165.3 km (17 km
-            # below physics), which forced f to collapse to the ±30 %
-            # lower bound inside the per-segment fit. The 5 km threshold
-            # sits below the observed error and above TLE's own
-            # propagation noise (~1 km).
-            _TLE_GUARD_KM = 5.0
+            # Phase 3b altitude authority gate — 3-zone logic.
+            #   a) |cam_gen − TLE| ≤ _TLE_GUARD_TIGHT_KM  → accept cam_gen
+            #      directly (no tiebreak: altitudes already agree).
+            #   b) _TLE_GUARD_TIGHT_KM < |cam_gen − TLE| ≤ _TLE_GUARD_REJECT_KM
+            #      → defer to a Stage-A/B fit-quality tiebreak in the
+            #      main loop. Memory records scenes where cam_gen's
+            #      refined altitude was more correct than TLE's mean-
+            #      motion propagation (TLE can be perigee-biased), so a
+            #      simple rejection throws away valid signal on those.
+            #   c) |cam_gen − TLE| > _TLE_GUARD_REJECT_KM OR out of
+            #      physical range [140, 280] km → reject outright.
+            _TLE_GUARD_TIGHT_KM = 5.0
+            _TLE_GUARD_REJECT_KM = 30.0
             in_physical_range = (140_000.0 <= alt_m <= 280_000.0)
-            large_delta = (
-                delta_km is not None and abs(delta_km) > _TLE_GUARD_KM
+            extreme_delta = (
+                delta_km is not None and abs(delta_km) > _TLE_GUARD_REJECT_KM
             )
-            if in_physical_range and not large_delta:
-                strip_cam_gen_altitude = alt_m
-                scene_telem.cam_gen_altitude_status = "used"
-                print(
-                    f"  [per_segment] cam_gen strip altitude: "
-                    f"{alt_m:,.0f} m (will override Zs0 for all sub-frames)"
-                )
-            elif not in_physical_range:
+            moderate_delta = (
+                delta_km is not None
+                and abs(delta_km) > _TLE_GUARD_TIGHT_KM
+                and abs(delta_km) <= _TLE_GUARD_REJECT_KM
+            )
+            if not in_physical_range:
                 scene_telem.cam_gen_altitude_status = "rejected_out_of_range"
                 print(
                     f"  [per_segment] cam_gen altitude {alt_m:,.0f} m outside "
                     f"[140, 280] km — rejecting, falling back to TLE/nominal"
                 )
-            else:
-                # Physically plausible but diverges from TLE.
+            elif extreme_delta:
                 scene_telem.cam_gen_altitude_status = (
-                    "rejected_tle_disagreement"
+                    "rejected_extreme_disagreement"
                 )
                 print(
                     f"  [per_segment] cam_gen altitude {alt_m:,.0f} m disagrees "
                     f"with TLE {strip_tle_altitude:,.0f} m by {delta_km:+.1f} km "
-                    f"(> {_TLE_GUARD_KM} km gate) — rejecting, using TLE"
+                    f"(> {_TLE_GUARD_REJECT_KM} km reject gate) — using TLE"
+                )
+            elif moderate_delta:
+                # Defer: leave strip_cam_gen_altitude None for now; the
+                # main loop will do the tiebreak once coarse GCPs exist.
+                # Keep cam_gen altitude in scene_telem for the tiebreak.
+                altitude_tiebreak_pending = True
+                scene_telem.cam_gen_altitude_status = "pending_tiebreak"
+                print(
+                    f"  [per_segment] cam_gen altitude {alt_m:,.0f} m disagrees "
+                    f"with TLE {strip_tle_altitude:,.0f} m by {delta_km:+.1f} km "
+                    f"(> {_TLE_GUARD_TIGHT_KM} km) — will run Stage-A/B "
+                    f"tiebreak on the first successful segment"
+                )
+            else:
+                # Within the tight gate — accept directly.
+                strip_cam_gen_altitude = alt_m
+                scene_telem.cam_gen_altitude_status = "used"
+                print(
+                    f"  [per_segment] cam_gen strip altitude: "
+                    f"{alt_m:,.0f} m (will override Zs0 for all sub-frames)"
                 )
         else:
             scene_telem.cam_gen_altitude_status = "cam_gen_failed"
@@ -2932,6 +2959,12 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             )
     else:
         scene_telem.cam_gen_altitude_status = "not_attempted"
+
+    # ``altitude_tiebreak_pending`` was set above in the moderate-delta
+    # branch. The main loop consumes it once coarse GCPs for the first
+    # active segment are available: if two viable candidates exist
+    # (cam_gen in the 5-30 km disagreement band + TLE), it runs Stage
+    # A/B for each and picks the lower-RMS one.
 
     # Record which altitude source will actually be used by the per-segment
     # fits below. The Stage A/B caller at ``initial.Zs0 = ...`` prefers
@@ -3196,6 +3229,78 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             )
             return stage_b
         return stage_a
+
+    def _run_altitude_tiebreak(seg_idx: int, coarse_gcps: np.ndarray,
+                               sf_w: int, sf_h: int):
+        """Phase 3b: pick the winning altitude by Stage A/B RMS.
+
+        Runs ``_fit_segment_staged`` twice on ``coarse_gcps`` — once
+        with ``Zs0 = cam_gen_alt``, once with ``Zs0 = tle_alt`` — and
+        returns a tuple ``(winning_alt_m, winning_source, winning_fit,
+        candidates)`` where ``candidates`` is a list of dicts suitable
+        for serialising into the telemetry sidecar. The caller reuses
+        ``winning_fit`` as the segment's Stage A/B result so the
+        tiebreak is not extra net work on the winning candidate.
+        """
+        candidates = []
+        results = {}
+        for source, alt in (
+            ("cam_gen", scene_telem.strip_cam_gen_altitude_m),
+            ("tle", scene_telem.strip_tle_altitude_m),
+        ):
+            if alt is None:
+                continue
+            initial = kh_panoramic.PanoramicParams.from_gcps_nadir(
+                sub_frame_gcps=coarse_gcps,
+                pixel_pitch=float(seg_camera_params["pixel_pitch"]),
+                image_width_px=sf_w,
+                image_height_px=sf_h,
+                nominal_f=float(seg_camera_params["focal_length"]),
+            )
+            initial.omega0 = float(
+                seg_camera_params.get("forward_tilt", 0.0) or 0.0
+            )
+            initial.Zs0 = float(alt)
+            fit = _fit_segment_staged(
+                seg_idx, coarse_gcps, initial, sf_w, sf_h,
+                fix_f=False, zs0_prior_sigma_m=None,
+            )
+            rms = float(getattr(fit, "reprojection_rms_px", float("inf")))
+            usable = _fit_is_usable(fit)
+            candidates.append({
+                "source": source,
+                "alt_m": float(alt),
+                "rms_px": rms,
+                "usable": bool(usable),
+                "fitted_f_m": float(getattr(fit.params, "f", 0.0)) if usable else None,
+            })
+            if usable:
+                results[source] = (alt, fit, rms)
+        if not results:
+            return None, None, None, candidates
+        # Prefer lower RMS. If both usable, require ≥ 0.25 px improvement
+        # for cam_gen to override TLE (small hysteresis prevents flipping
+        # on a sub-pixel preference).
+        if "cam_gen" in results and "tle" in results:
+            cg_alt, cg_fit, cg_rms = results["cam_gen"]
+            tle_alt, tle_fit, tle_rms = results["tle"]
+            if cg_rms <= tle_rms - 0.25:
+                print(
+                    f"  [per_segment/altitude] tiebreak: cam_gen wins "
+                    f"({cg_rms:.2f}px @ {cg_alt/1000:.1f}km vs "
+                    f"TLE {tle_rms:.2f}px @ {tle_alt/1000:.1f}km)"
+                )
+                return cg_alt, "cam_gen", cg_fit, candidates
+            print(
+                f"  [per_segment/altitude] tiebreak: TLE wins/tied "
+                f"({tle_rms:.2f}px @ {tle_alt/1000:.1f}km vs "
+                f"cam_gen {cg_rms:.2f}px @ {cg_alt/1000:.1f}km)"
+            )
+            return tle_alt, "tle", tle_fit, candidates
+        # Only one candidate ran usable — take it.
+        source = next(iter(results))
+        alt, fit, _ = results[source]
+        return alt, source, fit, candidates
 
     def _do_mapproject(params, sub_path: str, bbox, sf_w: int, sf_h: int, out_path: str):
         if bbox is None:
@@ -4049,6 +4154,69 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 failed_segments.append(i)
                 continue
 
+            # Phase 3b: first time through the loop with a moderate
+            # cam_gen/TLE disagreement, run the tiebreak using this
+            # segment's coarse GCPs. The winning fit is reused as the
+            # segment's Stage A/B result, so there's no wasted work on
+            # the winner (only the loser's fit is "extra"; ~15-30 s).
+            if altitude_tiebreak_pending:
+                (winning_alt, winning_source, winning_fit,
+                 tiebreak_candidates) = _run_altitude_tiebreak(
+                    i, coarse_gcps, sf_w, sf_h,
+                )
+                scene_telem.altitude_tiebreak_candidates = tiebreak_candidates
+                altitude_tiebreak_pending = False
+                if winning_alt is None:
+                    print(
+                        f"  [per_segment/altitude] tiebreak failed — "
+                        f"falling back to TLE"
+                    )
+                    scene_telem.cam_gen_altitude_status = (
+                        "rejected_tiebreak_unusable"
+                    )
+                    strip_cam_gen_altitude = None
+                else:
+                    if winning_source == "cam_gen":
+                        strip_cam_gen_altitude = float(winning_alt)
+                        scene_telem.cam_gen_altitude_status = (
+                            "tiebreak_cam_gen_wins"
+                        )
+                    else:
+                        strip_cam_gen_altitude = None
+                        scene_telem.cam_gen_altitude_status = (
+                            "tiebreak_tle_wins"
+                        )
+                    # Propagate the authoritative altitude into the
+                    # scene-level telemetry so downstream code and
+                    # post-hoc diffs see the resolved source.
+                    resolved_alt = (
+                        strip_cam_gen_altitude
+                        if strip_cam_gen_altitude is not None
+                        else strip_tle_altitude
+                    )
+                    scene_telem.altitude_source_used = (
+                        "cam_gen" if strip_cam_gen_altitude is not None
+                        else "tle"
+                    )
+                    scene_telem.altitude_used_m = float(resolved_alt)
+                    # Reuse the winning fit as the segment's Stage A/B
+                    # result to avoid a pointless third fit.
+                    fit_res = winning_fit
+                    try:
+                        nominal_f = float(seg_camera_params["focal_length"])
+                        fitted_f = float(fit_res.params.f)
+                        seg_t.stage_ab_rms_px = float(fit_res.reprojection_rms_px)
+                        seg_t.stage_ab_fitted_f_m = fitted_f
+                        seg_t.stage_ab_f_deviation_pct = (
+                            100.0 * (fitted_f - nominal_f) / nominal_f
+                        )
+                    except Exception:
+                        pass
+                    # Skip the Stage A/B block below — already done.
+                    stage_ab_done = True
+                # Regardless, fall through to Stage A/B below only if
+                # the tiebreak did not already produce a usable fit.
+
             initial = kh_panoramic.PanoramicParams.from_gcps_nadir(
                 sub_frame_gcps=coarse_gcps,
                 pixel_pitch=float(seg_camera_params["pixel_pitch"]),
@@ -4085,11 +4253,14 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             elif strip_tle_altitude is not None:
                 initial.Zs0 = float(strip_tle_altitude)
 
-            fit_res = _fit_segment_staged(
-                i, coarse_gcps, initial, sf_w, sf_h,
-                fix_f=False,
-                zs0_prior_sigma_m=None,
-            )
+            if not locals().get("stage_ab_done", False):
+                fit_res = _fit_segment_staged(
+                    i, coarse_gcps, initial, sf_w, sf_h,
+                    fix_f=False,
+                    zs0_prior_sigma_m=None,
+                )
+            # Reset the flag for the next iteration.
+            stage_ab_done = False
             if not _fit_is_usable(fit_res):
                 print(f"  [per_segment/14p] seg{i:02d}: Stage A/B fit unusable")
                 seg_t.rejected = True

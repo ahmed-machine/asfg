@@ -509,11 +509,14 @@ def _phase3_altitude_test_fixture(tmp_path, monkeypatch, cam_gen_altitude_m,
 
 @pytest.mark.fast
 @pytest.mark.process
-def test_phase3_altitude_gate_rejects_cam_gen_when_tle_disagrees(tmp_path, monkeypatch):
-    """Phase 3: cam_gen returning 147.8 km while TLE reports 165.3 km
-    (the observed Bahrain delta) must be rejected. The fit should fall
-    back to TLE altitude, and the telemetry sidecar must record the
-    decision so post-hoc diffs are attributable."""
+def test_phase3_altitude_gate_tiebreak_on_moderate_disagreement(tmp_path, monkeypatch):
+    """Phase 3b: a 17 km cam_gen-vs-TLE delta (the observed Bahrain
+    case) is in the 5-30 km moderate-disagreement band. The resolver
+    defers to a Stage-A/B fit-quality tiebreak rather than rejecting
+    outright. With the fake_fit_panoramic returning a constant RMS for
+    both candidates, TLE wins the tie via the built-in 0.25 px
+    hysteresis, so altitude_source_used ends at 'tle'. The candidates
+    list records both Stage A/B RMS values for attribution."""
     out, telem = _phase3_altitude_test_fixture(
         tmp_path, monkeypatch,
         cam_gen_altitude_m=147_800.0,
@@ -522,20 +525,165 @@ def test_phase3_altitude_gate_rejects_cam_gen_when_tle_disagrees(tmp_path, monke
     assert telem["strip_cam_gen_altitude_m"] == pytest.approx(147_800.0)
     assert telem["strip_tle_altitude_m"] == pytest.approx(165_300.0)
     assert telem["cam_gen_altitude_delta_km"] == pytest.approx(-17.5, abs=0.01)
-    assert telem["cam_gen_altitude_status"] == "rejected_tle_disagreement", (
-        f"cam_gen at 17 km below TLE must be rejected; got "
+    assert telem["cam_gen_altitude_status"] == "tiebreak_tle_wins", (
+        f"17 km delta should trigger tiebreak resolved to TLE; got "
         f"{telem['cam_gen_altitude_status']}"
     )
     assert telem["altitude_source_used"] == "tle"
     assert telem["altitude_used_m"] == pytest.approx(165_300.0)
+    # Candidates list recorded for diffability.
+    candidates = telem.get("altitude_tiebreak_candidates", [])
+    sources = {c["source"] for c in candidates}
+    assert sources == {"cam_gen", "tle"}
+    for c in candidates:
+        assert c["usable"] is True
+        assert c["rms_px"] == pytest.approx(1.0, abs=0.01)
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3_altitude_tiebreak_prefers_cam_gen_when_it_fits_better(tmp_path, monkeypatch):
+    """Phase 3b: when cam_gen's altitude produces a materially better
+    Stage-A/B fit than TLE's (memory records the 216 km cam_gen /
+    165 km TLE scenario where cam_gen was the correct call), the
+    tiebreak preserves cam_gen instead of defaulting to TLE."""
+    import numpy as np
+    import preprocess.camera_model as cm
+    import preprocess.kh_panoramic as kp
+    from osgeo import gdal, osr
+    from pathlib import Path as _P
+    import json
+
+    frames = []
+    for idx in range(3):
+        p = tmp_path / f"TEST_TB_{idx}.tif"
+        drv = gdal.GetDriverByName("GTiff")
+        ds = drv.Create(str(p), 64, 32, 1, gdal.GDT_Byte)
+        arr = np.zeros((32, 64), dtype=np.uint8)
+        arr[:, 12:52] = 180
+        ds.GetRasterBand(1).WriteArray(arr)
+        ds.FlushCache()
+        ds = None
+        frames.append(str(p))
+
+    def _synthetic_gcps():
+        cols = np.linspace(4, 59, 6)
+        rows = np.linspace(4, 27, 5)
+        cc, rr = np.meshgrid(cols, rows)
+        x = 5600000.0 + cc.ravel() * 8.0
+        y = 3040000.0 - rr.ravel() * 8.0
+        z = np.zeros_like(x)
+        return np.column_stack([cc.ravel(), rr.ravel(), x, y, z]).astype(np.float64)
+
+    def fake_fit_panoramic(sub_frame_gcps, initial, *a, **kw):
+        # Altitude-dependent RMS: the cam_gen candidate at 195 km yields
+        # low RMS; the TLE candidate at 165 km fits badly.
+        zs0_km = float(initial.Zs0) / 1000.0
+        rms = 1.2 if abs(zs0_km - 195.0) < 5.0 else 25.0
+        return type(
+            "FitResult", (),
+            {"params": initial, "reprojection_rms_px": rms,
+             "reprojection_rms_m": rms * 7e-6,
+             "success": True, "message": "synthetic"},
+        )()
+
+    def fake_mapproject(*a, **kw):
+        out = kw["out_path"]
+        seg_idx = int(_P(out).stem.split("_seg", 1)[1][:2])
+        drv = gdal.GetDriverByName("GTiff")
+        ds = drv.Create(out, 64, 32, 1, gdal.GDT_Float32)
+        x_origin = 5600000.0 + seg_idx * (64 - 20) * 3.5
+        ds.SetGeoTransform([x_origin, 3.5, 0, 3040000.0, 0, -3.5])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(3857)
+        ds.SetProjection(srs.ExportToWkt())
+        cols = seg_idx * (64 - 20) + np.arange(64, dtype=np.float32)
+        rows = np.arange(32, dtype=np.float32)[:, None]
+        arr = rows * 4.0 + cols[None, :] * 2.0
+        ds.GetRasterBand(1).WriteArray(arr)
+        ds.GetRasterBand(1).SetNoDataValue(-32768)
+        ds.FlushCache()
+        ds = None
+        return out
+
+    def fake_cam_gen(*a, **kw):
+        return {
+            "altitude_m": 195_000.0,   # 30 km above TLE but physical
+            "focal_length": 1.524,
+            "lat_rad": 0.458,
+            "lon_rad": 0.881,
+            "iC": [0.0, 0.0, 0.0],
+        }
+
+    class _FakeAltitudeResult:
+        altitude_m = 165_300.0
+        source = "from_tle_at_closest_pass"
+        tle_epoch_utc = "1977-08-27T00:00:00Z"
+        subpoint_distance_km = 12.3
+
+    monkeypatch.setattr(kp, "extract_reference_gcps",
+                        lambda *a, **kw: _synthetic_gcps())
+    monkeypatch.setattr(kp, "fit_panoramic", fake_fit_panoramic)
+    monkeypatch.setattr(kp, "extract_model_guided_gcps",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "extract_raw_subframe_tie_points",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "raw_tie_points_to_gcps",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(kp, "mapproject", fake_mapproject)
+    monkeypatch.setattr(cm, "cam_gen_opticalbar_per_subframe", fake_cam_gen)
+    monkeypatch.setattr(cm, "altitude_m_at",
+                        lambda *a, **kw: _FakeAltitudeResult())
+
+    corners = {"NW": (26.3, 50.3), "NE": (26.1, 50.6),
+               "SE": (25.9, 50.6), "SW": (26.1, 50.3)}
+    cam_params = {"focal_length": 1.524, "pixel_pitch": 7e-6,
+                  "scan_time": 0.5, "speed": 7500, "forward_tilt": 0.0,
+                  "scan_dir": "right", "motion_compensation_factor": 1.0,
+                  "cam_gen_altitude": True}
+    reference = write_test_raster(tmp_path / "ref_tb.tif", crs="EPSG:3857")
+    seg_dir = tmp_path / "segments_tb"
+
+    cm.opticalbar_per_segment_precorrect(
+        frames, cam_params, corners, str(seg_dir),
+        scene_id="D3C1213-200346A003",
+        is_aft=True, reference_path=str(reference),
+        acq_date=__import__("datetime").date(1977, 8, 27),
+    )
+    telem = json.loads((seg_dir / "per_segment_telemetry.json").read_text())
+    assert telem["cam_gen_altitude_status"] == "tiebreak_cam_gen_wins", (
+        f"cam_gen at 195 km (RMS 1.2) should beat TLE 165 km (RMS 25); "
+        f"got {telem['cam_gen_altitude_status']}"
+    )
+    assert telem["altitude_source_used"] == "cam_gen"
+    assert telem["altitude_used_m"] == pytest.approx(195_000.0)
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase3_altitude_gate_rejects_extreme_disagreement(tmp_path, monkeypatch):
+    """Phase 3b: a 50 km cam_gen-vs-TLE delta exceeds the 30 km reject
+    gate; cam_gen is rejected outright without running the tiebreak.
+    Protects against the degenerate 51 km / unphysical-refinement case
+    where running cam_gen through the fit would still be a waste."""
+    out, telem = _phase3_altitude_test_fixture(
+        tmp_path, monkeypatch,
+        cam_gen_altitude_m=215_300.0,   # +50 km from TLE, still physical
+        tle_altitude_m=165_300.0,
+    )
+    assert telem["cam_gen_altitude_status"] == "rejected_extreme_disagreement"
+    assert telem["altitude_source_used"] == "tle"
+    # Tiebreak should not have run at extreme delta.
+    assert telem.get("altitude_tiebreak_candidates") in (None, [])
 
 
 @pytest.mark.fast
 @pytest.mark.process
 def test_phase3_altitude_gate_accepts_cam_gen_when_agrees_with_tle(tmp_path, monkeypatch):
     """Phase 3 hygiene: when cam_gen agrees with TLE within the 5 km
-    tolerance, the resolver keeps cam_gen's refined value. Prevents
-    the gate from becoming a universal 'ignore cam_gen' switch."""
+    tight band, the resolver keeps cam_gen's refined value without a
+    tiebreak. Prevents the gate from becoming a universal 'ignore
+    cam_gen' switch."""
     out, telem = _phase3_altitude_test_fixture(
         tmp_path, monkeypatch,
         cam_gen_altitude_m=168_000.0,
@@ -544,6 +692,7 @@ def test_phase3_altitude_gate_accepts_cam_gen_when_agrees_with_tle(tmp_path, mon
     assert telem["cam_gen_altitude_status"] == "used"
     assert telem["altitude_source_used"] == "cam_gen"
     assert telem["altitude_used_m"] == pytest.approx(168_000.0)
+    assert telem.get("altitude_tiebreak_candidates") in (None, [])
 
 
 @pytest.mark.fast
