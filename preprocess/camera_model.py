@@ -2760,27 +2760,56 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         if cam_gen_info is not None:
             alt_m = float(cam_gen_info["altitude_m"])
             scene_telem.strip_cam_gen_altitude_m = alt_m
-            if strip_tle_altitude is not None:
-                scene_telem.cam_gen_altitude_delta_km = (
-                    (alt_m - strip_tle_altitude) / 1000.0
-                )
-            if 140_000.0 <= alt_m <= 280_000.0:
+            delta_km = (
+                (alt_m - strip_tle_altitude) / 1000.0
+                if strip_tle_altitude is not None else None
+            )
+            if delta_km is not None:
+                scene_telem.cam_gen_altitude_delta_km = delta_km
+
+            # Phase 3 altitude authority gate. Accept cam_gen's refined
+            # altitude iff all of:
+            #   a) 140 <= alt_m <= 280 km  (physical orbit range)
+            #   b) if a TLE altitude is available, |cam_gen - TLE| <= 5 km
+            # Otherwise trust TLE (or fall through to nominal when TLE
+            # is also unavailable). This closes the Bahrain failure mode
+            # where cam_gen landed at 147.8 km vs TLE 165.3 km (17 km
+            # below physics), which forced f to collapse to the ±30 %
+            # lower bound inside the per-segment fit. The 5 km threshold
+            # sits below the observed error and above TLE's own
+            # propagation noise (~1 km).
+            _TLE_GUARD_KM = 5.0
+            in_physical_range = (140_000.0 <= alt_m <= 280_000.0)
+            large_delta = (
+                delta_km is not None and abs(delta_km) > _TLE_GUARD_KM
+            )
+            if in_physical_range and not large_delta:
                 strip_cam_gen_altitude = alt_m
                 scene_telem.cam_gen_altitude_status = "used"
                 print(
                     f"  [per_segment] cam_gen strip altitude: "
                     f"{alt_m:,.0f} m (will override Zs0 for all sub-frames)"
                 )
-            else:
+            elif not in_physical_range:
                 scene_telem.cam_gen_altitude_status = "rejected_out_of_range"
                 print(
                     f"  [per_segment] cam_gen altitude {alt_m:,.0f} m outside "
-                    f"[140k, 280k] km — ignoring, using NOMINAL_Z_S0"
+                    f"[140, 280] km — rejecting, falling back to TLE/nominal"
+                )
+            else:
+                # Physically plausible but diverges from TLE.
+                scene_telem.cam_gen_altitude_status = (
+                    "rejected_tle_disagreement"
+                )
+                print(
+                    f"  [per_segment] cam_gen altitude {alt_m:,.0f} m disagrees "
+                    f"with TLE {strip_tle_altitude:,.0f} m by {delta_km:+.1f} km "
+                    f"(> {_TLE_GUARD_KM} km gate) — rejecting, using TLE"
                 )
         else:
             scene_telem.cam_gen_altitude_status = "cam_gen_failed"
             print(
-                f"  [per_segment] cam_gen unavailable/failed — using NOMINAL_Z_S0"
+                f"  [per_segment] cam_gen unavailable/failed — using TLE/NOMINAL_Z_S0"
             )
     else:
         scene_telem.cam_gen_altitude_status = "not_attempted"
@@ -3676,17 +3705,45 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             stage1_ortho_path = os.path.join(output_dir, f"{scene_id}_seg{i:02d}_ortho_stage1.tif")
             cached = _load_ortho_corners(seg_ortho_path)
             cached_meta = _load_ortho_metadata(seg_ortho_path)
+            # Phase 3: the cached ortho is only valid if the altitude
+            # authority used to produce it matches today's. Orthos
+            # encode the Zs0 implicitly (cam geometry + mapproject),
+            # so changing altitude sources without invalidating the
+            # cache would leave downstream reads of a stale geographic
+            # projection. Reject when |cached.zs0 - planned zs0| > 1km.
+            planned_zs0_m = (
+                float(strip_cam_gen_altitude)
+                if strip_cam_gen_altitude is not None
+                else (
+                    float(strip_tle_altitude)
+                    if strip_tle_altitude is not None
+                    else float(NOMINAL_ALTITUDE_M)
+                )
+            )
+            cached_zs0_m = cached_meta.get("zs0_m")
+            altitude_cache_ok = (
+                cached_zs0_m is None
+                or abs(float(cached_zs0_m) - planned_zs0_m) <= 1_000.0
+            )
             if (os.path.isfile(seg_ortho_path) and cached is not None
                     and cached_meta.get("mode") == mode_tag
                     and cached_meta.get("local_crs") == local_crs
                     and normalize_preprocess_matcher(
                         cached_meta.get("preprocess_matcher", "roma")
-                    ) == preprocess_matcher):
+                    ) == preprocess_matcher
+                    and altitude_cache_ok):
                 cached_base, _ = cached
                 if _corners_match(cached_base, base_corners[i]):
                     print(f"  [per_segment/14p] seg{i:02d} cached ({mode_tag})")
                     seg_orthos_map[i] = seg_ortho_path
                     continue
+            elif os.path.isfile(seg_ortho_path) and cached_zs0_m is not None \
+                    and not altitude_cache_ok:
+                print(
+                    f"  [per_segment/14p] seg{i:02d} cache invalid: "
+                    f"cached Zs0={cached_zs0_m:,.0f}m vs planned "
+                    f"{planned_zs0_m:,.0f}m — re-fitting"
+                )
 
             if reference_path is None or not os.path.isfile(reference_path):
                 seg_t = _seg_telem(scene_telem, i)
@@ -4015,6 +4072,8 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 "matcher_cache_tag": matcher_cache_tag,
                 "fit_rms_px": float(final_fit.reprojection_rms_px),
                 "n_gcps": int(final_gcps.shape[0]),
+                "zs0_m": float(final_fit.params.Zs0),
+                "altitude_source": scene_telem.altitude_source_used,
             }
             _save_ortho_corners(final_ortho, base_corners[i], base_corners[i], metadata=meta)
             seg_orthos_map[i] = final_ortho

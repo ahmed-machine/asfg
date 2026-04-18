@@ -161,6 +161,104 @@ def test_forward_project_east_ground_point_projects_east_on_film():
     assert abs(float(yp_mod.item())) < 1e-4
 
 
+def test_fit_recovers_kh4b_geometry_phase2_sanity():
+    """Phase 2 sanity check: the 14-parameter fit must reproduce KH-4B
+    geometry on noise-free synthetic GCPs.
+
+    The 2OC paper (Hou et al. 2023) is framed around KH-4B (f ≈ 0.6096 m,
+    shorter focal length than KH-9 PC's 1.524 m). Table 6 reports fitted
+    focal lengths of 0.60025, 0.6028, 0.60602, 0.6029 m across sub-images
+    a/b/c/d of one strip — a ~0.44 % spread around a ~0.6030 m mean.
+
+    If the fit core cannot recover a KH-4B focal length from noise-free
+    synthetic inputs, Phase 3+ of the recovery plan is wasted effort.
+    A passing run here confirms the port is sound and failures on real
+    data must be upstream (altitude, GCP coverage, bbox policy).
+    """
+    # KH-4B geometry — rough USGS sub-frame dimensions.
+    kh4b_f = 0.6096
+    kh4b_pixel_pitch = 7e-6
+    kh4b_img_w = 34_000
+    kh4b_img_h = 24_000
+    kh4b_L = kh4b_img_w * kh4b_pixel_pitch
+
+    cx, cy = 5_620_000.0, 3_035_000.0
+    truth = PanoramicParams(
+        Xs0=cx,
+        Ys0=cy,
+        Zs0=170_000.0,
+        omega0=0.0,
+        phi0=0.0,
+        kappa0=0.0,
+        Xs1=0.0, Ys1=0.0, Zs1=0.0,
+        omega1=0.0, phi1=0.0, kappa1=0.0,
+        P=0.0,
+        f=kh4b_f,
+    )
+
+    # Dense grid, similar coverage to KH-4B sub-frame footprint.
+    rng = np.random.default_rng(42)
+    xs = np.linspace(cx - 45_000, cx + 45_000, 14)
+    ys = np.linspace(cy - 25_000, cy + 25_000, 10)
+    X, Y = np.meshgrid(xs, ys)
+    Z = rng.uniform(0.0, 200.0, size=X.shape)
+    ground_xyz = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+
+    # Project with explicit KH-4B L so film-coord geometry is self-consistent.
+    import torch
+    params_t = truth.to_tensor()
+    Xt = torch.from_numpy(ground_xyz[:, 0].astype(np.float64))
+    Yt = torch.from_numpy(ground_xyz[:, 1].astype(np.float64))
+    Zt = torch.from_numpy(ground_xyz[:, 2].astype(np.float64))
+    n = ground_xyz.shape[0]
+    x_p = torch.zeros(n, dtype=torch.float64)
+    for _ in range(30):
+        xp_new, _ = forward_project(params_t, Xt, Yt, Zt, x_p, kh4b_L)
+        if torch.max(torch.abs(xp_new - x_p)) < 1e-8:
+            x_p = xp_new
+            break
+        x_p = xp_new
+    _, y_p = forward_project(params_t, Xt, Yt, Zt, x_p, kh4b_L)
+    cols = (x_p.detach().cpu().numpy() / kh4b_pixel_pitch) + kh4b_img_w / 2.0
+    rows = (-y_p.detach().cpu().numpy() / kh4b_pixel_pitch) + kh4b_img_h / 2.0
+    pixels = np.column_stack([cols, rows])
+    gcps = np.column_stack([pixels, ground_xyz])
+
+    perturbed = PanoramicParams(
+        Xs0=truth.Xs0 + 200.0,
+        Ys0=truth.Ys0 - 150.0,
+        Zs0=truth.Zs0,
+        omega0=0.01, phi0=-0.01, kappa0=0.005,
+        Xs1=0.0, Ys1=0.0, Zs1=0.0,
+        omega1=0.0, phi1=0.0, kappa1=0.0,
+        P=0.0,
+        f=truth.f * 1.005,
+    )
+    result = fit_panoramic(
+        sub_frame_gcps=gcps,
+        initial=perturbed,
+        pixel_pitch=kh4b_pixel_pitch,
+        image_width_px=kh4b_img_w,
+        image_height_px=kh4b_img_h,
+        nominal_f=kh4b_f,
+        max_iter=200,
+        f_scale_px=1.0,
+        verbose=False,
+    )
+    assert result.success, f"KH-4B fit failed: {result.message}"
+    assert result.reprojection_rms_px < 1.0, (
+        f"KH-4B RMS too high: {result.reprojection_rms_px:.3f} px "
+        f"({result.message})"
+    )
+    # f must stay within 0.5 % of KH-4B nominal — comfortably inside the
+    # 0.44 % observed-spread upper bound reported in paper Table 6.
+    f_dev_frac = abs(result.params.f - truth.f) / truth.f
+    assert f_dev_frac < 0.005, (
+        f"KH-4B f deviation {f_dev_frac * 100:.3f}% exceeds 0.5 % "
+        f"gate (fit f={result.params.f:.5f}, truth f={truth.f:.5f})"
+    )
+
+
 def test_fit_recovers_nadir_params_from_noise_free_synth():
     """Synthesise many ground points under a known nadir camera, project,
     and check fit_panoramic recovers the parameters within tight tolerance."""
