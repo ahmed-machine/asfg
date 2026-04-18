@@ -155,6 +155,8 @@ def test_run_strip_bundle_adjustment_phase4_flags(tmp_path, monkeypatch):
         out_cam = tmp_path / f"ba-seed_{i}.tsai"
         _fake_tsai(out_cam)
 
+    # First invocation: reference_terrain_weight set but no disparity_list,
+    # so ASP path falls back to --heights-from-dem.
     result = ba_mod.run_strip_bundle_adjustment(
         frames=frames,
         camera_params={"focal_length": 1.524, "pixel_pitch": 7e-6,
@@ -190,14 +192,13 @@ def test_run_strip_bundle_adjustment_phase4_flags(tmp_path, monkeypatch):
     assert _has("--intrinsics-to-float", "focal_length")
     assert _has("--intrinsics-to-share", "focal_length")
     assert _has("--intrinsics-limits", "0.92 1.08")
-    assert _has("--reference-terrain", str(dem_file))
-    assert _has("--reference-terrain-weight", "1000.0")
     assert _has("--robust-threshold", "2.0")
     assert _has("--camera-weight", "0")
 
-    # The legacy --heights-from-dem must NOT be present when reference-
-    # terrain path is active.
-    assert "--heights-from-dem" not in argv
+    # Without disparities, Phase 4 falls back to --heights-from-dem so
+    # --reference-terrain must NOT be present (ASP would hard-error).
+    assert "--reference-terrain" not in argv
+    assert _has("--heights-from-dem", str(dem_file))
 
     # Absolute GCP file must appear on the command line.
     assert str(gcp_file) in argv
@@ -205,6 +206,34 @@ def test_run_strip_bundle_adjustment_phase4_flags(tmp_path, monkeypatch):
     # The seed tsai files must appear (not freshly generated cameras).
     for seed in seeds:
         assert seed in argv
+
+    # Second invocation: if a disparity_list is supplied, --reference-terrain
+    # path is taken and --heights-from-dem is not emitted.
+    disp = tmp_path / "disp.tif"
+    disp.write_text("")
+    result2 = ba_mod.run_strip_bundle_adjustment(
+        frames=frames,
+        camera_params={"focal_length": 1.524, "pixel_pitch": 7e-6,
+                       "scan_time": 0.5, "speed": 7800,
+                       "forward_tilt": 0.0, "scan_dir": "right",
+                       "motion_compensation_factor": 1.0},
+        corners_list=[{}] * 3,
+        output_dir=str(tmp_path),
+        initial_tsai_paths=seeds,
+        absolute_gcp_file=str(gcp_file),
+        dem_path=str(dem_file),
+        solve_intrinsics=True,
+        shared_intrinsics=True,
+        intrinsics_limits=(0.92, 1.08),
+        reference_terrain_weight=1000.0,
+        disparity_list=[str(disp)],
+        robust_threshold=2.0,
+        camera_weight=0,
+    )
+    argv2 = captured_cmd["argv"]
+    assert "--reference-terrain" in argv2
+    assert "--heights-from-dem" not in argv2
+    assert "--disparity-list" in argv2
 
 
 def test_run_strip_bundle_adjustment_rejects_legacy_gcps_format(tmp_path, monkeypatch):

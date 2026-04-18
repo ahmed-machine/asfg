@@ -3607,7 +3607,6 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     image_height_px=int(sf_h_i),
                 ),
                 t_srs=t_srs,
-                bbox=final_bbox,
             )
             if new_ortho is None or not os.path.isfile(new_ortho):
                 scene_telem.phase4_skipped_reason = (

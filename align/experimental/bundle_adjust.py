@@ -126,6 +126,7 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
                                 shared_intrinsics=False,
                                 intrinsics_limits=None,
                                 reference_terrain_weight=None,
+                                disparity_list=None,
                                 robust_threshold=None,
                                 camera_weight=10):
     """Run ASP bundle_adjust on a strip of frames.
@@ -177,10 +178,18 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
         ``solve_intrinsics=True``. Passed to
         ``--intrinsics-limits "lo hi ..."``.
     reference_terrain_weight : float, optional
-        Phase 4: when > 0 AND ``dem_path`` is supplied, pass
+        Phase 4: when > 0 AND ``dem_path`` is supplied AND
+        ``disparity_list`` is non-empty, pass
         ``--reference-terrain DEM --reference-terrain-weight W`` instead
         of the weaker ``--heights-from-dem``. Dehecq et al. 2020 used
         weight 1000 to break the altitude/focal-length gauge on KH-9.
+        If ``disparity_list`` is missing, falls back to
+        ``--heights-from-dem`` (ASP refuses ``--reference-terrain``
+        without disparity pairs).
+    disparity_list : list of str, optional
+        Phase 4: paths to ASP stereo disparity ``.tif`` files
+        (one per image pair) required by ``--reference-terrain``.
+        Typically produced by ``parallel_stereo`` before BA.
     robust_threshold : float, optional
         Phase 4: override ASP's default ``--robust-threshold`` (0.5 px).
         Raise to 2-3 px on cross-temporal imagery where RoMa-filtered
@@ -293,22 +302,37 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
             )
 
     if dem_path and os.path.isfile(dem_path):
-        if reference_terrain_weight and reference_terrain_weight > 0:
+        want_reference_terrain = (
+            reference_terrain_weight and reference_terrain_weight > 0
+            and disparity_list
+        )
+        if want_reference_terrain:
             # Stronger DEM coupling: penalises reprojection residuals
             # against the DEM, not just heights. Dehecq's gauge-breaker.
+            # ASP requires a disparity list paired with --reference-terrain,
+            # so we only take this path when the caller has stereo disparities
+            # available. Without them ASP hard-errors.
             cmd.extend([
                 "--reference-terrain", dem_path,
                 "--reference-terrain-weight", str(reference_terrain_weight),
+                "--disparity-list", " ".join(disparity_list),
             ])
             print(
                 f"  [BundleAdjust] --reference-terrain-weight "
-                f"{reference_terrain_weight}"
+                f"{reference_terrain_weight} with {len(disparity_list)} disparities"
             )
         else:
             cmd.extend([
                 "--heights-from-dem", dem_path,
                 "--heights-from-dem-uncertainty", "10.0",
             ])
+            if reference_terrain_weight and reference_terrain_weight > 0:
+                # Caller asked for reference-terrain but didn't supply
+                # disparities — fall back to heights-from-dem with a note.
+                print(
+                    "  [BundleAdjust] reference-terrain requested but no "
+                    "disparity_list supplied; falling back to --heights-from-dem"
+                )
 
     if robust_threshold is not None:
         cmd.extend(["--robust-threshold", str(float(robust_threshold))])
