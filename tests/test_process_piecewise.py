@@ -267,6 +267,125 @@ def test_per_segment_precorrect_reverses_and_rotates_aft_frames(tmp_path, monkey
     assert "seg02_rot180" in observed_paths[2]
 
 
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase4_resolve_bbox_policy_defaults_and_unknown():
+    """Phase 4: empty defaults to predicted_union_gcp (experimental),
+    unknown values warn and fall back to gcp_hull, known values pass
+    through unchanged."""
+    from preprocess.camera_model import _resolve_bbox_policy
+
+    assert _resolve_bbox_policy(None) == "predicted_union_gcp"
+    assert _resolve_bbox_policy("") == "predicted_union_gcp"
+    assert _resolve_bbox_policy("gcp_hull") == "gcp_hull"
+    assert _resolve_bbox_policy("predicted_union_gcp") == "predicted_union_gcp"
+    assert _resolve_bbox_policy("bogus") == "gcp_hull"
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase4_predicted_bbox_unions_with_gcp_hull():
+    """Phase 4: when GCPs cluster in a narrow Y-band but the predicted
+    footprint spans the full sub-frame, the union bbox is Y-tall enough
+    to share real overlap with a neighbouring segment's ortho.
+
+    Constructed scenario: 20 GCPs packed into a 1 km Y-strip near the
+    segment centroid, but the predicted sub-frame footprint (from a
+    nadir camera at 170 km) spans ~50 km in Y. The legacy gcp_hull
+    bbox would be ~1-3 km tall (after padding); the predicted_union_gcp
+    bbox must be at least an order of magnitude taller.
+    """
+    import math
+    import numpy as np
+    from preprocess.camera_model import (
+        _bbox_from_gcps,
+        _predicted_segment_bbox,
+        _resolve_render_bbox,
+    )
+    from preprocess.kh_panoramic import PanoramicParams
+
+    cx, cy = 5_620_000.0, 3_035_000.0
+    img_w = 20_000
+    img_h = 20_000
+    pixel_pitch = 7e-6
+    params = PanoramicParams(
+        Xs0=cx, Ys0=cy, Zs0=170_000.0,
+        omega0=0.0, phi0=0.0, kappa0=0.0,
+        Xs1=0.0, Ys1=0.0, Zs1=0.0,
+        omega1=0.0, phi1=0.0, kappa1=0.0,
+        P=0.0, f=1.524,
+    )
+
+    # 20 GCPs packed into a narrow along-track band (typical Bahrain).
+    rng = np.random.default_rng(0)
+    gcps = np.column_stack([
+        rng.uniform(0, img_w, size=20),
+        rng.uniform(img_h * 0.48, img_h * 0.52, size=20),  # ~2 % of image height
+        rng.uniform(cx - 1_000, cx + 1_000, size=20),
+        rng.uniform(cy - 500, cy + 500, size=20),          # ~1 km Y-span
+        np.zeros(20),
+    ]).astype(np.float64)
+
+    legacy_bbox = _bbox_from_gcps(gcps)
+    predicted_bbox = _predicted_segment_bbox(
+        params, pixel_pitch, img_w, img_h,
+    )
+    union_bbox, pred_echo, gcp_echo = _resolve_render_bbox(
+        bbox_policy="predicted_union_gcp",
+        gcps=gcps,
+        fit_params=params,
+        pixel_pitch=pixel_pitch,
+        image_width_px=img_w,
+        image_height_px=img_h,
+    )
+
+    # Legacy hull Y-span should be small (GCPs in a narrow band).
+    legacy_span_y = legacy_bbox[3] - legacy_bbox[1]
+    assert legacy_span_y < 5_000, (
+        f"legacy GCP-hull Y-span {legacy_span_y:.0f} m should be < 5 km"
+    )
+
+    # Predicted footprint is driven by image dimensions × pixel_pitch × f.
+    assert predicted_bbox is not None
+    pred_span_y = predicted_bbox[3] - predicted_bbox[1]
+    assert pred_span_y > 5_000, (
+        f"predicted footprint Y-span {pred_span_y:.0f} m should be > 5 km "
+        f"for a 170-km-altitude nadir camera"
+    )
+
+    # Union bbox must be at least as tall as the predicted footprint.
+    union_span_y = union_bbox[3] - union_bbox[1]
+    assert union_span_y >= pred_span_y, (
+        f"union Y-span {union_span_y:.0f} should include predicted "
+        f"{pred_span_y:.0f}"
+    )
+
+
+@pytest.mark.fast
+@pytest.mark.process
+def test_phase4_resolve_render_bbox_gcp_hull_mode_skips_forward_project():
+    """Phase 4 back-compat: explicit 'gcp_hull' mode must not touch the
+    fit params. Protects users who opt into the legacy bbox on new
+    scenes without a usable Stage A/B fit."""
+    import numpy as np
+    from preprocess.camera_model import _resolve_render_bbox
+
+    gcps = np.array([
+        [0.0, 0.0, 5_620_000.0, 3_035_000.0, 0.0],
+        [100.0, 100.0, 5_620_500.0, 3_035_500.0, 0.0],
+    ])
+    final_bbox, predicted_bbox, gcp_bbox = _resolve_render_bbox(
+        bbox_policy="gcp_hull",
+        gcps=gcps,
+        fit_params=None,           # would crash forward_project
+        pixel_pitch=7e-6,
+        image_width_px=20_000,
+        image_height_px=20_000,
+    )
+    assert predicted_bbox is None
+    assert final_bbox == gcp_bbox
+
+
 def _phase3_altitude_test_fixture(tmp_path, monkeypatch, cam_gen_altitude_m,
                                   tle_altitude_m):
     """Shared setup for the Phase 3 altitude-gate tests.

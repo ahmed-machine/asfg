@@ -167,6 +167,21 @@ class CameraParams:
     # 'per_segment_experimental'. Profiles should migrate to the
     # explicit ``ortho_strategy`` field.
     per_segment_ortho: bool = False
+    # Phase 4 render-extent policy. Controls how the per-segment code
+    # decides the output ortho bbox for each sub-frame:
+    #   'gcp_hull'           — bbox of matched GCPs + padding (legacy).
+    #                          Can clip the ortho to a thin Y-band if
+    #                          RoMa matches cluster, destroying seam
+    #                          overlap on adjacent segments.
+    #   'predicted_union_gcp' — union of GCP hull + predicted sub-frame
+    #                          footprint (forward-projected through the
+    #                          14p fit). Restores meaningful seam
+    #                          overlap. Default for the experimental
+    #                          path.
+    # Left empty at the dataclass level so the resolver can distinguish
+    # "user set gcp_hull explicitly" from "nothing set, use the
+    # experimental default".
+    bbox_policy: str = ""
     # Feature matcher backend used by preprocessing-only correspondence
     # extraction (per-segment rectification and experimental BA .match files).
     preprocess_matcher: str = "roma"
@@ -224,6 +239,7 @@ class CameraParams:
             "cam_gen_altitude": self.cam_gen_altitude,
             "ortho_strategy": self.ortho_strategy,
             "per_segment_ortho": self.per_segment_ortho,
+            "bbox_policy": self.bbox_policy,
             "panoramic_seam_warp": self.panoramic_seam_warp,
             "panoramic_seam_feather_px": self.panoramic_seam_feather_px,
             "panoramic_seam_tps_smoothing": self.panoramic_seam_tps_smoothing,

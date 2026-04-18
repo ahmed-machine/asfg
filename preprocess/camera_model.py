@@ -1576,6 +1576,125 @@ def _bbox_from_gcps(gcps: np.ndarray,
     return (x_min - pad_x, y_min - pad_y, x_max + pad_x, y_max + pad_y)
 
 
+def _predicted_segment_bbox(fit_params, pixel_pitch: float,
+                            image_width_px: int, image_height_px: int,
+                            z_world: float = 0.0,
+                            n_grid: int = 8) -> tuple | None:
+    """Phase 4: project the sub-frame's corners + edge midpoints through
+    the 14-parameter fit to get a predicted ground footprint.
+
+    A panoramic scan is curved in ground coordinates (the bow-tie
+    distortion), so the true footprint is not convex on the 4 image
+    corners alone. Sample an ``n_grid × n_grid`` grid across the frame
+    and take the axis-aligned bounding box of the projected points.
+    Infinite/NaN projections (e.g. corners where the collinearity
+    inverse is degenerate) are dropped.
+
+    Returns ``(x_min, y_min, x_max, y_max)`` in the same local CRS as
+    ``params.Xs0 / Ys0``, or ``None`` if fewer than 4 samples project.
+    """
+    try:
+        from preprocess import kh_panoramic
+    except ImportError:
+        return None
+    cols_1d = np.linspace(0.0, float(image_width_px), n_grid)
+    rows_1d = np.linspace(0.0, float(image_height_px), n_grid)
+    cc, rr = np.meshgrid(cols_1d, rows_1d)
+    cols = cc.ravel()
+    rows = rr.ravel()
+    try:
+        xs, ys = kh_panoramic.raw_to_world(
+            params=fit_params,
+            cols=cols,
+            rows=rows,
+            pixel_pitch=float(pixel_pitch),
+            image_width_px=int(image_width_px),
+            image_height_px=int(image_height_px),
+            z_world=float(z_world),
+        )
+    except Exception:
+        return None
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
+    finite = np.isfinite(xs) & np.isfinite(ys)
+    if finite.sum() < 4:
+        return None
+    xs = xs[finite]
+    ys = ys[finite]
+    return (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+
+
+def _union_bbox(a: tuple | None, b: tuple | None) -> tuple | None:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return (
+        min(a[0], b[0]),
+        min(a[1], b[1]),
+        max(a[2], b[2]),
+        max(a[3], b[3]),
+    )
+
+
+def _bbox_with_padding(bbox: tuple | None,
+                       min_pad_m: float = 800.0,
+                       pad_frac: float = 0.05) -> tuple | None:
+    if bbox is None:
+        return None
+    x_min, y_min, x_max, y_max = bbox
+    span_x = max(1.0, x_max - x_min)
+    span_y = max(1.0, y_max - y_min)
+    pad_x = max(min_pad_m, span_x * pad_frac)
+    pad_y = max(min_pad_m, span_y * pad_frac)
+    return (x_min - pad_x, y_min - pad_y, x_max + pad_x, y_max + pad_y)
+
+
+def _resolve_bbox_policy(bbox_policy: str | None) -> str:
+    """Return the effective Phase 4 bbox policy.
+
+    Defaults to ``'predicted_union_gcp'`` when nothing is set, so the
+    experimental path gets the fix by default. Unknown values fall
+    back to ``'gcp_hull'`` (legacy) to avoid crashing on typos.
+    """
+    raw = (str(bbox_policy).strip().lower() if bbox_policy else "")
+    if raw == "gcp_hull":
+        return "gcp_hull"
+    if raw == "predicted_union_gcp":
+        return "predicted_union_gcp"
+    if raw:
+        print(
+            f"  [per_segment/bbox] warning: unknown bbox_policy={bbox_policy!r}; "
+            f"valid values are {{'gcp_hull', 'predicted_union_gcp'}}. "
+            f"Falling back to 'gcp_hull'."
+        )
+        return "gcp_hull"
+    return "predicted_union_gcp"
+
+
+def _resolve_render_bbox(bbox_policy: str, gcps: np.ndarray, fit_params,
+                         pixel_pitch: float, image_width_px: int,
+                         image_height_px: int) -> tuple:
+    """Phase 4 bbox resolver used at every ``_do_mapproject`` call site.
+
+    Returns ``(final_bbox, predicted_bbox, gcp_bbox)`` tuple so callers
+    can record each candidate in telemetry without re-projecting.
+    Falls back to ``gcp_hull`` semantics when either candidate is
+    unavailable.
+    """
+    gcp_bbox = _bbox_from_gcps(gcps)
+    if bbox_policy == "gcp_hull" or fit_params is None:
+        return gcp_bbox, None, gcp_bbox
+    predicted = _predicted_segment_bbox(
+        fit_params, pixel_pitch, image_width_px, image_height_px,
+    )
+    if predicted is None:
+        return gcp_bbox, None, gcp_bbox
+    padded_predicted = _bbox_with_padding(predicted)
+    final = _union_bbox(padded_predicted, gcp_bbox)
+    return final, predicted, gcp_bbox
+
+
 def _auto_output_resolution_m(reference_path: str | None,
                               bbox_xy,
                               image_width_px: int,
@@ -2913,6 +3032,8 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
     nominal_scan_time = float(seg_camera_params.get("scan_time", 0.0) or 0.0)
     if nominal_scan_time > 0:
         seg_camera_params["scan_time"] = nominal_scan_time / n
+    bbox_policy = _resolve_bbox_policy(seg_camera_params.get("bbox_policy"))
+    print(f"  [per_segment/bbox] policy={bbox_policy}")
 
     # --- 2OC-style staged 14-parameter fit in local UTM ---
     try:
@@ -3991,7 +4112,37 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             except Exception:
                 pass
 
-            final_bbox = _bbox_from_gcps(final_gcps)
+            # Phase 4 render bbox: prefer the union of the GCP hull and
+            # the predicted sub-frame footprint (forward-projected through
+            # the fit). This is what restores meaningful seam overlap on
+            # Bahrain — GCPs cluster in a ~2 km along-track band, so the
+            # legacy gcp_hull bbox clips the ortho to a narrow Y-strip and
+            # adjacent segments' strips don't overlap geographically.
+            final_bbox, predicted_bbox, gcp_bbox = _resolve_render_bbox(
+                bbox_policy=bbox_policy,
+                gcps=final_gcps,
+                fit_params=final_fit.params,
+                pixel_pitch=float(seg_camera_params["pixel_pitch"]),
+                image_width_px=sf_w,
+                image_height_px=sf_h,
+            )
+            # Telemetry — record each candidate so Phase 4 A/B diffs are
+            # straightforward.
+            try:
+                if predicted_bbox is not None:
+                    seg_t.predicted_bbox = [float(v) for v in predicted_bbox]
+                if gcp_bbox is not None:
+                    seg_t.gcp_bbox = [float(v) for v in gcp_bbox]
+                if final_bbox is not None:
+                    seg_t.final_bbox = [float(v) for v in final_bbox]
+                seg_t.bbox_source = (
+                    "predicted_union_gcp"
+                    if (bbox_policy == "predicted_union_gcp"
+                        and predicted_bbox is not None)
+                    else "gcp_hull"
+                )
+            except Exception:
+                pass
             final_ortho = _do_mapproject(
                 final_fit.params,
                 sub_path,
@@ -4087,12 +4238,8 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 seg_t.final_f_deviation_pct = 100.0 * (f_final - nominal_f) / nominal_f
                 seg_t.final_gcp_count = int(final_gcps.shape[0])
                 seg_t.ortho_path = final_ortho
-                seg_t.bbox_source = "gcp_hull"  # will change in Phase 4
-                try:
-                    seg_t.gcp_bbox = [float(v) for v in final_bbox]
-                    seg_t.final_bbox = [float(v) for v in final_bbox]
-                except Exception:
-                    pass
+                # bbox_source + predicted_bbox / gcp_bbox / final_bbox are
+                # already populated above by _resolve_render_bbox.
             except Exception:
                 pass
             seg_shape_map[i] = (sf_w, sf_h)
