@@ -20,7 +20,15 @@ camera:
   motion_compensation_factor: 1.0
   preprocess_matcher: roma
   panoramic_local_crs: ""
-  gcp_search_pad_m: 10000
+  # Reduced 10000 → 2000 (2026-04-18): 10 km pad per side inflated each
+  # segment's RoMa-vs-reference search region to ~48 km, so matches
+  # scattered far beyond the 28 km USGS-interpolated per-segment extent
+  # and the 14p fit converged onto a 48-km-wide footprint per segment.
+  # Rendered orthos then overlapped adjacent segments by ~55 %. 2 km
+  # matches extract_reference_gcps's own default — tight enough to
+  # respect the USGS corners without starving the matcher on modest
+  # USGS corner error. See diagnostics/baseline_v7_tight_bbox/.
+  gcp_search_pad_m: 2000
   gcp_match_res_m_coarse: 4.0
   gcp_match_res_m_fine: 2.0
   panoramic_fit_rms_px_max: 4.0

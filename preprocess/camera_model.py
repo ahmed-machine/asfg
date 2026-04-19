@@ -1668,8 +1668,17 @@ def _auto_local_utm_crs(strip_corners: dict) -> str:
 
 def _bbox_from_gcps(gcps: np.ndarray,
                     min_pad_m: float = 800.0,
-                    pad_frac: float = 0.18):
-    """Estimate a stable ortho bbox from the GCP ground coordinates."""
+                    pad_frac: float = 0.05):
+    """Estimate a stable ortho bbox from the GCP ground coordinates.
+
+    ``pad_frac`` was 0.18 until 2026-04-18; on a 48-km GCP spread that
+    added ~9 km per side, inflating the render extent to 65 km and
+    causing adjacent-segment overlap. 0.05 keeps a small buffer for
+    GCP scatter without dominating the extent. ``min_pad_m = 800 m``
+    still protects narrow-band GCP clusters (e.g. Bahrain coastline,
+    which can land in a <1 km strip) from over-tightening — the
+    ``max(min_pad_m, …)`` rule dominates for spans below ~16 km.
+    """
     if gcps is None or gcps.shape[0] == 0:
         return None
     xs = gcps[:, 2].astype(np.float64)
