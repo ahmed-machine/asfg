@@ -98,6 +98,65 @@ def _write_absolute_gcp_file(
     return n_written
 
 
+def _write_cam_gen_controls(gcps, local_crs, max_points=None):
+    """Build the ``--lon-lat-values`` + ``--pixel-values`` strings ASP
+    ``cam_gen`` needs for an N-point LSQ refinement.
+
+    Phase 4: used to seed each segment's BA camera from the per-segment
+    RoMa-vs-reference absolute GCPs (same control points the main BA
+    solve then refines further). This gives ``cam_gen`` 100-200 points
+    of pose/focal constraint instead of the 4 USGS corners the legacy
+    ``generate_camera()`` path uses — producing a far closer 7-DoF
+    approximation of the 14-parameter fit.
+
+    Parameters
+    ----------
+    gcps : numpy.ndarray
+        ``(N, 5)`` array with columns ``[col, row, X_local, Y_local,
+        Z_local]`` (same shape as one segment's ``seg_gcps_map`` entry).
+    local_crs : str
+        pyproj CRS string for the XY columns.
+    max_points : int, optional
+        Optional cap on the number of control points passed to
+        ``cam_gen`` for runtime reasons. A spatially-stratified subset
+        is taken when supplied. ``None`` passes all points.
+
+    Returns
+    -------
+    (lon_lat_str, pixel_str, n_points) : tuple[str, str, int]
+        Space-separated value strings ready for
+        ``--lon-lat-values`` / ``--pixel-values`` on the cam_gen CLI.
+        Returns ``("", "", 0)`` if the input has no usable rows.
+    """
+    from pyproj import Transformer
+
+    arr = np.asarray(gcps)
+    if arr.size == 0 or arr.ndim != 2 or arr.shape[-1] < 5:
+        return "", "", 0
+
+    if max_points is not None and arr.shape[0] > int(max_points):
+        # Spatially-stratified subsample: sort by col then take every
+        # k-th row. Preserves along-scan coverage, which is what
+        # constrains OpticalBar's per-column geometry.
+        order = np.argsort(arr[:, 0])
+        stride = max(1, arr.shape[0] // int(max_points))
+        arr = arr[order[::stride]][: int(max_points)]
+
+    tr = Transformer.from_crs(local_crs, "EPSG:4326", always_xy=True)
+    lon_lat_parts = []
+    pixel_parts = []
+    for row in arr:
+        col_px = float(row[0])
+        row_px = float(row[1])
+        x_local = float(row[2])
+        y_local = float(row[3])
+        lon, lat = tr.transform(x_local, y_local)
+        lon_lat_parts.append(f"{lon:.10f} {lat:.10f}")
+        pixel_parts.append(f"{col_px:.3f} {row_px:.3f}")
+
+    return " ".join(lon_lat_parts), " ".join(pixel_parts), len(pixel_parts)
+
+
 def _read_focal_length(tsai_path):
     """Parse the focal length from an ASP .tsai camera file.
 
@@ -158,9 +217,10 @@ def run_strip_bundle_adjustment(frames, camera_params, corners_list,
     initial_tsai_paths : list of str, optional
         Phase 4: pre-built OpticalBar .tsai seeds (one per frame) to
         use instead of running ``cam_gen`` fresh. Typically produced
-        from the per-segment 14-param fit via
-        ``preprocess.kh_panoramic.pano_params_to_opticalbar_tsai``.
-        When supplied, ``cam_gen`` is skipped entirely.
+        by running ``cam_gen`` over the per-segment RoMa GCPs — see
+        :func:`_write_cam_gen_controls` and the Phase 4 wire-up in
+        ``preprocess/camera_model.py::_run_phase4_joint_ba``. When
+        supplied, the fallback ``cam_gen`` call here is skipped.
     absolute_gcp_file : str, optional
         Phase 4: path to an ASP GCP file written by
         ``_write_absolute_gcp_file``. Gives BA absolute-lat/lon

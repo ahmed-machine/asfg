@@ -462,25 +462,49 @@ def generate_camera(image_path, camera_params, corners, dem_path=None,
 
 
 def _run_cam_gen_subprocess(cam_gen, sample_tsai, ll_str, image_path,
-                             output_tsai, dem_path):
+                             output_tsai, dem_path, pixel_str=None,
+                             timeout_s=None):
     """Invoke ASP cam_gen for an OpticalBar camera.
 
-    Shared between the legacy single-camera ``generate_camera`` path and
-    the new per-sub-frame ``cam_gen_opticalbar_per_subframe`` helper so
-    both follow the exact same ISISROOT / refine-camera / error-handling
-    semantics. Returns True on success (output_tsai present on disk),
-    False otherwise.
+    Shared between the legacy single-camera ``generate_camera`` path,
+    the per-sub-frame ``cam_gen_opticalbar_per_subframe`` helper, and
+    the Phase 4 joint-BA seed emitter (which passes ``pixel_str`` so
+    cam_gen runs an N-point LSQ instead of a 4-corner solve). All paths
+    share the same ISISROOT / refine-camera / error-handling semantics.
+
+    Parameters
+    ----------
+    cam_gen, sample_tsai, ll_str, image_path, output_tsai, dem_path
+        See :func:`generate_camera`.
+    pixel_str : str, optional
+        Space-separated ``"col0 row0 col1 row1 …"`` ASP passes via
+        ``--pixel-values``. When supplied, cam_gen treats
+        ``--lon-lat-values`` / ``--pixel-values`` as paired
+        correspondences for LSQ rather than 4 assumed corners.
+    timeout_s : float, optional
+        Subprocess timeout (seconds). Defaults to 120 s for the 4-corner
+        path; 300 s when ``pixel_str`` is supplied (Ceres LSQ over
+        N > 4 points is slower).
+
+    Returns True on success (``output_tsai`` on disk), False otherwise.
     """
     cmd = [
         cam_gen,
         "--sample-file", sample_tsai,
         "--camera-type", "opticalbar",
         "--lon-lat-values", ll_str,
+    ]
+    if pixel_str:
+        cmd.extend(["--pixel-values", pixel_str])
+    cmd.extend([
         image_path,
         "-o", output_tsai,
-    ]
+    ])
     if dem_path and os.path.isfile(dem_path):
         cmd.extend(["--reference-dem", dem_path, "--refine-camera"])
+
+    if timeout_s is None:
+        timeout_s = 300.0 if pixel_str else 120.0
 
     # See mapproject_image() for the rationale — set ISISROOT defensively so
     # subprocess inherits a workable environment regardless of the user's shell.
@@ -492,7 +516,9 @@ def _run_cam_gen_subprocess(cam_gen, sample_tsai, ll_str, image_path,
 
     print(f"  [camera_model] Running cam_gen for {os.path.basename(image_path)}")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s, env=env,
+        )
         if result.returncode != 0:
             print(f"  [camera_model] cam_gen failed: {result.stderr[:500]}")
             return False
@@ -3450,12 +3476,15 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
     ):
         """Phase 4: joint BA refinement via ASP ``bundle_adjust``.
 
-        1. Snapshot every active segment's 14p fit at scan-midpoint →
-           ASP OpticalBar seed ``.tsai``.
+        1. For each active segment, seed an ASP OpticalBar ``.tsai`` by
+           running ``cam_gen`` over the per-segment RoMa-vs-reference
+           GCPs (``--pixel-values`` + ``--lon-lat-values`` LSQ). This
+           hands the convention bridge to ASP itself — no manual 14p →
+           OpticalBar conversion needed.
         2. Concatenate per-segment ``seg_gcps_map`` into one absolute
-           GCP file (ASP format).
+           GCP file (ASP format) for BA.
         3. Call ``run_strip_bundle_adjustment`` with shared focal
-           length, intrinsics limits, reference-terrain DEM weight.
+           length and intrinsics limits.
         4. Re-mapproject each refined camera → candidate new orthos.
         5. Compare pre/post aggregate seam quality — keep winner.
 
@@ -3464,17 +3493,21 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         """
         from align.experimental.bundle_adjust import (
             _write_absolute_gcp_file,
+            _write_cam_gen_controls,
             run_strip_bundle_adjustment,
         )
-        from preprocess.kh_panoramic import pano_params_to_opticalbar_tsai
 
         phase4_dir = os.path.join(output_dir, "phase4_joint_ba")
         os.makedirs(phase4_dir, exist_ok=True)
 
-        # Gather inputs.
-        seed_tsai = []
-        ba_frames = []
-        gcp_entries = []
+        cam_gen = find_asp_tool("cam_gen")
+        if cam_gen is None:
+            scene_telem.phase4_skipped_reason = "cam_gen_not_found"
+            return False
+
+        # Phase 3d's shared f is already applied to every refitted
+        # segment's fit.params.f; use the most common value across active
+        # segments as the seed focal length for every cam_gen call.
         shared_f_pre = None
         for i in active_indices:
             fit = seg_fit_map.get(i)
@@ -3483,6 +3516,16 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                     "missing_fit_in_seg_fit_map"
                 )
                 return False
+            if shared_f_pre is None:
+                shared_f_pre = float(fit.params.f)
+        scene_telem.phase4_shared_f_m_before = shared_f_pre
+
+        # Gather inputs and emit per-segment seeds via cam_gen-over-GCPs.
+        seed_tsai = []
+        ba_frames = []
+        gcp_entries = []
+        for i in active_indices:
+            fit = seg_fit_map[i]
             gcps = seg_gcps_map.get(i)
             if gcps is None or gcps.shape[0] == 0:
                 scene_telem.phase4_skipped_reason = "missing_gcps"
@@ -3492,32 +3535,65 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             if sub_path is None or shape is None:
                 scene_telem.phase4_skipped_reason = "missing_sub_path_or_shape"
                 return False
-            sf_w_i, sf_h_i = shape
+            base_corners_i = seg_base_corners_map.get(i)
+            if base_corners_i is None:
+                scene_telem.phase4_skipped_reason = "missing_base_corners"
+                return False
+
+            # Sample tsai seeds the cam_gen iC from Phase 3d's altitude
+            # (fit.params.Zs0 is already the accepted altitude) and the
+            # shared focal length (override of the profile default).
+            seg_cam_params_f = dict(seg_camera_params)
+            seg_cam_params_f["focal_length"] = float(shared_f_pre)
+
+            sample_tsai = os.path.join(
+                phase4_dir, f"{scene_id}_seg{i:02d}_sample.tsai",
+            )
+            corners_lc = {
+                k.lower(): v for k, v in base_corners_i.items()
+            }
+            _write_sample_tsai(
+                sample_tsai,
+                int(shape[0]), int(shape[1]),
+                seg_cam_params_f,
+                corners=corners_lc,
+                altitude_m=float(fit.params.Zs0),
+            )
+
+            lon_lat_str, pixel_str, n_pts = _write_cam_gen_controls(
+                gcps, local_crs, max_points=200,
+            )
+            if n_pts < 10:
+                scene_telem.phase4_skipped_reason = (
+                    f"seed_cam_gen_too_few_controls:{n_pts}"
+                )
+                return False
+
             seed_path = os.path.join(
                 phase4_dir, f"{scene_id}_seg{i:02d}_seed.tsai",
             )
-            try:
-                pano_params_to_opticalbar_tsai(
-                    fit.params,
-                    pixel_pitch=float(seg_camera_params["pixel_pitch"]),
-                    image_width_px=int(sf_w_i),
-                    image_height_px=int(sf_h_i),
-                    local_crs=local_crs,
-                    camera_params=seg_camera_params,
-                    out_path=seed_path,
-                    at_time=0.5,
-                )
-            except Exception as _seed_exc:
+            ok = _run_cam_gen_subprocess(
+                cam_gen,
+                sample_tsai,
+                lon_lat_str,
+                sub_path,
+                seed_path,
+                dem_path,
+                pixel_str=pixel_str,
+            )
+            if not ok or not os.path.isfile(seed_path):
                 scene_telem.phase4_skipped_reason = (
-                    f"seed_write_failed:{_seed_exc}"
+                    f"seed_cam_gen_failed_seg{i:02d}"
                 )
                 return False
+            print(
+                f"  [per_segment/phase4] seg{i:02d} cam_gen seed from "
+                f"{n_pts} GCPs (shared f={shared_f_pre:.4f}m, "
+                f"Zs0={float(fit.params.Zs0):,.0f}m)"
+            )
             seed_tsai.append(seed_path)
             ba_frames.append(sub_path)
             gcp_entries.append((os.path.basename(sub_path), gcps))
-            if shared_f_pre is None:
-                shared_f_pre = float(fit.params.f)
-        scene_telem.phase4_shared_f_m_before = shared_f_pre
 
         gcp_file = os.path.join(phase4_dir, f"{scene_id}_absolute.gcp")
         try:
@@ -3623,27 +3699,24 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             for r in post_seams
         ]
 
-        # Aggregate seam quality: count accepted seams (ZNCC ≥ 0.4 OR
-        # sub-pixel + ZNCC ≥ 0.3 OR low_texture), break ties on mean
-        # ZNCC of "ok" seams.
+        # Aggregate seam quality: count seams that pass production QA
+        # (``_seam_report_passes`` — same gate the outer pipeline uses
+        # to decide stitched fallback) and break ties on mean ZNCC of
+        # "ok" seams. Using the production gate as-is is important:
+        # the Apr 18 verification showed BA can raise ZNCC while the
+        # phase shift blows out to > 1000 px — an "improvement" the
+        # outer pipeline would then reject as a failed QA. Don't ship
+        # those swaps.
         def _score(seams):
-            n_acc = 0
+            n_pass = 0
             znccs = []
             for r in seams:
-                status = r.get("status")
-                if status in ("low_texture", "no_overlap",
-                              "no_valid_overlap", "overlap_too_small"):
-                    n_acc += 1
-                    continue
-                if status != "ok":
-                    continue
-                z = float(r.get("zncc", -1.0))
-                shift = float(r.get("phase_shift_px", 1e9))
-                if z >= 0.4 or (shift < 2.0 and z >= 0.3):
-                    n_acc += 1
-                znccs.append(z)
+                if _seam_report_passes(r, seam_shift_px_max):
+                    n_pass += 1
+                if r.get("status") == "ok":
+                    znccs.append(float(r.get("zncc", -1.0)))
             mean_z = sum(znccs) / len(znccs) if znccs else float("-inf")
-            return (n_acc, mean_z)
+            return (n_pass, mean_z)
 
         pre_score = _score(pre_seams)
         post_score = _score(post_seams)

@@ -11,7 +11,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from align.experimental.bundle_adjust import _write_absolute_gcp_file
+from align.experimental.bundle_adjust import (
+    _write_absolute_gcp_file,
+    _write_cam_gen_controls,
+)
 
 
 def test_write_absolute_gcp_file_format(tmp_path):
@@ -281,3 +284,66 @@ def test_write_absolute_gcp_file_accepts_wider_arrays(tmp_path):
     # Each line has 12 fields regardless of the extra confidence column.
     for line in lines:
         assert len(line.split()) == 12
+
+
+def test_write_cam_gen_controls_pairs_and_lon_lat():
+    """Phase 4 seed emitter: the ``--lon-lat-values`` and
+    ``--pixel-values`` strings must have 2N tokens each (one lon lat
+    pair and one col row pair per GCP), and the lon/lat values must
+    match pyproj's local-CRS → WGS84 transform."""
+    from pyproj import Transformer
+
+    gcps = np.array([
+        [100.5, 200.0, 450_000.0, 2_900_000.0, 10.0],
+        [300.0, 400.0, 451_000.0, 2_901_000.0, 15.0],
+        [250.0, 350.0, 450_500.0, 2_900_500.0, 12.5],
+    ])
+    lon_lat_str, pixel_str, n = _write_cam_gen_controls(gcps, "EPSG:32639")
+    assert n == 3
+    ll_tokens = lon_lat_str.split()
+    px_tokens = pixel_str.split()
+    assert len(ll_tokens) == 6
+    assert len(px_tokens) == 6
+
+    tr = Transformer.from_crs("EPSG:32639", "EPSG:4326", always_xy=True)
+    lon0, lat0 = tr.transform(450_000.0, 2_900_000.0)
+    assert float(ll_tokens[0]) == pytest.approx(lon0, abs=1e-8)
+    assert float(ll_tokens[1]) == pytest.approx(lat0, abs=1e-8)
+    # Pixel string preserves insertion order (col row col row …).
+    assert float(px_tokens[0]) == pytest.approx(100.5, abs=1e-3)
+    assert float(px_tokens[1]) == pytest.approx(200.0, abs=1e-3)
+
+
+def test_write_cam_gen_controls_max_points_subsamples():
+    """When ``max_points`` is smaller than the input, the controls
+    string subsamples deterministically and preserves along-scan
+    coverage (sorted by col before striding). This matters for cam_gen
+    LSQ stability when GCP count reaches the several-hundreds."""
+    cols = np.linspace(0, 999, 100)
+    rows = np.full(100, 500.0)
+    xs = np.linspace(450_000.0, 470_000.0, 100)
+    ys = np.full(100, 2_900_000.0)
+    zs = np.full(100, 10.0)
+    gcps = np.column_stack([cols, rows, xs, ys, zs])
+    _, pixel_str, n = _write_cam_gen_controls(
+        gcps, "EPSG:32639", max_points=10,
+    )
+    assert n <= 10
+    # First and last pixel-col tokens should span most of the 0..999 range
+    # (stratified sampling preserves extent).
+    tokens = pixel_str.split()
+    first_col = float(tokens[0])
+    last_col = float(tokens[-2])
+    assert first_col < 100
+    assert last_col > 900
+
+
+def test_write_cam_gen_controls_empty_input():
+    """Empty or malformed GCP arrays return empty strings and count 0,
+    mirroring ``_write_absolute_gcp_file``'s no-raise contract."""
+    ll, px, n = _write_cam_gen_controls(
+        np.zeros((0, 5)), "EPSG:32639",
+    )
+    assert ll == ""
+    assert px == ""
+    assert n == 0
