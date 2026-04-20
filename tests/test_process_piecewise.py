@@ -2515,3 +2515,63 @@ def test_snap_bbox_to_grid_noop_on_none():
     assert _snap_bbox_to_grid(None, 4.7) is None
     # Zero resolution → passthrough so we never divide by zero.
     assert _snap_bbox_to_grid((0, 0, 1, 1), 0.0) == (0, 0, 1, 1)
+
+
+@pytest.mark.fast
+def test_measure_segment_seams_returns_phase_shift_px_key(tmp_path):
+    """``_measure_segment_seams`` must expose the seam shift under the
+    dict key ``phase_shift_px`` — the acceptance gates in
+    ``_iterative_guided_refit`` (preprocess/camera_model.py:3969, 4102)
+    and ``opticalbar_per_segment_precorrect`` (:5545, :5570) rely on
+    this contract. A latent bug previously read the wrong key
+    (``phase_corr.shift_px``) and silently defaulted every shift to
+    ``inf``, disabling the seam-worsen rejection gates across the
+    pipeline and letting Phase 3 TPS warp apply unconditionally —
+    observed as an 800 px vertical stair-step in the Bahrain KH-9 PC
+    per-segment mosaic."""
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+    from preprocess.camera_model import _measure_segment_seams
+
+    # Two tiny synthetic EPSG:3857 rasters with a horizontal overlap
+    # and a distinguishable content pattern so cv2.phaseCorrelate sees
+    # a non-trivial match.
+    def _write(path, origin_x: float, origin_y: float,
+               shape=(64, 64), seed: int = 0):
+        rng = np.random.default_rng(seed)
+        arr = (rng.uniform(50, 250, size=shape).astype(np.uint8))
+        tfm = from_origin(origin_x, origin_y, 10.0, 10.0)
+        with rasterio.open(
+            str(path), "w", driver="GTiff",
+            width=shape[1], height=shape[0], count=1, dtype="uint8",
+            crs="EPSG:3857", transform=tfm, nodata=0,
+        ) as ds:
+            ds.write(arr, 1)
+
+    a = tmp_path / "a.tif"
+    b = tmp_path / "b.tif"
+    # Adjacent rasters with a 320 m (32 px) horizontal overlap.
+    _write(a, 0.0, 640.0, seed=1)
+    _write(b, 320.0, 640.0, seed=2)
+
+    reports = _measure_segment_seams([str(a), str(b)])
+    assert len(reports) == 1
+    r = reports[0]
+    # Either "ok" with a numeric shift or a status explaining why not,
+    # but the key itself must be phase_shift_px on every report.
+    assert "phase_shift_px" in r, (
+        f"seam report missing 'phase_shift_px' key; got keys={sorted(r.keys())!r}"
+    )
+    # Sanity: when status is ok, the value is a finite number.
+    if r.get("status") == "ok":
+        assert np.isfinite(r["phase_shift_px"]), (
+            f"status=ok but phase_shift_px={r['phase_shift_px']!r}"
+        )
+    # Explicitly assert the legacy key path (which broke three
+    # downstream acceptance gates) is NOT present — if it ever comes
+    # back, future edits to _measure_segment_seams will be caught here.
+    assert "phase_corr" not in r, (
+        "seam report has legacy 'phase_corr' key; downstream consumers "
+        "expect flat 'phase_shift_px' — don't add back a nested dict."
+    )

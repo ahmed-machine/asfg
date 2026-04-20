@@ -3966,8 +3966,7 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                         )
                         if baseline_seam and baseline_seam.get("status") == "ok":
                             best_seam_px = float(
-                                baseline_seam.get("phase_corr", {})
-                                              .get("shift_px", float("inf"))
+                                baseline_seam.get("phase_shift_px", float("inf"))
                             )
                             print(
                                 f"  [per_segment/14p] seg{seg_idx:02d} "
@@ -4099,8 +4098,7 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                             )
                             if candidate_seam and candidate_seam.get("status") == "ok":
                                 candidate_shift = float(
-                                    candidate_seam.get("phase_corr", {})
-                                                   .get("shift_px", float("inf"))
+                                    candidate_seam.get("phase_shift_px", float("inf"))
                                 )
                                 if candidate_shift > best_seam_px + seam_worsen_px:
                                     print(
@@ -5541,9 +5539,7 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             # per-pair shift before flipping ``valid_orthos`` over.
             pre_warp_reports = _measure_segment_seams(valid_orthos)
             pre_shift_by_idx = {
-                r.get("index"): float(
-                    r.get("phase_corr", {}).get("shift_px", float("inf"))
-                )
+                r.get("index"): float(r.get("phase_shift_px", float("inf")))
                 for r in (pre_warp_reports or [])
                 if r.get("status") == "ok"
             }
@@ -5566,9 +5562,7 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                         continue
                     idx = r.get("index")
                     pre_shift = pre_shift_by_idx.get(idx)
-                    post_shift = float(
-                        r.get("phase_corr", {}).get("shift_px", float("inf"))
-                    )
+                    post_shift = float(r.get("phase_shift_px", float("inf")))
                     if pre_shift is None or not np.isfinite(pre_shift):
                         continue
                     # Allow small numerical noise but reject anything
