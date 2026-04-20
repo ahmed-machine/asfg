@@ -2242,14 +2242,28 @@ def _build_quadrilateral_mask(ortho_path: str, applied_corners: dict,
 
 
 def _blend_segment_mosaic(seg_orthos: list, output_path: str,
-                          applied_corners_list: list | None = None) -> bool:
+                          applied_corners_list: list | None = None,
+                          blend_mode: str = "argmax",
+                          feather_px: int = 200) -> bool:
     """Blend overlapping per-segment orthos into one seamless GeoTIFF.
 
-    Uses distance-to-edge weighted averaging: each pixel's contribution is
-    weighted by its Euclidean distance from the nearest nodata border.
-    Pixels near the centre of a segment dominate; pixels near the edge
-    fade out smoothly.  In overlap zones this produces a perfectly smooth
-    transition regardless of overlap shape (handles diagonal seams).
+    ``blend_mode`` controls how overlaps are composited:
+
+    - ``"argmax"`` (default; legacy): each canvas pixel is owned by the
+      segment whose distance-to-nearest-edge is largest. Produces a
+      clean Voronoi-like split along the midline of the overlap and
+      guarantees no "doubled content" ghost when adjacent segments
+      project the same ground feature to slightly different positions
+      — but the hard boundary is visible as a stair-step when the two
+      segments' 14p fits disagree sub-pixel in the overlap region.
+    - ``"feather"``: weighted average with per-segment weight clipped
+      into ``[0, 1]`` by ``feather_px``. Near a segment's edge (dist
+      ≤ ``feather_px``) the weight ramps linearly from 0 → 1; deeper
+      inside it is 1. Overlapping segments contribute proportionally,
+      smoothing the transition but at the cost of reintroducing ghost
+      doubling when fits disagree. Safe when the 14p fits are well-
+      anchored in the overlap region (e.g. after §4.4 model-guided
+      re-matching populates GCPs across the sub-frame).
 
     Processed in horizontal chunks to keep memory under ~2 GB.
     """
@@ -2397,21 +2411,22 @@ def _blend_segment_mosaic(seg_orthos: list, output_path: str,
         "bigtiff": "if_safer",
     }
 
-    # Argmax-over-weight tessellation: each canvas pixel is owned by the
-    # segment with the highest distance-to-edge weight at that pixel.  In
-    # an overlap zone, this means the segment whose interior is deeper
-    # wins at each pixel, producing a clean Voronoi-like split along the
-    # midline of the overlap.  We intentionally do NOT blend values from
-    # multiple segments: cam_gen produces inconsistent pixel-to-ground
-    # mappings for adjacent sub-frames in their overlapping fringes
-    # (the two cameras are fit independently and disagree in the
-    # interior of the overlap), so averaging shows the same ground
-    # feature at two canvas positions → visible "doubled content" ghost.
+    # Compositing: argmax-Voronoi (default) or feathered weighted average.
+    # See the docstring for the trade-off. feather_px sets the ramp width
+    # for the feather mode (ignored in argmax mode).
+    print(f"  [blend] Mode: {blend_mode}  (feather_px={feather_px})")
     with rasterio.open(output_path, "w", **profile) as dst:
         for y0 in range(0, out_h, CHUNK):
             h_chunk = min(CHUNK, out_h - y0)
-            best_w = np.full((h_chunk, out_w), -1.0, dtype=np.float32)
-            result = np.full((h_chunk, out_w), nodata, dtype=np.float32)
+            if blend_mode == "feather":
+                # Weighted average: accumulate weight × data and weight,
+                # finalize as numerator / denom. Weights are clipped by
+                # feather_px so near-edge pixels contribute less.
+                num = np.zeros((h_chunk, out_w), dtype=np.float32)
+                den = np.zeros((h_chunk, out_w), dtype=np.float32)
+            else:
+                best_w = np.full((h_chunk, out_w), -1.0, dtype=np.float32)
+                result = np.full((h_chunk, out_w), nodata, dtype=np.float32)
 
             for si in seg_info:
                 seg_top = si["row_off"]
@@ -2430,11 +2445,27 @@ def _blend_segment_mosaic(seg_orthos: list, output_path: str,
                 d = si["data"][seg_r0:seg_r1, :]
                 w_seg = si["weight"][seg_r0:seg_r1, :]
 
-                rv = result[chunk_r0:chunk_r1, c0:c1]
-                bv = best_w[chunk_r0:chunk_r1, c0:c1]
-                take = (w_seg > bv) & (w_seg > 0)
-                rv[take] = d[take]
-                bv[take] = w_seg[take]
+                if blend_mode == "feather":
+                    # Feather ramp: 0 at boundary, 1 at feather_px+ inside.
+                    fw = np.clip(
+                        w_seg / max(1.0, float(feather_px)), 0.0, 1.0,
+                    ).astype(np.float32)
+                    contribute = w_seg > 0
+                    rv_num = num[chunk_r0:chunk_r1, c0:c1]
+                    rv_den = den[chunk_r0:chunk_r1, c0:c1]
+                    rv_num[contribute] = rv_num[contribute] + fw[contribute] * d[contribute]
+                    rv_den[contribute] = rv_den[contribute] + fw[contribute]
+                else:
+                    rv = result[chunk_r0:chunk_r1, c0:c1]
+                    bv = best_w[chunk_r0:chunk_r1, c0:c1]
+                    take = (w_seg > bv) & (w_seg > 0)
+                    rv[take] = d[take]
+                    bv[take] = w_seg[take]
+
+            if blend_mode == "feather":
+                result = np.full((h_chunk, out_w), nodata, dtype=np.float32)
+                den_ok = den > 1e-6
+                result[den_ok] = num[den_ok] / den[den_ok]
 
             window = rasterio.windows.Window(0, y0, out_w, h_chunk)
             dst.write(result, 1, window=window)
@@ -5596,7 +5627,20 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
         if any(os.path.getmtime(p) > tif_mtime + 1e-6 for p in valid_orthos):
             os.remove(tif_path)
     if not os.path.isfile(tif_path):
-        ok = _blend_segment_mosaic(valid_orthos, tif_path, applied_corners_list)
+        blend_mode = str(
+            seg_camera_params.get("panoramic_blend_mode", "argmax") or "argmax"
+        ).strip().lower()
+        if blend_mode not in ("argmax", "feather"):
+            print(f"  [per_segment] warning: unknown panoramic_blend_mode "
+                  f"{blend_mode!r}; falling back to argmax")
+            blend_mode = "argmax"
+        feather_px = int(
+            seg_camera_params.get("panoramic_blend_feather_px", 200)
+        )
+        ok = _blend_segment_mosaic(
+            valid_orthos, tif_path, applied_corners_list,
+            blend_mode=blend_mode, feather_px=feather_px,
+        )
         if not ok:
             print(f"  [per_segment] Blending failed")
             scene_telem.stitched_fallback_triggered = True

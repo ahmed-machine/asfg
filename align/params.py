@@ -231,6 +231,19 @@ class CameraParams:
     # Per-segment f values within this relative threshold skip the
     # refit entirely (no heterogeneity problem to fix).
     shared_f_refit_min_spread_frac: float = 0.02
+    # Per-segment mosaic compositing mode. See ``_blend_segment_mosaic``
+    # in ``preprocess/camera_model.py``.
+    #   'argmax'  — Voronoi-like split at each pixel by distance to
+    #               edge. Hard boundary, no doubled-content ghosting,
+    #               but visible stair-step when adjacent 14p fits
+    #               disagree sub-pixel in the overlap.
+    #   'feather' — weighted average with a
+    #               ``panoramic_blend_feather_px`` ramp. Smoother
+    #               transitions, reintroduces doubling ghost when fits
+    #               disagree. Safe with §4.4 model-guided re-matching
+    #               populating GCPs across each sub-frame.
+    panoramic_blend_mode: str = "argmax"
+    panoramic_blend_feather_px: int = 200
     # Phase 4 — joint bundle-adjustment refinement via ASP ``bundle_adjust``.
     # Runs AFTER Phase 3d as an optional cross-segment joint solve
     # seeded with Phase 3d's pose + shared f. Uses RoMa-vs-reference
@@ -310,6 +323,8 @@ class CameraParams:
             "f_prior_frac_sigma": self.f_prior_frac_sigma,
             "shared_f_refit_enabled": self.shared_f_refit_enabled,
             "shared_f_refit_min_spread_frac": self.shared_f_refit_min_spread_frac,
+            "panoramic_blend_mode": self.panoramic_blend_mode,
+            "panoramic_blend_feather_px": self.panoramic_blend_feather_px,
             "joint_ba_refinement": self.joint_ba_refinement,
             "joint_ba_f_frac_limit": self.joint_ba_f_frac_limit,
             "panoramic_seam_warp": self.panoramic_seam_warp,

@@ -114,6 +114,17 @@ camera:
   # preprocess/camera_model.py:3823 rejects any iteration that
   # regresses RMS or seam shift, so enabling it is safe on hard scenes.
   guided_refit_max_iter: 2
+  # Per-segment blend: feathered weighted-average so adjacent sub-frame
+  # transitions smooth over ~1 km instead of a hard argmax-Voronoi
+  # boundary. With §4.4 model-guided re-matching populating GCPs across
+  # each sub-frame, the per-segment 14p fits agree closely enough in the
+  # overlap that the legacy "doubled content ghost" risk from averaging
+  # is acceptable. Observed visual stair-step on Bahrain D3C1213 goes
+  # away with feather_px=200 (~1 km at 4.8 m/px reference resolution).
+  # ``argmax`` remains the safe fallback for profiles where the 14p fits
+  # are not yet reliable across the sub-frame.
+  panoramic_blend_mode: feather
+  panoramic_blend_feather_px: 200
 
 coarse:
   coarse_res: 10.0
