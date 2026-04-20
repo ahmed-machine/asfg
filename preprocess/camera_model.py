@@ -4636,6 +4636,12 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 if _corners_match(cached_base, base_corners[i]):
                     print(f"  [per_segment/14p] seg{i:02d} cached ({mode_tag})")
                     seg_orthos_map[i] = seg_ortho_path
+                    # Populate seg_base_corners_map on cache-hit too so the
+                    # quadrilateral-mask blend (applied_corners_list) and
+                    # Phase 3d sidecar refresh can find per-seg corners
+                    # without a fresh 14p fit. Without this the cache-hit
+                    # path skips the mask and the mosaic stair-steps.
+                    seg_base_corners_map[i] = base_corners[i]
                     continue
             elif os.path.isfile(seg_ortho_path) and cached_zs0_m is not None \
                     and not altitude_cache_ok:
@@ -5610,11 +5616,28 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
     except Exception as e:
         print(f"  [per_segment] VRT sidecar skipped: {e}")
 
-    # Composite the orthorectified segments. For the 14p path we trust the
-    # mapprojected valid-data mask more than the interpolated USGS corners:
-    # the latter can be kilometres off and are only used to seed matching,
-    # not to define the final footprint.
-    applied_corners_list = None
+    # Composite the orthorectified segments. Crop each segment to its
+    # interpolated quadrilateral (USGS strip corners linearly split by
+    # ``interpolate_segment_corners``) so the union across segments is
+    # a single slanted parallelogram matching the physical scan footprint.
+    # Without this, each sub-frame renders a slanted parallelogram of
+    # valid content inside a rectangular bbox with nodata above/below;
+    # when composited on a shared canvas the rectangles are axis-aligned
+    # but the parallelograms are stacked diagonally → the mosaic looks
+    # like a staircase instead of a smooth slanted band.
+    #
+    # With §4.4 model-guided re-matching and the altitude tiebreak in
+    # play, the 14p fits produce orthos whose valid content is close
+    # enough to the USGS-interpolated quadrilaterals that masking to
+    # the quadrilateral drops only the cam_gen-extrapolation fringe
+    # (which was junk anyway). Segments in ``active_indices`` order;
+    # ``None`` entries skip the mask.
+    applied_corners_list = [
+        seg_base_corners_map.get(i) for i in active_indices
+        if seg_orthos_map.get(i) is not None
+    ]
+    if not any(applied_corners_list):
+        applied_corners_list = None
     tif_path = os.path.join(output_dir, f"{scene_id}_per_segment.tif")
     if os.path.isfile(tif_path):
         tif_mtime = os.path.getmtime(tif_path)

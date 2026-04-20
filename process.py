@@ -380,6 +380,34 @@ def _maybe_generate_asp_ortho(scene, cache_dir: str, stitched_path: str,
                 acq_date=_parse_acquisition_date(scene.acquisition_date),
             )
             if vrt_path:
+                # Coarse-align the per-segment mosaic against the reference
+                # so the whole mosaic lands at the correct absolute position.
+                # The segments are geometrically correct relative to each
+                # other (scan slant preserved) — this shifts the composite
+                # as one rigid block. Uses the same helper the stitched path
+                # runs (see below); if the land-mask correlation is too low
+                # or the shift is outlandish it returns the ortho unshifted.
+                if reference and os.path.exists(reference):
+                    coarse_tmp = os.path.splitext(vrt_path)[0] + "_coarse.tif"
+                    try:
+                        coarse_result = coarse_align_and_crop(
+                            vrt_path,
+                            reference,
+                            coarse_tmp,
+                            target_bbox_wgs=bbox,
+                        )
+                    except Exception as exc:
+                        print(f"  [coarse_crop] per-segment coarse-align "
+                              f"failed: {exc}")
+                        coarse_result = None
+                    if coarse_result and os.path.exists(coarse_result):
+                        try:
+                            os.replace(coarse_result, vrt_path)
+                            print(f"  [coarse_crop] per-segment mosaic "
+                                  f"coarse-aligned in place: {vrt_path}")
+                        except OSError as exc:
+                            print(f"  [coarse_crop] replace failed ({exc}); "
+                                  f"keeping unaligned {vrt_path}")
                 return vrt_path
             if skip_stitched_fallback:
                 print("  [per_segment_ortho] failed; stitched fallback suppressed "
