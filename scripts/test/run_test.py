@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Test runner for the Bahrain alignment pipeline.
+Test runner for the declass alignment pipeline — scene-parameterised.
 
 Runs the pipeline, captures stdout/stderr, parses logs into a structured
-summary.json for automated analysis.
+summary.json for automated analysis. The scene (entity id + reference +
+catalog) comes from a scripts/test/e2e_configs/<scene>.yaml so the same
+runner drives both the KH-9 PC Bahrain test and the KH-4B Bahrain test.
 
 Usage:
-    python3 scripts/test/run_test.py [--version N] [--timeout 2400]
+    python3 scripts/test/run_test.py [--scene NAME] [--version N] [--timeout 2400]
 """
 
 import argparse
@@ -26,40 +28,84 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.paths_config import get_target, get_reference
 
-REFERENCE = get_reference("kh9_dzb1212")
 ANCHORS = str(PROJECT_ROOT / "data" / "bahrain_anchor_gcps.json")
 
 # Shared preprocessing cache (downloads/extracted/stitched/georef/ortho).
 # Re-used across run_test.py and run_e2e_test.py so frames don't re-download.
 CACHE_DIR = PROJECT_ROOT / "output"
-E2E_CONFIG = PROJECT_ROOT / "scripts" / "test" / "e2e_configs" / "bahrain_kh9_pc_1977.yaml"
-ENTITY_ID = "D3C1213-200346A003"  # Bahrain KH-9 PC Aft scene
+E2E_CONFIG_DIR = PROJECT_ROOT / "scripts" / "test" / "e2e_configs"
+DEFAULT_SCENE = "bahrain_kh9_pc_1977"
 
 
-def ensure_target_built(preprocess_matcher: str = "roma") -> str:
-    """Materialize the per-segment orthorectified target for the Bahrain KH-9
-    PC scene and return its path. Runs process.py --skip-align --skip-mosaic
-    against the shared output/ cache, so downloads/extracted/georef stages
-    short-circuit on mtime checks. Set DECLASS_USE_PRESTITCHED=1 to fall back
-    to the legacy pre-stitched Dropbox TIFF for A/B comparison.
+def _load_scene_config(scene_name: str) -> dict:
+    """Resolve scripts/test/e2e_configs/<scene_name>.yaml to a dict with
+    resolved absolute paths.
+
+    Returns keys: ``name``, ``entity_id``, ``reference_path``,
+    ``boundary_path``, ``catalogs`` (list of absolute paths), and the
+    optional ``prefer_camera``. ``reference_name`` in the YAML is looked
+    up via :func:`scripts.paths_config.get_reference`.
     """
+    import yaml
+
+    cfg_path = E2E_CONFIG_DIR / f"{scene_name}.yaml"
+    if not cfg_path.exists():
+        raise FileNotFoundError(
+            f"Scene config not found: {cfg_path}. "
+            f"Available: {[p.stem for p in E2E_CONFIG_DIR.glob('*.yaml')]}"
+        )
+    with open(cfg_path) as fh:
+        cfg = yaml.safe_load(fh) or {}
+
+    entity_id = cfg.get("entity_id")
+    if not entity_id:
+        raise ValueError(
+            f"{cfg_path}: missing required field 'entity_id'"
+        )
+    reference_name = cfg.get("reference_name") or cfg.get("reference")
+    if not reference_name:
+        raise ValueError(
+            f"{cfg_path}: missing required field 'reference_name'"
+        )
+    boundary_rel = cfg.get("boundary")
+    if not boundary_rel:
+        raise ValueError(f"{cfg_path}: missing required field 'boundary'")
+    catalogs_rel = cfg.get("catalogs") or []
+    if not catalogs_rel:
+        raise ValueError(f"{cfg_path}: missing required field 'catalogs'")
+
+    return {
+        "name": cfg.get("name", scene_name),
+        "entity_id": str(entity_id),
+        "reference_path": get_reference(reference_name),
+        "boundary_path": str(PROJECT_ROOT / boundary_rel),
+        "catalogs": [str(PROJECT_ROOT / c) for c in catalogs_rel],
+        "prefer_camera": cfg.get("prefer_camera"),
+    }
+
+
+def ensure_target_built(scene_cfg: dict, preprocess_matcher: str = "roma") -> str:
+    """Materialize the per-segment orthorectified target for ``scene_cfg`` and
+    return its path. Runs ``process.py --skip-align --skip-mosaic`` against the
+    shared output/ cache, so downloads/extracted/georef stages short-circuit on
+    mtime checks. Set DECLASS_USE_PRESTITCHED=1 to fall back to the legacy
+    pre-stitched Dropbox TIFF for A/B comparison (only valid for the KH-9 PC
+    Bahrain scene — the legacy target was hardcoded to that entity).
+    """
+    entity_id = scene_cfg["entity_id"]
+    ref_path = scene_cfg["reference_path"]
+    boundary_path = scene_cfg["boundary_path"]
+    catalogs = scene_cfg["catalogs"]
+
     if os.environ.get("DECLASS_USE_PRESTITCHED"):
         legacy = get_target("bahrain_1977")
         print(f"  [ensure_target_built] DECLASS_USE_PRESTITCHED set — using {legacy}")
         return legacy
 
-    import yaml
-
-    with open(E2E_CONFIG) as f:
-        cfg = yaml.safe_load(f)
-    ref_path = get_reference(cfg["reference"])
-    boundary_path = str(PROJECT_ROOT / cfg["boundary"])
-    catalogs = [str(PROJECT_ROOT / c) for c in cfg["catalogs"]]
-
     # Candidate output paths (see paths.py :: ortho_path, ortho_segments_dir
     # and preprocess/camera_model.py for the per-segment output).
-    ortho_tif = CACHE_DIR / "ortho" / f"{ENTITY_ID}_ortho.tif"
-    ortho_seg_dir = CACHE_DIR / "ortho" / f"{ENTITY_ID}_segments"
+    ortho_tif = CACHE_DIR / "ortho" / f"{entity_id}_ortho.tif"
+    ortho_seg_dir = CACHE_DIR / "ortho" / f"{entity_id}_segments"
     selected_matcher = str(preprocess_matcher).strip().lower() or "roma"
     # Prefer materialized TIF over VRT (VRT chains cause GDAL version issues).
     existing_tifs = sorted(ortho_seg_dir.glob("*_per_segment.tif")) if ortho_seg_dir.exists() else []
@@ -74,7 +120,7 @@ def ensure_target_built(preprocess_matcher: str = "roma") -> str:
             return str(ortho_tif)
         return None
 
-    metadata_path = CACHE_DIR / "georef" / f"{ENTITY_ID}_metadata.json"
+    metadata_path = CACHE_DIR / "georef" / f"{entity_id}_metadata.json"
     metadata = None
     if metadata_path.exists():
         try:
@@ -88,7 +134,8 @@ def ensure_target_built(preprocess_matcher: str = "roma") -> str:
     per_seg = existing_tifs or existing_vrts
     if per_seg and cached_matcher == selected_matcher:
         print(f"  [ensure_target_built] Using cached per-segment mosaic: {per_seg[-1]}")
-        cropped = _crop_ortho_to_reference(str(per_seg[-1]), ref_path, ortho_seg_dir)
+        cropped = _crop_ortho_to_reference(str(per_seg[-1]), ref_path, ortho_seg_dir,
+                                           entity_id=entity_id)
         print(f"  [ensure_target_built] Cropped target: {cropped}")
         return cropped
     if per_seg and cached_matcher != selected_matcher:
@@ -123,15 +170,15 @@ def ensure_target_built(preprocess_matcher: str = "roma") -> str:
         "--csv", *catalogs,
         "--reference", ref_path,
         "--boundary", boundary_path,
-        "--entities", ENTITY_ID,
+        "--entities", entity_id,
         "--cache-dir", str(CACHE_DIR),
         "--output-dir", str(CACHE_DIR / "preprocess_run"),
         "--skip-align",
         "--skip-mosaic",
         "--preprocess-matcher", preprocess_matcher,
     ]
-    if cfg.get("prefer_camera"):
-        cmd.extend(["--prefer-camera", cfg["prefer_camera"]])
+    if scene_cfg.get("prefer_camera"):
+        cmd.extend(["--prefer-camera", scene_cfg["prefer_camera"]])
 
     print("=== run_test.py: Preprocessing target via process.py ===")
     print(f"  cmd: {' '.join(cmd[:6])}...")
@@ -150,13 +197,14 @@ def ensure_target_built(preprocess_matcher: str = "roma") -> str:
     # reference only covers ~60 km (Bahrain). Crop to the reference's
     # footprint plus ~5 km margin so coarse offset detection and feature
     # matching don't waste effort on regions with no reference coverage.
-    cropped = _crop_ortho_to_reference(resolved, ref_path, ortho_seg_dir)
+    cropped = _crop_ortho_to_reference(resolved, ref_path, ortho_seg_dir,
+                                       entity_id=entity_id)
     print(f"  [ensure_target_built] Cropped target: {cropped}")
     return cropped
 
 
 def _crop_ortho_to_reference(ortho_path: str, reference_path: str,
-                             output_dir) -> str:
+                             output_dir, *, entity_id: str) -> str:
     """Crop a full-strip ortho to its overlap with the reference, plus margin.
 
     KH-9 panoramic strips are ~200 km long and cross the reference image
@@ -178,7 +226,7 @@ def _crop_ortho_to_reference(ortho_path: str, reference_path: str,
     MARGIN_M = 5000.0
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cropped_tif = out_dir / f"{ENTITY_ID}_cropped.tif"
+    cropped_tif = out_dir / f"{entity_id}_cropped.tif"
 
     # Determine target CRS from the ortho.
     with rasterio.open(ortho_path) as ortho_src:
@@ -280,9 +328,22 @@ def _crop_ortho_to_reference(ortho_path: str, reference_path: str,
     return str(cropped_tif)
 
 
-def detect_next_version():
-    """Scan diagnostics/run_v*/ and return the next version number."""
-    diag_dir = PROJECT_ROOT / "diagnostics"
+def _diagnostics_root_for_scene(scene_name: str) -> Path:
+    """Return the per-scene diagnostics directory.
+
+    For the default KH-9 PC Bahrain scene, we keep the historical
+    ``diagnostics/run_v*/`` layout (to preserve comparison with the many
+    pre-parameterisation runs sitting in that folder). Any other scene
+    gets its own subdirectory.
+    """
+    if scene_name == DEFAULT_SCENE:
+        return PROJECT_ROOT / "diagnostics"
+    return PROJECT_ROOT / "diagnostics" / scene_name
+
+
+def detect_next_version(scene_name: str = DEFAULT_SCENE):
+    """Scan diagnostics/{scene}/run_v*/ and return the next version number."""
+    diag_dir = _diagnostics_root_for_scene(scene_name)
     existing = glob(str(diag_dir / "run_v*"))
     versions = []
     for d in existing:
@@ -789,9 +850,9 @@ def build_summary(version, run_dir, log_text, exit_code, wall_clock_s, qa_path):
     return summary
 
 
-def run_pipeline(version, timeout):
+def run_pipeline(version, timeout, scene_cfg: dict):
     """Run the alignment pipeline and capture everything."""
-    run_dir = PROJECT_ROOT / "diagnostics" / f"run_v{version}"
+    run_dir = _diagnostics_root_for_scene(scene_cfg["name"]) / f"run_v{version}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     qa_path = run_dir / "qa.json"
@@ -805,7 +866,8 @@ def run_pipeline(version, timeout):
 
     # Build (or reuse cached) per-segment ortho target before running the
     # alignment. Falls back to legacy pre-stitched TIFF if DECLASS_USE_PRESTITCHED=1.
-    target_path = ensure_target_built()
+    target_path = ensure_target_built(scene_cfg)
+    reference_path = scene_cfg["reference_path"]
 
     # Pre-flight: confirm target + reference actually decode to non-NoData
     # pixels. This catches the ASP image_mosaic "silent unfinalized TIFF"
@@ -816,14 +878,14 @@ def run_pipeline(version, timeout):
         print(f"\nERROR: target {target_path} is not readable. Delete it "
               f"(and any cached siblings) and re-run.", file=sys.stderr)
         sys.exit(2)
-    if not verify_tiff_decodes_nonempty(REFERENCE, label="run_test REFERENCE"):
-        print(f"\nERROR: reference {REFERENCE} is not readable.", file=sys.stderr)
+    if not verify_tiff_decodes_nonempty(reference_path, label="run_test REFERENCE"):
+        print(f"\nERROR: reference {reference_path} is not readable.", file=sys.stderr)
         sys.exit(2)
 
     cmd = [
         sys.executable, str(PROJECT_ROOT / "auto-align.py"),
         target_path,
-        "-r", REFERENCE,
+        "-r", reference_path,
         "--anchors", ANCHORS,
         "-y", "--best",
         "--diagnostics-dir", str(run_dir) + "/",
@@ -936,14 +998,14 @@ def run_pipeline(version, timeout):
     return summary
 
 
-def cleanup_old_runs(keep_version):
+def cleanup_old_runs(keep_version, scene_name: str = DEFAULT_SCENE):
     """Remove large files from old runs, keeping only the most recent and the best-scoring.
 
     Preserves summary.json, qa.json, run.log, code_state.txt, and stderr.log
     in all runs (lightweight). Removes output.tif and other large files from
     runs that are neither the most recent nor the best-scoring.
     """
-    diag_dir = PROJECT_ROOT / "diagnostics"
+    diag_dir = _diagnostics_root_for_scene(scene_name)
     run_dirs = {}
     for d in sorted(diag_dir.glob("run_v*")):
         if d.is_dir():
@@ -1008,8 +1070,35 @@ def cleanup_old_runs(keep_version):
                   f"Most recent: v{most_recent}")
 
 
+def _available_scenes() -> list[str]:
+    """Return scene names whose YAML has the fields run_test.py needs.
+
+    The e2e_configs directory also hosts older configs used by
+    ``run_e2e_test.py`` that predate the scene-parameterised runner and
+    omit ``entity_id`` / ``reference_name``. Filter those out so the
+    argparse ``choices`` list only shows configs this runner can load.
+    """
+    import yaml
+
+    scenes = []
+    for p in sorted(E2E_CONFIG_DIR.glob("*.yaml")):
+        try:
+            with open(p) as fh:
+                cfg = yaml.safe_load(fh) or {}
+        except Exception:
+            continue
+        if cfg.get("entity_id") and (cfg.get("reference_name") or cfg.get("reference")):
+            scenes.append(p.stem)
+    return scenes
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Run Bahrain alignment test")
+    parser = argparse.ArgumentParser(description="Run declass alignment test (scene-parameterised)")
+    parser.add_argument("--scene", default=DEFAULT_SCENE,
+                        choices=_available_scenes(),
+                        help=(f"Which scene config to run (reads "
+                              f"scripts/test/e2e_configs/<scene>.yaml). "
+                              f"Default: {DEFAULT_SCENE}."))
     parser.add_argument("--version", "-v", type=int, default=None,
                         help="Version number (default: auto-detect next)")
     parser.add_argument("--timeout", "-t", type=int, default=9000,
@@ -1025,17 +1114,21 @@ def main():
                         help="Matcher backend for preprocessing target generation")
     args = parser.parse_args()
 
-    version = args.version if args.version is not None else detect_next_version()
+    scene_cfg = _load_scene_config(args.scene)
+    print(f"=== Scene: {scene_cfg['name']} (entity {scene_cfg['entity_id']}) ===")
+    print(f"    reference: {scene_cfg['reference_path']}")
+
+    version = args.version if args.version is not None else detect_next_version(args.scene)
 
     if args.stage in ("preprocess", "all"):
-        target = ensure_target_built(args.preprocess_matcher)
+        target = ensure_target_built(scene_cfg, args.preprocess_matcher)
         print(f"\n=== Preprocess complete: {target} ===\n")
         if args.stage == "preprocess":
             return
 
     if args.stage in ("align", "all"):
-        run_pipeline(version, args.timeout)
-        cleanup_old_runs(version)
+        run_pipeline(version, args.timeout, scene_cfg)
+        cleanup_old_runs(version, args.scene)
 
 
 if __name__ == "__main__":

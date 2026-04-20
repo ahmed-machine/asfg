@@ -101,6 +101,19 @@ camera:
   panoramic_seam_feather_px: 400
   panoramic_seam_tps_smoothing: 100.0
   panoramic_seam_post_warp_rms_m_max: 30.0
+  # 2OC §4.4 model-guided re-matching. After Stage A/B, re-render each
+  # sub-frame ortho, re-match it against the reference to produce new
+  # GCPs distributed across the full sub-frame footprint, then re-fit
+  # the 14p pose. Paper Table 11 ablation credits this loop with most
+  # of 2OC's headline 30–45 % accuracy gain on KH-4B. Was gated at 0
+  # (off) while the recovery-plan Phase 3 (altitude) and Phase 4 (bbox
+  # policy) prerequisites waited to land. Both are now in production
+  # (cam_gen_altitude: true above; bbox_policy defaults to
+  # predicted_union_gcp in preprocess/camera_model.py:1790), so the
+  # gate is stale. _iterative_guided_refit in
+  # preprocess/camera_model.py:3823 rejects any iteration that
+  # regresses RMS or seam shift, so enabling it is safe on hard scenes.
+  guided_refit_max_iter: 2
 
 coarse:
   coarse_res: 10.0

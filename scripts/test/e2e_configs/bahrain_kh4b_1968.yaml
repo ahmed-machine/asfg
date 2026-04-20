@@ -1,0 +1,18 @@
+# End-to-end test: Bahrain coverage from KH-4B 1968 mission 1104-1.
+# Entity DS1104-1057DA023 (Aft stereo high, 1968/08/11).
+#
+# Added alongside bahrain_kh9_pc_1977.yaml to exercise the same alignment
+# pipeline against the paper's native camera system (KH-4B). The 2OC paper
+# (Hou et al. 2023) only validated on KH-4A/B imagery; our KH-9 PC results
+# are an extrapolation. Having a KH-4B scene on the same AOI lets us
+# compare against the paper's own claims directly.
+#
+# Profile routes automatically: DS1* prefix → kh4.yaml (see
+# process.py::_profile_name_for_scene).
+name: bahrain_kh4b_1968
+entity_id: DS1104-1057DA023
+boundary: data/bahrain_boundary.geojson
+reference_name: bahrain_esri_worldimagery
+catalogs:
+  - data/available/corona2_69b17d89ee62ff28.csv
+prefer_camera: A              # Aft camera (vs F Fore)

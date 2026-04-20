@@ -7,3 +7,12 @@ targets:
 references:
   kh9_dzb1212: "/path/to/data/1976-KH9-DZB1212.warped.tif"
   kh4_ds1022: "/path/to/data/1965-DS1022-1024DA.warped.tif"
+  # Modern high-resolution basemap over Bahrain (ESRI World Imagery /
+  # Maxar via the ArcGIS REST tile service). Used as the stable ground
+  # truth for the scene-parameterised run_test.py flow. Populate once:
+  #   python scripts/fetch_esri_basemap.py \
+  #       --boundary data/bahrain_boundary.geojson \
+  #       --output /path/to/data/bahrain_esri_worldimagery.tif
+  # Attribution is written into the GeoTIFF TIFFTAG_IMAGEDESCRIPTION
+  # tag; see scripts/fetch_esri_basemap.py for TOS notes.
+  bahrain_esri_worldimagery: "/path/to/data/bahrain_esri_worldimagery.tif"
