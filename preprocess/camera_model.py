@@ -5616,28 +5616,17 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
     except Exception as e:
         print(f"  [per_segment] VRT sidecar skipped: {e}")
 
-    # Composite the orthorectified segments. Crop each segment to its
-    # interpolated quadrilateral (USGS strip corners linearly split by
-    # ``interpolate_segment_corners``) so the union across segments is
-    # a single slanted parallelogram matching the physical scan footprint.
-    # Without this, each sub-frame renders a slanted parallelogram of
-    # valid content inside a rectangular bbox with nodata above/below;
-    # when composited on a shared canvas the rectangles are axis-aligned
-    # but the parallelograms are stacked diagonally → the mosaic looks
-    # like a staircase instead of a smooth slanted band.
-    #
-    # With §4.4 model-guided re-matching and the altitude tiebreak in
-    # play, the 14p fits produce orthos whose valid content is close
-    # enough to the USGS-interpolated quadrilaterals that masking to
-    # the quadrilateral drops only the cam_gen-extrapolation fringe
-    # (which was junk anyway). Segments in ``active_indices`` order;
-    # ``None`` entries skip the mask.
-    applied_corners_list = [
-        seg_base_corners_map.get(i) for i in active_indices
-        if seg_orthos_map.get(i) is not None
-    ]
-    if not any(applied_corners_list):
-        applied_corners_list = None
+    # Composite the orthorectified segments. We deliberately skip the
+    # USGS-interpolated quadrilateral mask — empirically (Bahrain KH-9
+    # D3C1213) each rendered segment extends ~5 km beyond its USGS
+    # quadrilateral on every side, so masking to those corners drops
+    # real data and lets the adjacent segment's mask claim the same
+    # ground region, producing the visible "seg01 covers up seg00's
+    # content" artefact the user observed after the mask was enabled.
+    # The nodata-based valid mask + connected-component fringe removal
+    # inside ``_blend_segment_mosaic`` is enough on its own; the
+    # feather blend smooths transitions where segments overlap.
+    applied_corners_list = None
     tif_path = os.path.join(output_dir, f"{scene_id}_per_segment.tif")
     if os.path.isfile(tif_path):
         tif_mtime = os.path.getmtime(tif_path)
