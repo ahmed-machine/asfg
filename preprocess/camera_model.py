@@ -8,6 +8,7 @@ terrain parallax.
 Falls back gracefully if ASP is not installed.
 """
 
+import math
 import os
 import subprocess
 import tempfile
@@ -1790,6 +1791,41 @@ def _resolve_bbox_policy(bbox_policy: str | None) -> str:
     return "predicted_union_gcp"
 
 
+def _snap_bbox_to_grid(
+    bbox: tuple | None, resolution_m: float, anchor: tuple = (0.0, 0.0),
+) -> tuple | None:
+    """Expand a bbox outward so its edges lie on a shared pixel grid.
+
+    When adjacent per-segment orthos are rendered with bboxes that aren't
+    multiples of the pixel size from a common origin, their pixel grids
+    end up offset by sub-pixel amounts. The subsequent blend then has
+    each segment land on a slightly different grid, which produces
+    visible sub-pixel drift at segment transitions — observable as a
+    stair-step at adjacent segment boundaries on Bahrain KH-9 PC.
+
+    Snapping every segment's bbox to a grid anchored at ``anchor`` (0,0
+    by default) with pixel size ``resolution_m`` guarantees that every
+    segment's pixel edges coincide with every other's, so
+    ``_blend_segment_mosaic``'s ``int(round(...))`` offset math is
+    exact. Snaps outward (floor for lower edges, ceil for upper) so no
+    content is dropped. Bbox width / height grow by at most one pixel
+    per side.
+    """
+    if bbox is None or resolution_m <= 0:
+        return bbox
+    ax, ay = float(anchor[0]), float(anchor[1])
+    w = (bbox[0] - ax) / resolution_m
+    s = (bbox[1] - ay) / resolution_m
+    e = (bbox[2] - ax) / resolution_m
+    n = (bbox[3] - ay) / resolution_m
+    return (
+        ax + math.floor(w) * resolution_m,
+        ay + math.floor(s) * resolution_m,
+        ax + math.ceil(e) * resolution_m,
+        ay + math.ceil(n) * resolution_m,
+    )
+
+
 def _resolve_render_bbox(bbox_policy: str, gcps: np.ndarray, fit_params,
                          pixel_pitch: float, image_width_px: int,
                          image_height_px: int) -> tuple:
@@ -2247,6 +2283,17 @@ def _blend_segment_mosaic(seg_orthos: list, output_path: str,
     canvas_bottom = min(m["bounds"].bottom for m in metas)
     canvas_right = max(m["bounds"].right for m in metas)
     canvas_top = max(m["bounds"].top for m in metas)
+
+    # Defensive canvas snap: if segments were rendered through
+    # ``_do_mapproject`` they already land on the shared grid, but this
+    # guarantees the union is pixel-aligned for blend paths that
+    # bypass ``_do_mapproject`` (legacy, tests). The snap matches
+    # ``_snap_bbox_to_grid`` above.
+    canvas_snap = _snap_bbox_to_grid(
+        (canvas_left, canvas_bottom, canvas_right, canvas_top), float(res_x),
+    )
+    if canvas_snap is not None:
+        canvas_left, canvas_bottom, canvas_right, canvas_top = canvas_snap
 
     out_w = int(round((canvas_right - canvas_left) / res_x))
     out_h = int(round((canvas_top - canvas_bottom) / res_y))
@@ -3800,6 +3847,12 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
                 image_width_px=sf_w,
                 image_height_px=sf_h,
             )
+        # Snap bbox outward to a pixel grid anchored at (0, 0) so every
+        # segment rendered at the same resolution lands on a shared pixel
+        # lattice. Eliminates the sub-pixel drift that shows up as visible
+        # stair-step between adjacent segments in the blended mosaic. The
+        # snap expands bbox by at most one pixel per edge.
+        snapped_bbox = _snap_bbox_to_grid(bbox, float(resolution_m))
         return kh_panoramic.mapproject(
             params=params,
             sub_frame_path=sub_path,
@@ -3809,7 +3862,7 @@ def opticalbar_per_segment_precorrect(sub_frames, camera_params, strip_corners,
             image_width_px=sf_w,
             image_height_px=sf_h,
             resolution_m=float(resolution_m),
-            bbox_xy=bbox,
+            bbox_xy=snapped_bbox,
             local_crs=local_crs,
             t_srs=t_srs,
             device=str(matcher_runtime.device),

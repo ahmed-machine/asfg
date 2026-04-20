@@ -2480,3 +2480,38 @@ def test_generate_manifest_sorts_jobs_by_overlap(tmp_path, monkeypatch, piecewis
             "ordered_inputs": ordered_inputs,
         }
     )
+
+
+@pytest.mark.fast
+def test_snap_bbox_to_grid_aligns_adjacent_segments():
+    """Two adjacent bboxes that start at non-grid-aligned coordinates should
+    both snap to the SAME shared grid after ``_snap_bbox_to_grid``, so the
+    downstream blend can place them without sub-pixel drift."""
+    from preprocess.camera_model import _snap_bbox_to_grid
+
+    res = 4.777314267158508  # ESRI World Imagery at z=15
+    # seg00-like bbox — deliberately off-grid by ~0.28 px.
+    a = _snap_bbox_to_grid(
+        (425853.7, 2888826.9, 462755.2, 2915481.6), res,
+    )
+    # seg01-like bbox, offset by 3334 m east (matches Bahrain D3C1213 obs).
+    b = _snap_bbox_to_grid(
+        (425853.7 + 3334.023, 2888826.9, 462755.2 + 3334.023, 2915481.6), res,
+    )
+    # Both corners must land on integer multiples of ``res`` from (0, 0).
+    for edge in (a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]):
+        frac = (edge / res) % 1.0
+        assert abs(frac) < 1e-9 or abs(frac - 1.0) < 1e-9, (
+            f"edge {edge} fractional px {frac:.6f} — grid-snap failed"
+        )
+    # Snap is outward: a expands slightly but never loses the original span.
+    assert a[0] <= 425853.7 and a[2] >= 462755.2
+    assert a[1] <= 2888826.9 and a[3] >= 2915481.6
+
+
+@pytest.mark.fast
+def test_snap_bbox_to_grid_noop_on_none():
+    from preprocess.camera_model import _snap_bbox_to_grid
+    assert _snap_bbox_to_grid(None, 4.7) is None
+    # Zero resolution → passthrough so we never divide by zero.
+    assert _snap_bbox_to_grid((0, 0, 1, 1), 0.0) == (0, 0, 1, 1)

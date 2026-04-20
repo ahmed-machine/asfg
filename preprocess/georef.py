@@ -470,8 +470,15 @@ def coarse_align_and_crop(
                   f"using zero offset (USGS corners)")
             dx_m, dy_m = 0.0, 0.0
             use_offset = False
-        elif max_val < 0.40 and total_offset > 25000:
-            # Low-confidence match with large shift — almost certainly spurious
+        elif max_val < 0.25 and total_offset > 25000:
+            # Low-confidence match with large shift — likely spurious.
+            # Lowered 0.40 → 0.25 (2026-04-20) because on KH-4B film vs
+            # a modern optical basemap (ESRI World Imagery), the land-mask
+            # correlation tops out around 0.30 even when the detected
+            # shift is physically consistent with USGS corner offset
+            # (observed: Bahrain DS1104-1057DA023 detected 39 km shift
+            # correctly at corr=0.308; 0.40 threshold was rejecting it).
+            # Values below 0.25 remain ambiguous enough to reject.
             print(f"  [coarse_crop] Low-confidence large shift "
                   f"({total_offset/1000:.0f}km, corr={max_val:.3f}), "
                   f"using zero offset")

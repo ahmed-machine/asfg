@@ -414,7 +414,7 @@ def _maybe_generate_asp_ortho(scene, cache_dir: str, stitched_path: str,
     if cam_path is None:
         return None
 
-    return mapproject_image(
+    stitched_ortho = mapproject_image(
         stitched_path,
         cam_path,
         dem_path=dem_path,
@@ -422,6 +422,39 @@ def _maybe_generate_asp_ortho(scene, cache_dir: str, stitched_path: str,
         resolution=_reference_resolution(reference),
         t_srs="EPSG:3857",
     )
+    if not stitched_ortho or not reference or not os.path.exists(reference):
+        return stitched_ortho
+
+    # Coarse-align the stitched ortho against the reference and replace the
+    # original file with the aligned+cropped version. cam_gen seeds its iC
+    # from the USGS 4-corner centroid, which for KH-4 / KH-4B scenes is
+    # commonly 10–30 km off; without this step the ortho lands mispositioned
+    # in the reference frame and the downstream run_test intersection-based
+    # crop lops off valid Bahrain content. ``coarse_align_and_crop`` does
+    # a low-res template match on land masks, shifts the geotransform,
+    # then crops to the reference bbox + 10 km margin. On success we
+    # overwrite the original stitched ortho in place so any caller reading
+    # ``paths.ortho_path`` gets the aligned version.
+    coarse_tmp = os.path.splitext(stitched_ortho)[0] + "_coarse.tif"
+    try:
+        coarse_result = coarse_align_and_crop(
+            stitched_ortho,
+            reference,
+            coarse_tmp,
+            target_bbox_wgs=bbox,
+        )
+    except Exception as exc:
+        print(f"  [coarse_crop] stitched coarse-align failed: {exc}")
+        coarse_result = None
+    if coarse_result and os.path.exists(coarse_result):
+        try:
+            os.replace(coarse_result, stitched_ortho)
+            print(f"  [coarse_crop] stitched ortho coarse-aligned in place: "
+                  f"{stitched_ortho}")
+        except OSError as exc:
+            print(f"  [coarse_crop] replace failed ({exc}); keeping unaligned "
+                  f"{stitched_ortho}")
+    return stitched_ortho
 
 
 def _ensure_scene_asp_ortho(scene, cache_dir: str, reference: str | None,

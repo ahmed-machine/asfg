@@ -1204,6 +1204,28 @@ def mapproject(
                 src.crs, t_srs, src.width, src.height, *src.bounds,
                 resolution=resolution_m,
             )
+            # calculate_default_transform places the output on whatever
+            # grid it picks, not a grid-aligned multiple of resolution_m.
+            # When multiple per-sub-frame orthos are rendered for the same
+            # scene and later blended, their independent grid origins drift
+            # sub-pixel relative to each other — visible as a stair-step
+            # between adjacent segments at the blend boundary. Snap the
+            # output transform's upper-left to a ``(0, 0)``-anchored grid
+            # so every per-segment ortho lands on the same pixel lattice.
+            import math as _math
+            snapped_c = _math.floor(dst_tfm.c / resolution_m) * resolution_m
+            snapped_f = _math.ceil(dst_tfm.f / resolution_m) * resolution_m
+            # Preserve the rendered extent: grow dst dimensions to cover
+            # the original output area from the new snapped origin.
+            dc = dst_tfm.c - snapped_c
+            df = snapped_f - dst_tfm.f
+            dst_w_snap = int(_math.ceil(dst_w + dc / resolution_m))
+            dst_h_snap = int(_math.ceil(dst_h + df / resolution_m))
+            dst_tfm = rasterio.Affine(
+                dst_tfm.a, dst_tfm.b, snapped_c,
+                dst_tfm.d, dst_tfm.e, snapped_f,
+            )
+            dst_w, dst_h = dst_w_snap, dst_h_snap
             dst_profile = profile.copy()
             dst_profile.update(crs=t_srs, transform=dst_tfm,
                                width=dst_w, height=dst_h)
