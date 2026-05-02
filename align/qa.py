@@ -22,6 +22,17 @@ _IOU_RAMP_LO = 50       # union pixels where IoU penalty starts ramping in
 _IOU_RAMP_HI = 200      # union pixels where IoU penalty reaches full weight
 _MAX_METRIC_M = 500.0   # cap for inf grid_score / patch_med (meters)
 
+# Era-gap grid downweight tuning. Cross-temporal data drift (vegetation,
+# subtle development, sediment) accumulates with the gap between source
+# and reference image years; the per-cell shoreline grid is the most
+# saturated signal. Below the threshold no downweight is applied;
+# beyond it grid_weight decays linearly with year-gap, floored at
+# _ERA_GAP_MIN_FACTOR. The reclamation mask handles localized land/water
+# changes; this factor handles the residual global drift.
+_ERA_GAP_DOWNWEIGHT_THRESHOLD_YEARS = 5.0
+_ERA_GAP_DECAY_PER_YEAR = 0.06
+_ERA_GAP_MIN_FACTOR = 0.3
+
 
 def compute_shoreline_iou_and_median(ref_arr, test_arr, valid_mask, res_m):
     """Return shoreline IoU and median symmetric shoreline mismatch (meters)."""
@@ -146,6 +157,59 @@ def compute_patch_residual_median(ref_arr, test_arr, valid_mask, res_m,
         "max": float(np.max(mags)),
         "count": int(len(mags)),
     }
+
+
+def _compute_qa_reclamation_mask(land_ref, land_out, valid_mask, eval_res):
+    """Return a boolean mask flagging likely physical land/water change.
+
+    Pixels where ``land_ref`` and ``land_out`` disagree at scale are most
+    plausibly reclamation, sediment migration, or large-scale construction,
+    not alignment error. Aligning a 1968 KH-4B against a 1976 KH-9 ref
+    over Bahrain produces shoreline cells with multi-km residuals dominated
+    by these changes; excluding them stops grid_score from saturating.
+
+    The XOR is morphologically opened to drop small alignment-noise blobs,
+    then connected components below ~150 m × 150 m are dropped, and the
+    remaining mask is dilated by ~50 m to absorb shoreline-edge bleed.
+    """
+    if land_ref is None or land_out is None or valid_mask is None:
+        return np.zeros(valid_mask.shape if valid_mask is not None else (0, 0), dtype=bool)
+    if eval_res <= 0:
+        return np.zeros_like(valid_mask, dtype=bool)
+    xor = (np.asarray(land_ref).astype(bool) ^ np.asarray(land_out).astype(bool)) & valid_mask
+    if not xor.any():
+        return np.zeros_like(valid_mask, dtype=bool)
+    open_px = max(3, int(round(50.0 / eval_res)))
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_px, open_px))
+    cleaned = cv2.morphologyEx(xor.astype(np.uint8), cv2.MORPH_OPEN, k_open)
+    if not cleaned.any():
+        return np.zeros_like(valid_mask, dtype=bool)
+    min_area_px = max(50, int(round((150.0 / eval_res) ** 2)))
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
+    keep = np.zeros_like(cleaned)
+    for lbl in range(1, n_labels):
+        if int(stats[lbl, cv2.CC_STAT_AREA]) >= min_area_px:
+            keep[labels == lbl] = 1
+    if not keep.any():
+        return np.zeros_like(valid_mask, dtype=bool)
+    dilate_px = max(1, int(round(50.0 / eval_res)))
+    k_dilate = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1)
+    )
+    return cv2.dilate(keep, k_dilate, iterations=1).astype(bool)
+
+
+def _era_gap_grid_factor(era_gap_years: float | None) -> float:
+    """Return the grid_weight downweight factor for a given era gap.
+
+    Returns 1.0 when the gap is below ``_ERA_GAP_DOWNWEIGHT_THRESHOLD_YEARS``;
+    decays linearly at ``_ERA_GAP_DECAY_PER_YEAR`` per year past that
+    threshold, floored at ``_ERA_GAP_MIN_FACTOR``.
+    """
+    if era_gap_years is None or not np.isfinite(era_gap_years):
+        return 1.0
+    over = max(0.0, float(era_gap_years) - _ERA_GAP_DOWNWEIGHT_THRESHOLD_YEARS)
+    return float(max(_ERA_GAP_MIN_FACTOR, 1.0 - _ERA_GAP_DECAY_PER_YEAR * over))
 
 
 def _compute_grid_metrics(sym, common, h, w, n_rows, n_cols):
@@ -291,12 +355,32 @@ def _compute_boundary_distance(mask_ref, mask_out, valid_mask, eval_res):
     return float(np.median(sym))
 
 
-def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0, mask_mode="coastal_obia"):
-    """Compute grid-based shoreline drift and patch residual metrics."""
+def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0, mask_mode="coastal_obia",
+                                      era_gap_years: float | None = None):
+    """Compute grid-based shoreline drift and patch residual metrics.
+
+    ``era_gap_years`` (optional) is the year gap between source and
+    reference acquisition. When >0 it triggers two cross-temporal
+    corrections so the shoreline grid does not saturate on physical
+    land/water change: (1) a reclamation mask excludes land/water-disagreement
+    regions from shoreline scoring; (2) the grid component weight is
+    downweighted past a 5-year threshold to absorb undetected drift
+    (vegetation, subtle development, sediment) that the mask doesn't catch.
+    """
     bundle_ref = build_semantic_masks(ref_arr, mode=mask_mode)
     bundle_out = build_semantic_masks(out_arr, mode=mask_mode)
-    m_ref = (bundle_ref.shoreline > 0) & valid_mask
-    m_out = (bundle_out.shoreline > 0) & valid_mask
+    # Reclamation mask: pixels where the two land masks disagree at scale
+    # are physical change (reclamation, sediment, large construction), not
+    # alignment error. Exclude them from shoreline scoring.
+    reclamation_mask = _compute_qa_reclamation_mask(
+        getattr(bundle_ref, "land", None),
+        getattr(bundle_out, "land", None),
+        valid_mask,
+        eval_res,
+    )
+    valid_for_shore = valid_mask & ~reclamation_mask
+    m_ref = (bundle_ref.shoreline > 0) & valid_for_shore
+    m_out = (bundle_out.shoreline > 0) & valid_for_shore
     k = np.ones((3, 3), np.uint8)
     e_ref = cv2.morphologyEx(m_ref.astype(np.uint8), cv2.MORPH_GRADIENT, k) > 0
     e_out = cv2.morphologyEx(m_out.astype(np.uint8), cv2.MORPH_GRADIENT, k) > 0
@@ -320,12 +404,7 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
     valid_cells = [c for c in cells if c["valid"]]
     valid_count = len(valid_cells)
     total_count = len(cells)
-
-    if valid_count > 0:
-        grid_score = float(np.mean([c["shoreline_med"] for c in valid_cells]))
-    else:
-        grid_score = _MAX_METRIC_M
-    grid_coverage = valid_count / total_count if total_count > 0 else 0.0
+    raw_grid_coverage = valid_count / total_count if total_count > 0 else 0.0
 
     # Derive legacy directional keys from grid
     west, center, east, north_shift = _derive_legacy_from_grid(cells, n_cols)
@@ -349,7 +428,12 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
     )
     patch_med = patch_result["median"]
 
-    # Per-cell patch displacement (Phase 3a: inland coverage)
+    # Per-cell patch displacement (Phase 3a: inland coverage). Cells with
+    # at least one valid patch are considered "patch-supported" and used
+    # to filter the shoreline grid_score below — a cell whose shoreline
+    # residual cannot be corroborated by an inland phase-correlation patch
+    # is much more likely to be measuring cross-temporal change rather
+    # than alignment error.
     patch_grid_cells = _compute_patch_grid_metrics(
         to_u8(ref_arr), to_u8(out_arr),
         valid_mask & (stable_ref | stable_out),
@@ -357,6 +441,33 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
     )
     patch_grid_valid = [c for c in patch_grid_cells if c["valid"]]
     patch_grid_coverage = len(patch_grid_valid) / len(patch_grid_cells) if patch_grid_cells else 0.0
+    patch_valid_keys = {(c["row"], c["col"]) for c in patch_grid_valid}
+
+    # Patch-supported filter: prefer to score only cells where an inland
+    # patch corroborates the shoreline residual. Falls back to all valid
+    # cells when no patches survived (shoreline_only) so the score still
+    # has a value to report.
+    score_cells = valid_cells
+    grid_reliability = "shoreline_only"
+    if patch_valid_keys:
+        supported_cells = [
+            c for c in valid_cells
+            if (c["row"], c["col"]) in patch_valid_keys
+        ]
+        if supported_cells:
+            score_cells = supported_cells
+            grid_reliability = "patch_supported"
+    scored_valid_count = len(score_cells)
+
+    if scored_valid_count > 0:
+        # Median (not mean) — per-cell shoreline_med values are themselves
+        # cell medians, so the natural aggregator is also a median, and
+        # median is robust to occasional uncaught-reclamation outlier cells
+        # that survive the XOR mask (e.g. very narrow harbour fingers).
+        grid_score = float(np.median([c["shoreline_med"] for c in score_cells]))
+    else:
+        grid_score = _MAX_METRIC_M
+    grid_coverage = scored_valid_count / total_count if total_count > 0 else 0.0
 
     # Boundary distance metrics (Phase 3b: replaces IoU as shift-sensitive)
     stable_boundary_m = _compute_boundary_distance(stable_ref, stable_out, valid_mask, eval_res)
@@ -375,6 +486,16 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
         patch_w = 0.25 + 0.55 * (1.0 - blend)
     else:
         grid_w, patch_w = 0.0, 0.80
+
+    # Era-gap downweight: large source/reference year gaps accumulate
+    # cross-temporal drift the reclamation mask doesn't fully catch
+    # (vegetation, subtle development, sediment). Reweight from grid to
+    # patch so the residual drift doesn't overwhelm honest alignment.
+    era_factor = _era_gap_grid_factor(era_gap_years)
+    if era_factor < 1.0:
+        shifted = grid_w * (1.0 - era_factor)
+        grid_w = grid_w * era_factor
+        patch_w = patch_w + shifted
 
     grid_contrib = grid_w * grid_score
     patch_contrib = patch_w * patch_med
@@ -404,7 +525,10 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
             "cols": n_cols,
             "cells": cells,
             "valid_count": valid_count,
+            "scored_valid_count": scored_valid_count,
             "total_count": total_count,
+            "raw_coverage": round(raw_grid_coverage, 3),
+            "reliability": grid_reliability,
         },
         "grid_score": grid_score,
         "grid_coverage": round(grid_coverage, 3),
@@ -437,13 +561,28 @@ def evaluate_alignment_quality_arrays(ref_arr, out_arr, valid_mask, eval_res=8.0
             "shore_boundary_penalty": round(float(shore_boundary_penalty), 2),
             "grid_weight": round(grid_w, 3),
             "patch_weight": round(patch_w, 3),
+            "era_gap_years": (None if era_gap_years is None
+                              else round(float(era_gap_years), 2)),
+            "era_gap_factor": round(era_factor, 3),
+        },
+        "reclamation": {
+            "fraction_of_valid": (
+                round(float(np.sum(reclamation_mask)) / float(max(1, np.sum(valid_mask))), 4)
+            ),
+            "pixels": int(np.sum(reclamation_mask)),
         },
     }
 
 
 def evaluate_alignment_quality_paths(output_path, reference_path, overlap, work_crs, eval_res=8.0,
-                                     mask_mode="coastal_obia"):
-    """Compute alignment QA metrics directly from raster paths."""
+                                     mask_mode="coastal_obia",
+                                     era_gap_years: float | None = None):
+    """Compute alignment QA metrics directly from raster paths.
+
+    ``era_gap_years`` (optional) is forwarded to
+    :func:`evaluate_alignment_quality_arrays` to enable cross-temporal
+    drift corrections (reclamation mask + grid-weight downweight).
+    """
     with rasterio.open(reference_path) as src_ref, rasterio.open(output_path) as src_out:
         arr_ref, _ = read_overlap_region(src_ref, overlap, work_crs, eval_res)
         arr_out, _ = read_overlap_region(src_out, overlap, work_crs, eval_res)
@@ -451,7 +590,11 @@ def evaluate_alignment_quality_paths(output_path, reference_path, overlap, work_
     valid = (arr_ref > 0) & (arr_out > 0)
     if np.mean(valid) < 0.05:
         return None
-    return evaluate_alignment_quality_arrays(arr_ref, arr_out, valid, eval_res=eval_res, mask_mode=mask_mode)
+    return evaluate_alignment_quality_arrays(
+        arr_ref, arr_out, valid,
+        eval_res=eval_res, mask_mode=mask_mode,
+        era_gap_years=era_gap_years,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -742,14 +885,30 @@ def build_candidate_report(candidate_name: str, output_path: str, reference_path
                            overlap, work_crs, *, holdout_pairs=None, M_geo=None,
                            coverage: float = 0.0, cv_mean_m: float | None = None,
                            hypothesis_id: str = "", eval_res: float = 4.0,
-                           image_metrics=None, qa_params=None) -> QaReport:
-    """Compute an independent QA report for a candidate output."""
+                           image_metrics=None, qa_params=None,
+                           affine_post_warp_metrics: dict | None = None,
+                           era_gap_years: float | None = None) -> QaReport:
+    """Compute an independent QA report for a candidate output.
+
+    ``affine_post_warp_metrics`` (optional) is the affine candidate's own
+    image-space holdout phase-correlation result. When supplied, the
+    post-warp regression rule compares the current candidate to it
+    (apples-to-apples in image space), instead of to the M_geo
+    coordinate-space prediction — which has a cross-temporal content-drift
+    floor unrelated to warp quality.
+
+    ``era_gap_years`` (optional) is forwarded to the underlying scorer
+    so cross-temporal corrections (reclamation mask + grid-weight
+    downweight) engage when the candidate's image_metrics aren't already
+    pre-supplied.
+    """
     from .params import get_params
     qp = qa_params or get_params().qa
 
     if image_metrics is None:
         image_metrics = evaluate_alignment_quality_paths(
             output_path, reference_path, overlap, work_crs, eval_res=eval_res,
+            era_gap_years=era_gap_years,
         ) or {}
     holdout_metrics = compute_holdout_affine_metrics(M_geo, holdout_pairs or [])
     holdout_warp_metrics = compute_holdout_warp_metrics(
@@ -780,15 +939,27 @@ def build_candidate_report(candidate_name: str, output_path: str, reference_path
     if not geometry_only and coverage < qp.accept_coverage_min:
         accepted = False
         reasons.append("gcp_coverage_low")
-    if holdout_warp_metrics and holdout_metrics:
-        affine_mean = float(holdout_metrics.get("mean_m", 0.0))
+    if holdout_warp_metrics and holdout_metrics and candidate_name != "affine":
+        # Skip the regression rule for the affine candidate: its warp IS
+        # M_geo applied, so any gap between the M_geo coord-space prediction
+        # (holdout_metrics) and the rendered phase-correlation residual
+        # (holdout_warp_metrics) is content drift + resampling, not a
+        # warp-quality signal.
         warp_mean = float(holdout_warp_metrics.get("mean_m", 0.0))
-        affine_p90 = float(holdout_metrics.get("p90_m", 0.0))
         warp_p90 = float(holdout_warp_metrics.get("p90_m", 0.0))
+        # Prefer comparison against the affine candidate's image-space
+        # post-warp baseline (apples-to-apples). Falls back to the M_geo
+        # coord-space prediction if the affine baseline is unavailable.
+        if affine_post_warp_metrics:
+            base_mean = float(affine_post_warp_metrics.get("mean_m", 0.0))
+            base_p90 = float(affine_post_warp_metrics.get("p90_m", 0.0))
+        else:
+            base_mean = float(holdout_metrics.get("mean_m", 0.0))
+            base_p90 = float(holdout_metrics.get("p90_m", 0.0))
         if (
-            affine_mean > 0.0 and warp_mean > affine_mean * 1.5
+            base_mean > 0.0 and warp_mean > base_mean * 1.5
         ) or (
-            affine_p90 > 0.0 and warp_p90 > affine_p90 * 1.5
+            base_p90 > 0.0 and warp_p90 > base_p90 * 1.5
         ):
             accepted = False
             reasons.append("post_warp_holdout_regression")

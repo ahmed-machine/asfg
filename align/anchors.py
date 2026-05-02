@@ -5,6 +5,7 @@ sub-pixel phase refinement, geo conversion) lives in :func:`locate_anchors`.
 """
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
@@ -52,11 +53,28 @@ def _anchor_mask_mode(anchor: dict) -> str:
 
 @dataclass
 class AnchorMatchResult:
-    """Displacement + quality returned by a matcher."""
+    """Displacement + quality returned by a matcher.
+
+    ``rotation_deg`` and ``scale`` capture the local affine of the match
+    when the matcher derives one (e.g. RoMa-foundation via
+    ``cv2.estimateAffinePartial2D``). They're optional — pre-search-only
+    matchers leave them at identity. Used downstream by
+    ``apply_local_scale_precorrection`` to feed per-anchor distortion
+    into the warp.
+    """
     dx_px: float
     dy_px: float
     quality: float
     method: str
+    rotation_deg: float = 0.0
+    scale: float = 1.0
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +385,14 @@ def match_anchor_roma(ref_patch, off_patch, patch_half, name,
     local_rot = np.degrees(np.arctan2(c, a))
     print(f"    Located: {name} (RoMa foundation: {n_inliers} inliers, deterministic top-k, rot={local_rot:.2f}deg)")
 
-    return AnchorMatchResult(total_dx, total_dy, 1.0, "RoMa")
+    # Capture the local rigid component of the affine so the pipeline can
+    # feed it to apply_local_scale_precorrection (per-anchor rotations
+    # vary across panoramic strips and a single global rigid fit
+    # under-corrects the western/eastern edges).
+    local_scale = float((scale_x + scale_y) / 2.0)
+    return AnchorMatchResult(total_dx, total_dy, 1.0, "RoMa",
+                             rotation_deg=float(local_rot),
+                             scale=local_scale)
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +516,7 @@ def _prepare_single_anchor(anchor, arr_ref, arr_off_shifted, h_img, w_img,
     if feature_type in ("island_center", "reef_feature"):
         min_land = 0.005
     else:
-        min_land = 0.05 if has_roma else 0.15
+        min_land = 0.05 if has_roma else float(anchor_min_land_ncc)
 
     land_ok = False
     for try_ph in shrink_sizes:
@@ -572,7 +597,7 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                    ref_transform, offset_transform, arr_ref, arr_off_shifted,
                    shift_px_x, shift_py_y, fine_res, model_cache=None,
                    arr_off_unshifted=None, matcher_type="roma",
-                   diagnostics_dir=None):
+                   diagnostics_dir=None, anchor_min_land_ncc=0.10):
     """Locate anchor GCPs in both reference and offset images.
 
     *matcher_type*: "roma" (default).  Controls priority.
@@ -604,6 +629,12 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
         print(f"    Loaded {len(gcps_list)} anchors from custom JSON format", flush=True)
 
     results = []
+    # Per-anchor patch_results (cx, cy, scale_x, scale_y, rotation) feed
+    # apply_local_scale_precorrection so per-anchor rotations from
+    # RoMa-foundation matches drive a non-rigid precorrection. Captures
+    # the −2.21° / +3.61° / +1.05° spread we see across KH-4B Bahrain
+    # anchors that a single global rigid fit can't represent.
+    _anchor_patch_results = []
     failed_anchors = []
     h_img, w_img = arr_ref.shape
 
@@ -621,6 +652,9 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
             print(f"    WARNING: RoMa from cache failed ({e})")
 
     has_roma = roma_model is not None
+    device_type = str(getattr(model_cache, "device", get_torch_device())).split(":", 1)[0].lower()
+    cpu_roma_max_attempts = _env_int("DECLASS_CPU_ANCHOR_ROMA_MAX_ATTEMPTS", 0)
+    cpu_roma_attempts = 0
 
     # Phase 1: Parallel CPU prep (coords, coverage, land masks, presearch NCC)
     prep_results = [None] * len(gcps_list)
@@ -642,6 +676,8 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
     # (translation + rotation) to these vectors and applying it to the offset
     # adjustments improves fine matching success rate.
     _presearch_global_offset = None  # (dE_m, dN_m) if rigid fit succeeds
+    _presearch_global_rotation_deg = 0.0  # rigid-fit rotation when significant
+    _presearch_global_scale = 1.0  # rigid-fit scale when significant
     presearch_pts = []  # (ref_row, ref_col, off_row_adj, off_col_adj, ncc)
     for prep in prep_results:
         if prep is None or prep["status"] != "ready":
@@ -691,6 +727,8 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
 
             if shift_m > 5 and n_inliers >= 3:
                 _presearch_global_offset = (float(tx * fine_res), float(ty * fine_res))
+                _presearch_global_rotation_deg = float(angle)
+                _presearch_global_scale = float(scale)
                 print(f"  [Anchor presearch] Rigid fit from {n_inliers}/{len(presearch_pts)} anchors: "
                       f"dE={tx*fine_res:.0f}m, dN={ty*fine_res:.0f}m, "
                       f"rot={angle:.2f}°, scale={scale:.4f}", flush=True)
@@ -732,18 +770,35 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
         anchor_x, anchor_y = prep["anchor_x"], prep["anchor_y"]
 
         best_match = None
+        presearch_offset_m = np.sqrt(off_row_adj**2 + off_col_adj**2) * fine_res
+        if (device_type == "cpu" and presearch_ncc >= 0.65
+                and presearch_offset_m < 500.0):
+            print(f"    Located: {name} (presearch CPU fast-path: "
+                  f"NCC={presearch_ncc:.2f}, offset={presearch_offset_m:.0f}m)")
+            best_match = AnchorMatchResult(
+                float(off_col_adj), float(off_row_adj),
+                presearch_ncc * 0.6, "PresearchCPU")
+
         if has_roma:
             patch_sizes = [eff_patch_half]
-            if eff_patch_half > 64:
+            if device_type != "cpu" and eff_patch_half > 64:
                 patch_sizes.append(eff_patch_half // 2)
-            if eff_patch_half > 4:
+            if device_type != "cpu" and eff_patch_half > 4:
                 patch_sizes.append(eff_patch_half // 4)
             for try_ph in patch_sizes:
+                if best_match is not None:
+                    break
+                if device_type == "cpu" and cpu_roma_attempts >= cpu_roma_max_attempts:
+                    print(f"    Skipped neural anchor matching for {name} "
+                          f"(CPU RoMa anchor budget {cpu_roma_max_attempts} reached)")
+                    break
                 rp, op = _extract_patches(
                     ref_row, ref_col, try_ph, arr_ref, arr_off_shifted,
                     h_img, w_img, off_row_adj, off_col_adj)
                 if rp is None:
                     continue
+                if device_type == "cpu":
+                    cpu_roma_attempts += 1
                 result = match_anchor_roma(
                     rp, op, try_ph, name,
                     off_row_adj, off_col_adj, roma_model)
@@ -752,7 +807,6 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                     break
 
         # Presearch fallback
-        presearch_offset_m = np.sqrt(off_row_adj**2 + off_col_adj**2) * fine_res
         if best_match is None and presearch_ncc >= 0.44 and feature_type in ("island_center", "reef_feature"):
             print(f"    Located: {name} (presearch mask fallback: NCC={presearch_ncc:.2f})")
             best_match = AnchorMatchResult(float(off_col_adj), float(off_row_adj), presearch_ncc * 0.8, "PresearchMask")
@@ -775,6 +829,22 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                 confidence=best_match.quality,
                 name=f"anchor:{name}",
             ))
+            # When the matcher derived a local affine (RoMa foundation),
+            # record the patch so apply_local_scale_precorrection has a
+            # per-anchor (rotation, scale) sample. Pre-search-only matches
+            # default to identity (rotation_deg=0, scale=1.0) and don't
+            # contribute non-rigid signal — skip them.
+            if (abs(best_match.rotation_deg) > 1e-3
+                    or abs(best_match.scale - 1.0) > 1e-3):
+                _anchor_patch_results.append({
+                    "cx": float(ref_gx),
+                    "cy": float(ref_gy),
+                    "scale_x": float(best_match.scale),
+                    "scale_y": float(best_match.scale),
+                    "rotation": float(best_match.rotation_deg),
+                    "status": "ok",
+                    "n_inliers": 1,
+                })
             disp_e = off_gx - ref_gx
             disp_n = off_gy - ref_gy
             disp_tot = np.sqrt(disp_e ** 2 + disp_n ** 2)
@@ -832,7 +902,12 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                   f"(median residual {fit_med_res:.1f}m > threshold {pass15_threshold:.0f}m "
                   f"for {n_fit} anchors)", flush=True)
             results = _filter_anchor_displacement_outliers(results)
-            return results, {"presearch_global_offset_m": _presearch_global_offset}
+            return results, {
+                "presearch_global_offset_m": _presearch_global_offset,
+                "presearch_rotation_deg": _presearch_global_rotation_deg,
+                "presearch_scale": _presearch_global_scale,
+                "anchor_patch_results": list(_anchor_patch_results),
+            }
 
         # Invert to get ref_pos -> offset_pos
         M_3x3 = np.vstack([M_fwd, [0, 0, 1]])
@@ -1011,4 +1086,9 @@ def locate_anchors(anchors_path, src_ref, src_offset, overlap, work_crs,
                         break
 
     results = _filter_anchor_displacement_outliers(results)
-    return results, {"presearch_global_offset_m": _presearch_global_offset}
+    return results, {
+        "presearch_global_offset_m": _presearch_global_offset,
+        "presearch_rotation_deg": _presearch_global_rotation_deg,
+        "presearch_scale": _presearch_global_scale,
+        "anchor_patch_results": list(_anchor_patch_results),
+    }

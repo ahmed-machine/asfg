@@ -1,0 +1,70 @@
+inherits: _base
+
+# KH-9 HEXAGON MAPPING CAMERA (1971-1984) — Itek 304.8 mm (12 in) frame
+# camera with 1081 reseau crosses at 10 mm spacing, 9" × 18" film format,
+# moving-platen V/H-control IMC. Stereo along-track via fore+aft (20°
+# total convergence, same geometry as KH-9 PC but at ~10× coarser GSD
+# and with a simpler frame-camera sensor model).
+#
+# **STUB PROFILE — KH-9 MC INGESTION NOT WIRED INTO THIS PIPELINE TODAY.**
+#
+# Unlike KH-7 / KH-8, MC has a well-established public pipeline:
+#   Dehecq et al. 2020 (Frontiers in Earth Science 8:566802) —
+#     pinhole + Brown-Conrady 8-coefficient distortion + reseau TPS
+#     correction. Elevations within ±5 m vs SRTM on stable terrain.
+#   UW `declass_stereo` — KH-9 MC workflow for glacier elevation change.
+#   `preprocess/reseau.py::process_kh9_reseau` already exists and handles
+#     the 1081-reseau grid; it's wired for KH-9 PC today but MC is its
+#     original target use case.
+#
+# If you ingest KH-9 MC imagery:
+#   1. Confirm the entity prefix USGS uses (D3C covers KH-9 PC — need to
+#      verify MC has a distinct prefix).
+#   2. Extend `process.py::_profile_name_for_scene` dispatch.
+#   3. Wire `type: pinhole` through `align/params.py::is_pinhole` (already
+#      landed this session) → frame-camera-specific cam_gen + BA path.
+#   4. Apply reseau correction as a preprocess step (see `preprocess/
+#      reseau.py`).
+#
+# Authoritative sources:
+#   Dehecq et al. 2020, Frontiers in Earth Science 8:566802 — the
+#     canonical KH-9 MC pipeline.
+#   NRO Preliminary KH-9 Camera Manual (1969) — local at
+#     `data/camera-manuals/kh9_mc_system_manual_1969.pdf`. Covers the
+#     Stellar/Terrain (AST) sub-system including MC optics.
+#   NRO HEXAGON Mapping Camera Program history — local at
+#     `data/camera-manuals/kh9_mc_mapping_camera_program.pdf`.
+
+meta:
+  name: kh9_mc
+  description: KH-9 HEXAGON Mapping Camera (1971-1984) — Itek 12" frame, 1081 reseau [STUB]
+  cameras: [KH-9 MC]
+
+camera:
+  type: pinhole               # frame camera
+  focal_length: 0.3048        # 12 in = 304.8 mm
+  pixel_pitch: 7.0e-6         # USGS standard scan
+  # 1081 reseau crosses at 10 mm spacing — see preprocess/reseau.py.
+  use_reseau: true
+  reseau_grid_spacing_mm: 10.0
+  # Stereo along-track (fore+aft) at 20° total convergence — same geometry
+  # as KH-9 PC (both use the ±10° platform tilt). Frame camera doesn't
+  # have a per-exposure forward tilt; attitude is via vehicle pointing.
+  nominal_altitude_km: 170
+  speed: 7800
+  scan_arc_deg: 0.0
+  scan_time: 0.0
+  forward_tilt: 0.0
+  scan_dir: right
+  motion_compensation_factor: 1.0
+  # KH-9 MC frame-camera corners are tighter than KH-4 / KH-7. Dehecq's
+  # validated pipeline assumes corners are usable; mark as reliable so
+  # the coarse-abstain hard-skip doesn't trip on transient match failures.
+  usgs_corners_reliable: true
+  fix_f: false
+  _unsupported_reason: >
+    KH-9 MC ingestion path not wired. Dehecq 2020 pipeline exists as the
+    reference; preprocess/reseau.py::process_kh9_reseau is already in-
+    repo. When a MC scene arrives, extend process.py dispatch and route
+    this profile through a frame-camera cam_gen + BA path instead of
+    the KH-4/KH-9 PC panoramic codepath.

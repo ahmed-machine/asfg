@@ -3,6 +3,7 @@
 import copy
 import multiprocessing as mp
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -43,7 +44,7 @@ from .coarse import detect_offset_at_resolution
 from .scale import (detect_scale_rotation, detect_local_scales,
                     apply_scale_rotation_precorrection, apply_local_scale_precorrection)
 from .anchors import locate_anchors
-from .matching import match_with_roma
+from .matching import match_with_roma, match_with_matchanything
 from .filtering import (matched_pairs_sufficient, refine_matches_phase_correlation,
                         correct_reference_offset, select_best_gcps,
                         iterative_outlier_removal,
@@ -295,6 +296,73 @@ def _ensure_overviews(path, width, height):
         print(f"  Overviews built for {os.path.basename(path)}")
 
 
+_YEAR_RE = re.compile(r"(?:^|[^\d])(19\d{2}|20\d{2})(?:\D|$)")
+
+# References whose filenames don't carry a 4-digit acquisition year are
+# nevertheless modern composites; treat them as recent-year for era-gap
+# computation so cross-temporal corrections (reclamation mask + grid-
+# weight downweight) actually fire on KH-4 / KH-7 / KH-9 vs these refs.
+# Heuristic only — adding new refs takes one entry. Year picked at the
+# midpoint of typical Sentinel-2 / ESRI World Imagery vintages.
+_MODERN_REF_HINTS = {
+    "esri": 2023,
+    "worldimagery": 2023,
+    "sentinel2": 2023,
+    "sentinel-2": 2023,
+    "s2_": 2023,
+    "naip": 2022,
+    "planetscope": 2024,
+}
+
+
+def _infer_era_gap_years(args, priors, reference_path: str) -> float | None:
+    """Best-effort year-gap between source and reference acquisition.
+
+    Precedence:
+      1. explicit ``args.era_gap_years``
+      2. priors' ``acquisition_date`` (4-digit year) AND a reference year
+         (filename year OR modern-composite hint, see ``_MODERN_REF_HINTS``)
+      3. ``None``
+
+    Returns the absolute year gap (float). The QA scorer engages cross-
+    temporal corrections when the gap is positive; for short gaps (<5 yr)
+    the gap has zero effect.
+    """
+    explicit = getattr(args, "era_gap_years", None)
+    if explicit is not None:
+        try:
+            return float(explicit)
+        except (TypeError, ValueError):
+            pass
+
+    src_year = None
+    for prior in priors or []:
+        attrs = getattr(prior, "attributes", None) or {}
+        date_str = attrs.get("acquisition_date")
+        if not date_str:
+            continue
+        m = re.search(r"(\d{4})", str(date_str))
+        if m:
+            src_year = int(m.group(1))
+            break
+
+    ref_year = None
+    if reference_path:
+        ref_basename_lower = os.path.basename(reference_path).lower()
+        m = _YEAR_RE.search(os.path.basename(reference_path))
+        if m:
+            ref_year = int(m.group(1))
+        else:
+            for hint, year in _MODERN_REF_HINTS.items():
+                if hint in ref_basename_lower:
+                    ref_year = year
+                    break
+
+    if src_year is None or ref_year is None:
+        return None
+    return float(abs(src_year - ref_year))
+
+
 def step_setup(args) -> AlignState:
     """Parse args, inspect datasets, and load priors."""
     if args.output is None:
@@ -431,7 +499,10 @@ def step_setup(args) -> AlignState:
         diagnostics_dir=getattr(args, 'diagnostics_dir', None),
         allow_abstain=bool(getattr(args, 'allow_abstain', False)),
         tps_fallback=bool(getattr(args, 'tps_fallback', False)),
+        era_gap_years=_infer_era_gap_years(args, priors, args.reference),
     )
+    if state.era_gap_years is not None:
+        print(f"  Era gap (source vs reference): {state.era_gap_years:.0f} yr")
     if rough_georef_tmp is not None:
         state.temp_paths.append(rough_georef_tmp)
     return state
@@ -2047,6 +2118,7 @@ def _fallback_to_ncc_matching(state: AlignState, src_ref, src_offset, neural_res
 
 _DENSE_MATCHERS = {
     "roma": match_with_roma,
+    "matchanything": match_with_matchanything,
 }
 
 
@@ -2704,6 +2776,7 @@ def _evaluate_candidate_image_quality(candidate: _WarpCandidate, state: AlignSta
                 state.work_crs,
                 eval_res=qa_eval_res,
                 mask_mode=state.mask_provider,
+                era_gap_years=state.era_gap_years,
             )
             if candidate.image_metrics is not None:
                 print(f"  {candidate.name.capitalize()} warp QA: "
@@ -2713,7 +2786,8 @@ def _evaluate_candidate_image_quality(candidate: _WarpCandidate, state: AlignSta
 
 
 def _build_candidate_qa_report(candidate: _WarpCandidate, state: AlignState,
-                               qa_eval_res: float) -> None:
+                               qa_eval_res: float,
+                               affine_post_warp_metrics: dict | None = None) -> None:
     """Build the independent holdout QA report for a candidate that produced output."""
     if not candidate.produced or not os.path.exists(candidate.output_path):
         return
@@ -2730,6 +2804,8 @@ def _build_candidate_qa_report(candidate: _WarpCandidate, state: AlignState,
         hypothesis_id=state.chosen_hypothesis.hypothesis_id if state.chosen_hypothesis else "",
         eval_res=qa_eval_res,
         image_metrics=candidate.image_metrics,
+        affine_post_warp_metrics=affine_post_warp_metrics,
+        era_gap_years=state.era_gap_years,
     )
     print(
         f"  {candidate.name.capitalize()} independent QA: "
@@ -2807,10 +2883,39 @@ def _should_abstain(state: AlignState, selected: _WarpCandidate | None) -> bool:
 
 def _abstain_and_cleanup(state: AlignState) -> None:
     state.abstained = True
-    if state.precorrection_tmp and os.path.exists(state.precorrection_tmp):
+    if (state.precorrection_tmp and os.path.exists(state.precorrection_tmp)
+            and not state.keep_temp_paths):
         os.remove(state.precorrection_tmp)
     if os.path.exists(state.output_path):
-        os.remove(state.output_path)
+        # Preserve the alignment artifact for inspection rather than
+        # delete it. Cross-temporal cases (long era gaps) routinely
+        # produce geometrically-sound alignments (low patch_med) that
+        # nonetheless fail the QA score threshold and abstain; keeping
+        # the warp under a ``_aligned_rejected.tif`` name lets the user
+        # inspect manually while qa.json's ``accepted: false`` keeps
+        # automated downstream stages (mosaic glob = ``*_aligned.tif``)
+        # filtered.
+        rejected_path = (
+            state.output_path[: -len("_aligned.tif")] + "_aligned_rejected.tif"
+            if state.output_path.endswith("_aligned.tif")
+            else state.output_path + ".rejected"
+        )
+        try:
+            if os.path.exists(rejected_path):
+                os.remove(rejected_path)
+            os.rename(state.output_path, rejected_path)
+            print(
+                f"  Abstained — preserved warp as {os.path.basename(rejected_path)} "
+                f"(qa.json marks accepted=False)",
+                flush=True,
+            )
+        except OSError as e:
+            print(f"  Could not rename abstained output ({e}); removing instead",
+                  flush=True)
+            try:
+                os.remove(state.output_path)
+            except OSError:
+                pass
     print("\nAlignment abstained: independent QA marked this result as low confidence.")
 
 
@@ -2828,22 +2933,64 @@ def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
           f"+ {len(state.boundary_gcps)} boundary = {len(all_gcps)} total)", flush=True)
     _release_model_cache(state)
 
+    # Build the grid candidate first and write a provisional qa.json from
+    # it BEFORE running the affine baseline. Reason: gdal.Warp on huge
+    # panoramic overlap regions (e.g. KH-4B Bahrain DA025/26 with
+    # 105 × 56 km overlaps → ~58k × 31k px per band) has been observed
+    # to terminate the python process abruptly during the affine baseline
+    # — a C-level segfault or kernel OOM-kill that no Python try/except
+    # can catch (memory/machine_crash_2026_04_21.md tracks similar OOM
+    # patterns). If we don't write qa.json from grid first, the alignment
+    # artifact lands on disk but downstream idempotency / strip-manifest
+    # retry logic can't tell that the frame succeeded — DA026's
+    # extrapolation pass never gets to fire.
     candidates: list[_WarpCandidate] = [
         _apply_grid_warp(state, all_gcps, output_crs, _p),
-        _apply_affine_warp(state, all_gcps, output_crs, _p),
     ]
+    _evaluate_candidate_image_quality(candidates[0], state, qa_eval_res, _p)
+    _build_candidate_qa_report(candidates[0], state, qa_eval_res,
+                               affine_post_warp_metrics=None)
+    if candidates[0].report is not None:
+        state.qa_reports = [candidates[0].report]
+        _write_qa_report_to_disk(state, candidates[0].name)
+        print(
+            f"  Provisional QA written from grid candidate "
+            f"(score={candidates[0].report.total_score:.1f}, "
+            f"accepted={candidates[0].report.accepted}); "
+            f"will re-write after affine baseline completes",
+            flush=True,
+        )
+
+    # Now run the riskier affine + (optional) TPS candidates. A process-
+    # level crash here (segfault/OOM) leaves the provisional qa.json on
+    # disk so the strip-manifest retry path stays unblocked.
+    candidates.append(_apply_affine_warp(state, all_gcps, output_crs, _p))
     if state.tps_fallback:
         candidates.append(_apply_tps_warp(state, all_gcps, output_crs, _p))
 
-    for candidate in candidates:
+    # Image-quality eval for the new candidates only (grid already done).
+    for candidate in candidates[1:]:
         _evaluate_candidate_image_quality(candidate, state, qa_eval_res, _p)
 
     state.qa_reports = []
     with _p.section("qa_report"):
-        for candidate in candidates:
-            _build_candidate_qa_report(candidate, state, qa_eval_res)
+        # Build the affine candidate first so its image-space holdout
+        # post-warp metrics can serve as the regression baseline for the
+        # other candidates (apples-to-apples; M_geo coord-space prediction
+        # has a cross-temporal content-drift floor unrelated to warp quality).
+        ordered = sorted(candidates, key=lambda c: 0 if c.name == "affine" else 1)
+        affine_post_warp_metrics: dict | None = None
+        for candidate in ordered:
+            _build_candidate_qa_report(
+                candidate, state, qa_eval_res,
+                affine_post_warp_metrics=affine_post_warp_metrics,
+            )
             if candidate.report is not None:
                 state.qa_reports.append(candidate.report)
+                if candidate.name == "affine" and affine_post_warp_metrics is None:
+                    pw = (candidate.report.holdout_metrics or {}).get("post_warp")
+                    if isinstance(pw, dict) and pw:
+                        affine_post_warp_metrics = pw
 
     selected = _rank_warp_candidates(candidates)
     selected_name = _promote_selected_candidate(state, selected, candidates)
@@ -2853,7 +3000,8 @@ def step_select_warp_and_apply(state: AlignState, profiler=None) -> AlignState:
         _abstain_and_cleanup(state)
         return state
 
-    if state.precorrection_tmp and os.path.exists(state.precorrection_tmp):
+    if (state.precorrection_tmp and os.path.exists(state.precorrection_tmp)
+            and not state.keep_temp_paths):
         os.remove(state.precorrection_tmp)
     print(f"\nAligned image written to: {state.output_path}")
     return state
@@ -2872,14 +3020,103 @@ def step_post_refinement(state: AlignState) -> None:
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
+_PHASES_DONE_BY_CHECKPOINT = {
+    None: set(),
+    "post_setup": {"setup", "global_localization"},
+    "post_coarse": {"setup", "global_localization", "coarse_offset"},
+    "post_scale_rotation": {
+        "setup", "global_localization", "coarse_offset",
+        "orthorectify", "handle_large_offset", "scale_rotation",
+    },
+    "post_match": {
+        "setup", "global_localization", "coarse_offset",
+        "orthorectify", "handle_large_offset", "scale_rotation",
+        "feature_matching",
+    },
+    "post_validate": {
+        "setup", "global_localization", "coarse_offset",
+        "orthorectify", "handle_large_offset", "scale_rotation",
+        "feature_matching", "validate_and_filter",
+    },
+}
+
+
 def run(args, model_cache=None, profile=True) -> str:
     """Main pipeline orchestrator.  Returns output path."""
     pipeline_t0 = time.time()
     state = None
     profiler = PipelineProfiler() if profile else _NullProfiler()
 
-    with profiler.section("setup"):
-        state = step_setup(args)
+    # Activate the per-job camera profile so QA acceptance thresholds
+    # (and other profile-derived params) match the scene. Strip-manifest
+    # jobs flow profile through args.profile here; auto-align.py's CLI
+    # path activates the profile earlier at module-import time.
+    job_profile = getattr(args, "profile", None)
+    if job_profile:
+        from .params import set_profile as _set_profile
+        _set_profile(job_profile)
+
+    resume_from = getattr(args, "resume_from_checkpoint", None) or None
+    if resume_from not in _PHASES_DONE_BY_CHECKPOINT:
+        valid = sorted(k for k in _PHASES_DONE_BY_CHECKPOINT if k)
+        raise ValueError(
+            f"Unknown --resume-from-checkpoint={resume_from!r}; valid: {valid}")
+    skip = _PHASES_DONE_BY_CHECKPOINT[resume_from]
+    keep_temp = bool(getattr(args, "keep_temp_paths", False))
+
+    if resume_from:
+        diag_dir = getattr(args, "diagnostics_dir", None)
+        if not diag_dir:
+            raise ValueError(
+                "--resume-from-checkpoint requires --diagnostics-dir")
+        from .checkpoint import load_checkpoint
+        ckpt_dir = os.path.join(diag_dir, "checkpoints")
+        with profiler.section(f"resume_load_{resume_from}"):
+            state = load_checkpoint(resume_from, ckpt_dir)
+        # Re-bind args-derived fields the checkpoint may not carry / may stale.
+        # Without these, an iteration would silently use the values frozen in
+        # the original run (e.g. tps_fallback=False, even when --tps-fallback
+        # is passed). Override for everything downstream phases actually read.
+        state.diagnostics_dir = diag_dir
+        out = getattr(args, "output", None)
+        if out:
+            state.output_path = out
+        qa = getattr(args, "qa_json", None)
+        if qa:
+            state.qa_json_path = qa
+        state.keep_temp_paths = keep_temp
+        # Args-derived behavior flags affecting the resumed phases
+        for field_name, default in [
+            ("tps_fallback", False),
+            ("allow_abstain", False),
+            ("yes", True),
+            ("best", state.best),
+            ("tin_tarr_thresh", state.tin_tarr_thresh),
+            ("skip_fpp", state.skip_fpp),
+            ("matcher_anchor", state.matcher_anchor),
+            ("matcher_dense", state.matcher_dense),
+            ("grid_size", state.grid_size),
+            ("grid_iters", state.grid_iters),
+            ("global_search", state.global_search),
+            ("global_search_res", state.global_search_res),
+            ("global_search_top_k", state.global_search_top_k),
+            ("force_global", state.force_global),
+        ]:
+            v = getattr(args, field_name, None)
+            if v is not None:
+                setattr(state, field_name, v)
+        # arap_weight: None on args means "use whatever's on state"; otherwise override
+        arap = getattr(args, "arap_weight", None)
+        if arap is not None:
+            state.arap_weight = float(arap)
+        print(f"  [Resume] Loaded checkpoint {resume_from}; "
+              f"will skip phases {sorted(skip)}; "
+              f"tps_fallback={state.tps_fallback} "
+              f"allow_abstain={state.allow_abstain}", flush=True)
+    else:
+        with profiler.section("setup"):
+            state = step_setup(args)
+        state.keep_temp_paths = keep_temp
 
     # Attach or create model cache
     if model_cache is not None:
@@ -2890,26 +3127,33 @@ def run(args, model_cache=None, profile=True) -> str:
         state.model_cache = ModelCache(device)
 
     try:
-        with profiler.section("global_localization"):
-            state = step_global_localization(state, args)
-        if state.diagnostics_dir:
-            save_checkpoint(state, "post_setup",
-                            os.path.join(state.diagnostics_dir, "checkpoints"))
-        with profiler.section("coarse_offset"):
-            state = step_coarse_offset(state, profiler=profiler)
+        if "global_localization" not in skip:
+            with profiler.section("global_localization"):
+                state = step_global_localization(state, args)
+            if state.diagnostics_dir:
+                save_checkpoint(state, "post_setup",
+                                os.path.join(state.diagnostics_dir, "checkpoints"))
+        if "coarse_offset" not in skip:
+            with profiler.section("coarse_offset"):
+                state = step_coarse_offset(state, profiler=profiler)
         if state.abstained:
             print("\nNo output retained because the run abstained on coarse offset grounds.")
         else:
-            with profiler.section("orthorectify"):
-                state = step_orthorectify(state)
-            with profiler.section("handle_large_offset"):
-                state = step_handle_large_offset(state, args)
-            with profiler.section("scale_rotation"):
-                state = step_scale_rotation(state, args, profiler=profiler)
-            with profiler.section("feature_matching"):
-                state = step_feature_matching(state, args, profiler=profiler)
-            with profiler.section("validate_and_filter"):
-                state = step_validate_and_filter(state)
+            if "orthorectify" not in skip:
+                with profiler.section("orthorectify"):
+                    state = step_orthorectify(state)
+            if "handle_large_offset" not in skip:
+                with profiler.section("handle_large_offset"):
+                    state = step_handle_large_offset(state, args)
+            if "scale_rotation" not in skip:
+                with profiler.section("scale_rotation"):
+                    state = step_scale_rotation(state, args, profiler=profiler)
+            if "feature_matching" not in skip:
+                with profiler.section("feature_matching"):
+                    state = step_feature_matching(state, args, profiler=profiler)
+            if "validate_and_filter" not in skip:
+                with profiler.section("validate_and_filter"):
+                    state = step_validate_and_filter(state)
             with profiler.section("select_warp_and_apply"):
                 state = step_select_warp_and_apply(state, profiler=profiler)
             with profiler.section("post_refinement"):
@@ -2925,7 +3169,7 @@ def run(args, model_cache=None, profile=True) -> str:
         # Only close if we created the cache (not passed in)
         if model_cache is None and state is not None and state.model_cache is not None:
             state.model_cache.close()
-        if state is not None:
+        if state is not None and not state.keep_temp_paths:
             for temp_path in state.temp_paths:
                 if temp_path and os.path.exists(temp_path):
                     try:

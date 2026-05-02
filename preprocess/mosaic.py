@@ -1,11 +1,46 @@
 """Final mosaic assembly of aligned outputs."""
 
 import os
+import json
 import subprocess
 import tempfile
 from collections import defaultdict
 
 from . import run_gdal_cmd as _run_cmd
+
+
+class MosaicIncoherentError(RuntimeError):
+    """Raised when pairwise mosaic shifts exceed the coherence bound."""
+
+    def __init__(self, status: dict):
+        self.status = status
+        super().__init__(status.get("message", "mosaic incoherent"))
+
+
+def _mosaic_pair_shift_bound_m() -> float:
+    try:
+        return float(os.environ.get("DECLASS_MOSAIC_MAX_PAIR_SHIFT_M", "1000"))
+    except (TypeError, ValueError):
+        return 1000.0
+
+
+def _mosaic_status_path(output_path: str) -> str:
+    root, ext = os.path.splitext(output_path)
+    return f"{root}_status.json" if ext else f"{output_path}_status.json"
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _write_mosaic_status(output_path: str, status: dict) -> str:
+    path = _mosaic_status_path(output_path)
+    _ensure_parent_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(status, f, indent=2, sort_keys=True)
+    return path
 
 
 def _resample_to_common_grid(paths, tmp_dir):
@@ -245,11 +280,27 @@ def _compute_pairwise_corrections(paths):
 
         # Sanity check: reject shifts > 1km — strips are already georeferenced,
         # so inter-strip corrections should be at most a few hundred meters.
-        max_shift = 1000.0  # meters in EPSG:3857
-        if abs(dx_geo) > max_shift or abs(dy_geo) > max_shift:
-            print(f"    Pair {pair_idx}: {n_inliers} inliers, shift=({dx_geo:.2f}, {dy_geo:.2f}) REJECTED (>{max_shift}m)")
-            pairwise_shifts.append(None)
-            continue
+        max_shift = _mosaic_pair_shift_bound_m()
+        shift_mag = float(np.hypot(dx_geo, dy_geo))
+        if abs(dx_geo) > max_shift or abs(dy_geo) > max_shift or shift_mag > max_shift:
+            status = {
+                "mosaic_status": "incoherent",
+                "message": "pairwise shift exceeds post-alignment bound",
+                "pair_idx": int(pair_idx),
+                "strip_a": os.path.basename(sa["path"]),
+                "strip_b": os.path.basename(sb["path"]),
+                "inliers": int(n_inliers),
+                "rejected_pair_shift": {
+                    "dx_m": float(dx_geo),
+                    "dy_m": float(dy_geo),
+                    "magnitude_m": shift_mag,
+                },
+                "max_pair_shift_m": float(max_shift),
+            }
+            print(f"    Pair {pair_idx}: {n_inliers} inliers, "
+                  f"shift=({dx_geo:.2f}, {dy_geo:.2f}) REJECTED "
+                  f"(>{max_shift}m)")
+            raise MosaicIncoherentError(status)
 
         print(f"    Pair {pair_idx}: {n_inliers} inliers, shift=({dx_geo:.2f}, {dy_geo:.2f}) geo units")
         pairwise_shifts.append((dx_geo, dy_geo))
@@ -1474,6 +1525,16 @@ def build_mosaic(aligned_paths: list, output_path: str, feather_margin: int = 50
     if os.path.exists(output_path):
         print(f"  [skip] Mosaic already exists: {output_path}")
         return output_path
+    status_path = _mosaic_status_path(output_path)
+    if os.path.exists(status_path):
+        try:
+            with open(status_path, "r", encoding="utf-8") as f:
+                previous_status = json.load(f)
+            if previous_status.get("mosaic_status") == "incoherent":
+                print(f"  [skip] Mosaic previously marked incoherent: {status_path}")
+                return None
+        except Exception:
+            pass
 
     if not aligned_paths:
         print(f"  WARNING: No aligned files to mosaic")
@@ -1481,12 +1542,17 @@ def build_mosaic(aligned_paths: list, output_path: str, feather_margin: int = 50
 
     if len(aligned_paths) == 1:
         import shutil
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        _ensure_parent_dir(output_path)
         shutil.copy2(aligned_paths[0], output_path)
+        _write_mosaic_status(output_path, {
+            "mosaic_status": "ok",
+            "output_path": os.path.abspath(output_path),
+            "inputs": [os.path.abspath(aligned_paths[0])],
+        })
         print(f"  Single file mosaic: {output_path}")
         return output_path
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    _ensure_parent_dir(output_path)
 
     tmp_dir = os.path.join(os.path.dirname(output_path), "_mosaic_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
@@ -1537,12 +1603,32 @@ def build_mosaic(aligned_paths: list, output_path: str, feather_margin: int = 50
 
                 accumulator = step_output
 
+    except MosaicIncoherentError as exc:
+        status = dict(exc.status)
+        status.update({
+            "output_path": os.path.abspath(output_path),
+            "inputs": [os.path.abspath(p) for p in sorted_paths],
+        })
+        _write_mosaic_status(output_path, status)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        shift = status.get("rejected_pair_shift") or {}
+        print(
+            "  Mosaic skipped: incoherent pair shift "
+            f"dx={shift.get('dx_m', '?')}m dy={shift.get('dy_m', '?')}m"
+        )
+        return None
     finally:
         # Clean up temp directory
         import shutil
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    _write_mosaic_status(output_path, {
+        "mosaic_status": "ok",
+        "output_path": os.path.abspath(output_path),
+        "inputs": [os.path.abspath(p) for p in sorted_paths],
+    })
     print(f"  Mosaic complete: {output_path} ({len(aligned_paths)} inputs)")
     return output_path
 

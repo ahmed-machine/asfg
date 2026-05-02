@@ -1,0 +1,22 @@
+# KH-4B 1968 Bahrain — central four frames only (DA023-DA026).
+# Bypasses the bbox-based scene selector via explicit entity_ids so
+# DA022 / DA027 / DA028 (which only clip the bbox edges and add hours
+# of mapproject time without touching Bahrain proper) are not pulled
+# in. Use this for fast iteration on the alignment phase.
+name: bahrain_kh4b_1968_central
+boundary: data/bahrain_boundary.geojson
+# Era-matched reference (1976 KH-9 panchromatic vs 1968 KH-4B; ~8 yr gap)
+# gives stronger cross-temporal NCC signals than ESRI WorldImagery
+# (modern, RGB) on shallow-shoreline / mudflat terrain. v23's DA023
+# sidecar already validated against this reference (dx=+29.6km,
+# dy=+3.6km, agreement=0.50). v24/v26 used ESRI and got dispersed
+# matches that abstained at coarse stage.
+reference_name: kh9_dzb1212
+catalogs:
+  - data/available/corona2_69b17d89ee62ff28.csv
+prefer_camera: A
+entity_ids:
+  - DS1104-1057DA023
+  - DS1104-1057DA024
+  - DS1104-1057DA025
+  - DS1104-1057DA026

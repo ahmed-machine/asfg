@@ -1,4 +1,4 @@
-"""Dense feature matching: RoMa tiled."""
+"""Dense feature matching: RoMa tiled (default), MatchAnything-ELoFTR (cross-modal fallback)."""
 
 import os
 import numpy as np
@@ -101,6 +101,13 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
         max_matches = max(max_matches, 12000)
         max_tiles = max(max_tiles, 650)
 
+    if str(device).split(":", 1)[0].lower() == "cpu":
+        max_cpu_pixels = int(os.environ.get("DECLASS_CPU_ROMA_MAX_PIXELS", "120000000"))
+        if int(arr_ref.size) > max_cpu_pixels:
+            max_tiles = min(max_tiles, int(os.environ.get("DECLASS_CPU_ROMA_MAX_TILES", "48")))
+            max_matches = min(max_matches, int(os.environ.get("DECLASS_CPU_ROMA_MAX_MATCHES", "2000")))
+            batch_size = min(batch_size, 1)
+
     tile_size = _C.ROMA_TILE_SIZE
     overlap_px = _C.ROMA_TILE_OVERLAP
     step = tile_size - overlap_px
@@ -134,28 +141,6 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
                 continue
 
             # c is post-sigmoid overlap; satast clamps >0.05 to 1.0
-            
-            # --- SSD EXTRACTION HOOK ---
-            # If the environment variable SSD_EXTRACT_DIR is set, dump the raw un-thresholded 
-            # neural correspondences to disk for Simple Self-Distillation training.
-            ssd_dir = os.environ.get("SSD_EXTRACT_DIR", None)
-            if ssd_dir:
-                import torch
-                os.makedirs(ssd_dir, exist_ok=True)
-                ext_id = os.environ.get("SSD_EXTRACT_ID", "default")
-                tile_idx = it.get('tile_idx', 0)
-                pt_path = os.path.join(ssd_dir, f"roma_raw_{ext_id}_{tile_idx}.pt")
-                torch.save({
-                    'm': m, 
-                    'c': c, 
-                    'prec_trace': prec_trace,
-                    'tile_meta': {
-                        'r0': it['r0'], 'c0': it['c0'], 
-                        'h': it['ref'].shape[0], 'w': it['ref'].shape[1]
-                    }
-                }, pt_path)
-            # ---------------------------
-
             mask = c > 0.55
             m = m[mask]
             c = c[mask]
@@ -408,15 +393,20 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
         all_matches = kept
 
     # Sub-cell spatial distribution quota: inside each 2km cell, group matches
-    # by 500m sub-cell (4x4 grid) and keep only the top-2 highest-confidence
-    # matches per sub-cell. This trades raw match count for spatial uniformity
-    # and quality, so low-confidence regions still get sampled while the global
-    # total stays small enough that downstream GCP selection gets better picks.
+    # by 500m sub-cell (4x4 grid) and keep the top-N highest-confidence matches
+    # per sub-cell. Then run a coverage-floor pass that restores cap-discarded
+    # matches in any 2km cell that ended up below ``per_cell_floor`` so the
+    # warp gets fairer GCP support in low-density regions (e.g. east/west
+    # extremes of KH-4 strips).
     if len(all_matches) > 100:
         cell_m = _C.MATCH_QUOTA_GRID_M
         sub_n = 4  # 4x4 sub-cells per 2km cell (500m each)
         sub_m = cell_m / sub_n
-        per_subcell_cap = 2  # top-N per sub-cell; fewer, higher-quality matches
+        # Per-cell budget from profile; per-subcell cap derives from it so a
+        # cell with one active sub-cell can still keep ~quarter of its quota.
+        per_cell_quota = max(8, int(getattr(_C, "MATCH_QUOTA_PER_CELL", 30)))
+        per_subcell_cap = max(2, per_cell_quota // sub_n)
+        per_cell_floor = max(6, per_cell_quota // 4)
 
         cell_buckets: dict[tuple[int, int], list] = {}
         for m in all_matches:
@@ -425,8 +415,8 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
 
         quota_kept = []
         n_capped = 0
+        n_floor_rescued = 0
         for cell_matches in cell_buckets.values():
-            # Group by sub-cell, then keep top-N by confidence inside each.
             sub_groups: dict[tuple[int, int], list] = {}
             for m in cell_matches:
                 sx = int(m.ref_x / sub_m) % sub_n
@@ -434,17 +424,30 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
                 sub_groups.setdefault((sx, sy), []).append(m)
 
             selected = []
+            leftovers = []
             for group in sub_groups.values():
                 group.sort(key=lambda mm: -mm.confidence)
                 selected.extend(group[:per_subcell_cap])
+                leftovers.extend(group[per_subcell_cap:])
+
+            # Coverage floor: if this 2km cell ended up below the floor and
+            # we still have leftovers (RoMa found more matches than the cap
+            # allowed), restore the highest-confidence ones up to the floor.
+            if len(selected) < per_cell_floor and leftovers:
+                leftovers.sort(key=lambda mm: -mm.confidence)
+                need = per_cell_floor - len(selected)
+                rescue = leftovers[:need]
+                selected.extend(rescue)
+                n_floor_rescued += len(rescue)
 
             if len(cell_matches) > len(selected):
                 n_capped += 1
             quota_kept.extend(selected)
 
-        if n_capped > 0:
+        if n_capped > 0 or n_floor_rescued > 0:
             print(f"    Sub-cell quota: {len(all_matches)} -> {len(quota_kept)} "
-                  f"({n_capped} cells capped, {sub_n}x{sub_n} sub-cells × top-{per_subcell_cap})")
+                  f"({n_capped} cells capped, floor={per_cell_floor} rescued {n_floor_rescued}; "
+                  f"sub-cell cap={per_subcell_cap}, cell quota={per_cell_quota})")
         all_matches = quota_kept
 
     if not skip_ransac and len(all_matches) >= 6:
@@ -490,5 +493,215 @@ def _tiled_matcher_core(model, model_type, arr_ref, arr_off_shifted, ref_transfo
             print(f"    Stability reweight: penalized {n_pen}/{len(all_matches)} "
                   f"(one-land={n_one_land}, neither-land={n_neither_land})")
         all_matches = reweighted
+
+    return all_matches
+
+
+# ---------------------------------------------------------------------------
+# Cross-modal matcher: MatchAnything-ELoFTR
+# ---------------------------------------------------------------------------
+#
+# RoMa is dense and fast but trained primarily on RGB-RGB pairs. On panchromatic
+# 1968 KH-4B vs modern RGB or panchromatic-modern references, RoMa's tile-level
+# matching can yield 0 RANSAC survivors (e2e_v39 / v40 confirmed for DA025/26
+# even with the panchromatic ESRI fallback — neighbor-frame matching also
+# fails because along-track frame overlap is only ~15 km).
+#
+# MatchAnything (Xu et al., CVPR 2024 — "Universal Cross-Modality Image
+# Matching with Large-Scale Pre-Training") is an EfficientLoFTR variant
+# fine-tuned on multi-modal pairs: optical/SAR, optical/thermal, optical/
+# medical, and historical-vs-modern image pairs. The HuggingFace checkpoint
+# `zju-community/matchanything_eloftr` is already in the codebase as
+# ``ModelCache.eloftr`` (used today only for scale detection and coarse-
+# offset estimation). This function exposes it as a full dense matcher
+# usable via ``--matcher-dense matchanything``.
+#
+# When to prefer MatchAnything over RoMa:
+#   - Cross-temporal pairs > 20 yr where the imagery has changed substantially
+#     (urbanization, reclamation, vegetation shifts).
+#   - Cross-modal pairs (panchromatic film vs modern RGB; SAR; thermal).
+#   - When RoMa's tile-level match counts collapse below RANSAC viability
+#     (< 50 survivors per tile across the overlap).
+#
+# When NOT to prefer:
+#   - Era-matched same-modality pairs (e.g. KH-4B 1968 vs KH-9 1976
+#     panchromatic). RoMa is faster and produces denser matches.
+
+def match_with_matchanything(arr_ref, arr_off_shifted, ref_transform, off_transform,
+                             shift_px_x, shift_py_y, neural_res=4.0,
+                             min_valid_frac=_C.LAND_MASK_FRAC_MIN,
+                             skip_ransac=False, model_cache=None,
+                             batch_size=4, max_matches=8000, max_tiles=400,
+                             existing_anchors=None,
+                             src_offset=None, work_crs=None,
+                             mask_mode="coastal_obia",
+                             tile_px: int = 800, conf_min: float = 0.20):
+    """Dense cross-modal matching via MatchAnything-ELoFTR.
+
+    Same signature as ``match_with_roma`` so the dispatch in
+    ``_DENSE_MATCHERS`` can use either interchangeably.  Tile-streamed at
+    ``tile_px`` (default 800) with 50% overlap.  Returns a list of
+    ``MatchPair`` in world coordinates; downstream
+    ``_filter_matches_geographic_ransac`` and ``local_consistency_filter``
+    handle the dispersion-based rejection that ``_tiled_matcher_core``
+    does internally for RoMa.
+    """
+    if model_cache is None:
+        return []
+
+    # Lazily resolve the wrapper — this triggers HF model load on first call
+    eloftr = model_cache.eloftr
+    device = model_cache.device
+
+    from .params import get_params
+    norm_p = get_params().normalization
+    if norm_p.wallis_matching:
+        arr_off_shifted = wallis_match(arr_off_shifted, arr_ref)
+    ref_u8 = clahe_normalize(arr_ref)
+    off_u8 = clahe_normalize(arr_off_shifted)
+
+    h, w = ref_u8.shape
+    if h < 64 or w < 64:
+        return []
+
+    # Build tiles. For canvases that fit a single tile, do a single pass.
+    if h <= tile_px and w <= tile_px:
+        tiles = [{"ref": ref_u8, "off": off_u8, "r0": 0, "c0": 0,
+                  "tile_idx": 0}]
+    else:
+        stride = max(1, tile_px // 2)
+        rows = list(range(0, max(1, h - tile_px) + 1, stride))
+        cols = list(range(0, max(1, w - tile_px) + 1, stride))
+        if rows[-1] + tile_px < h:
+            rows.append(h - tile_px)
+        if cols[-1] + tile_px < w:
+            cols.append(w - tile_px)
+        tiles = []
+        idx = 0
+        for r0 in rows:
+            for c0 in cols:
+                ref_p = ref_u8[r0:r0 + tile_px, c0:c0 + tile_px]
+                off_p = off_u8[r0:r0 + tile_px, c0:c0 + tile_px]
+                # Skip tiles dominated by no-data on either side
+                if (np.mean(ref_p > 0) < min_valid_frac
+                        or np.mean(off_p > 0) < min_valid_frac):
+                    continue
+                tiles.append({"ref": ref_p, "off": off_p,
+                              "r0": r0, "c0": c0, "tile_idx": idx})
+                idx += 1
+                if len(tiles) >= max_tiles:
+                    break
+            if len(tiles) >= max_tiles:
+                break
+
+    if not tiles:
+        print("    [matchanything] no tiles passed content check")
+        return []
+
+    print(f"    [matchanything] {len(tiles)} tiles @ {tile_px}px "
+          f"(target conf_min={conf_min})")
+
+    # Reuse the scale-detection batched runner — it handles MPS OOM retry
+    # and coordinate alignment to the wrapper's pixel-space output.
+    from .scale import _run_eloftr_batch
+    try:
+        batch_results = _run_eloftr_batch(
+            tiles, eloftr, device, batch_size=batch_size,
+        )
+    except Exception as exc:
+        print(f"    [matchanything] inference failed ({exc}); returning empty")
+        return []
+
+    ref_valid = (arr_ref > 0)
+    off_valid = (arr_off_shifted > 0)
+
+    all_matches: list[MatchPair] = []
+    n_tiles_with_matches = 0
+    for tile, result in zip(tiles, batch_results):
+        if result is None:
+            continue
+        kp_ref, kp_off, conf = result
+        if kp_ref is None or len(kp_ref) == 0:
+            continue
+        # Filter by per-keypoint confidence — retains MatchAnything's strong
+        # high-confidence pairs while shedding low-conf coarse leftovers.
+        mask = conf > conf_min
+        if mask.sum() == 0:
+            continue
+        n_tiles_with_matches += 1
+        kp_ref = kp_ref[mask]
+        kp_off = kp_off[mask]
+        conf_kept = conf[mask]
+        offset = np.array([tile["c0"], tile["r0"]], dtype=np.float32)
+        kp_ref_global = kp_ref + offset
+        kp_off_global = kp_off + offset
+
+        for k in range(len(kp_ref_global)):
+            ref_c, ref_r = kp_ref_global[k]
+            off_c, off_r = kp_off_global[k]
+            ref_ri = int(round(ref_r))
+            ref_ci = int(round(ref_c))
+            off_ri = int(round(off_r))
+            off_ci = int(round(off_c))
+            if not (0 <= ref_ri < h and 0 <= ref_ci < w
+                    and ref_valid[ref_ri, ref_ci]):
+                continue
+            if not (0 <= off_ri < h and 0 <= off_ci < w
+                    and off_valid[off_ri, off_ci]):
+                continue
+            ref_gx, ref_gy = rasterio.transform.xy(
+                ref_transform, float(ref_r), float(ref_c))
+            off_gx, off_gy = rasterio.transform.xy(
+                off_transform, float(off_r) + shift_py_y,
+                float(off_c) + shift_px_x)
+            all_matches.append(MatchPair(
+                ref_x=float(ref_gx), ref_y=float(ref_gy),
+                off_x=float(off_gx), off_y=float(off_gy),
+                confidence=float(conf_kept[k]),
+                name=f"matchanything_{tile['tile_idx']}_{k}",
+                precision=1.0))
+
+        # Cap total to avoid pathological tile counts blowing up downstream
+        if len(all_matches) >= max_matches:
+            break
+
+    print(f"    [matchanything] {len(all_matches)} matches from "
+          f"{n_tiles_with_matches}/{len(tiles)} productive tiles")
+
+    # Light spatial dedup so dense-tile-overlap doesn't oversample one region.
+    # Bin to ``neural_res * 4`` metres in world coords; keep highest-conf per bin.
+    if len(all_matches) > 0:
+        bin_m = max(neural_res * 4.0, 25.0)
+        seen: dict[tuple[int, int], MatchPair] = {}
+        for m in all_matches:
+            key = (int(m.ref_x / bin_m), int(m.ref_y / bin_m))
+            kept = seen.get(key)
+            if kept is None or m.confidence > kept.confidence:
+                seen[key] = m
+        deduped = list(seen.values())
+        if len(deduped) < len(all_matches):
+            print(f"    [matchanything] spatial dedup {len(all_matches)} → "
+                  f"{len(deduped)} (bin={bin_m:.0f}m)")
+        all_matches = deduped
+
+    # Pre-RANSAC affine sanity gate (optional, mirrors RoMa core's behaviour)
+    if not skip_ransac and len(all_matches) >= 6:
+        src_pts = np.array([m.ref_coords() for m in all_matches],
+                           dtype=np.float32).reshape(-1, 1, 2)
+        dst_pts = np.array([m.off_coords() for m in all_matches],
+                           dtype=np.float32).reshape(-1, 1, 2)
+        thresh = max(_C.RANSAC_REPROJ_THRESHOLD * neural_res, 25.0)
+        from .geo import ransac_affine
+        est = get_params().matching.estimation_method
+        try:
+            _, inliers = ransac_affine(src_pts, dst_pts,
+                                       threshold=thresh, method=est)
+        except Exception:
+            inliers = None
+        if inliers is not None:
+            n_before = len(all_matches)
+            all_matches = [m for m, k in zip(all_matches, inliers) if k]
+            print(f"    [matchanything] internal RANSAC ({est}, "
+                  f"thresh={thresh:.0f}m): {n_before} → {len(all_matches)}")
 
     return all_matches

@@ -407,6 +407,40 @@ def _fit_rbf_residual(
     }
 
 
+def _residual_fit_observable(real_tgt: np.ndarray,
+                             min_scan_span_frac: float = 0.45,
+                             min_cross_span_frac: float = 0.18,
+                             min_scan_bins: int = 4) -> tuple[bool, dict]:
+    """Return whether residual fitting is observable from GCP spread.
+
+    Coordinates are normalised to [-1, 1]. A panoramic bow-tie residual is
+    primarily a scan-axis effect, so clustered points can fit a deceptively
+    good local RBF while being unconstrained at the strip edges.
+    """
+    if real_tgt.shape[0] < 8:
+        return False, {"reason": "count", "count": int(real_tgt.shape[0])}
+    xs = real_tgt[:, 0]
+    ys = real_tgt[:, 1]
+    scan_span_frac = float((xs.max() - xs.min()) / 2.0)
+    cross_span_frac = float((ys.max() - ys.min()) / 2.0)
+    bins = np.clip(((xs + 1.0) * 0.5 * min_scan_bins).astype(int),
+                   0, min_scan_bins - 1)
+    occupied_scan_bins = int(len(set(int(v) for v in bins)))
+    ok = (
+        scan_span_frac >= min_scan_span_frac
+        and cross_span_frac >= min_cross_span_frac
+        and occupied_scan_bins >= min_scan_bins
+    )
+    return ok, {
+        "scan_span_frac": scan_span_frac,
+        "cross_span_frac": cross_span_frac,
+        "occupied_scan_bins": occupied_scan_bins,
+        "min_scan_span_frac": min_scan_span_frac,
+        "min_cross_span_frac": min_cross_span_frac,
+        "min_scan_bins": min_scan_bins,
+    }
+
+
 def _apply_affine(params, xx, yy):
     """Apply affine params to grid, return (src_x, src_y)."""
     src_x = params[0]*xx + params[1]*yy + params[2]
@@ -459,7 +493,8 @@ def _compute_affine_baseline(
     real_tgt = tgt_np[:n_real]
     real_src = src_np[:n_real]
 
-    if n_real >= 6:
+    observable, obs_diag = _residual_fit_observable(real_tgt)
+    if n_real >= 6 and observable:
         rbf_result = _fit_rbf_residual(real_tgt, real_src, global_params, xx, yy, scale)
         if rbf_result is not None:
             # Compare RBF vs affine RMS on real GCPs
@@ -481,6 +516,12 @@ def _compute_affine_baseline(
                 return baseline
             else:
                 print(f"  RBF not used: improvement {(1 - rbf_rms/affine_rms_real)*100:.1f}% < 5%", flush=True)
+    elif n_real >= 6:
+        print("  RBF residual skipped: insufficient scan-axis observability "
+              f"(scan_span={obs_diag.get('scan_span_frac', 0.0):.2f}, "
+              f"cross_span={obs_diag.get('cross_span_frac', 0.0):.2f}, "
+              f"scan_bins={obs_diag.get('occupied_scan_bins', 0)})",
+              flush=True)
 
     # Fall back to global affine
     src_x, src_y = _apply_affine(global_params, xx, yy)

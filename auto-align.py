@@ -90,8 +90,13 @@ def main():
     )
     parser.add_argument(
         "--matcher-dense", type=str, default="roma",
-        choices=["roma"],
-        help="Model to use for dense tiled matching (default: roma)"
+        choices=["roma", "matchanything"],
+        help="Dense tiled matcher. 'roma' (default) is RGB-trained dense "
+             "matcher — fastest and densest on era-matched same-modality "
+             "pairs. 'matchanything' is the MatchAnything-ELoFTR HF model "
+             "(zju-community/matchanything_eloftr, CVPR 2024) — fine-tuned "
+             "on cross-modal / cross-temporal pairs; use when RoMa "
+             "produces too few RANSAC survivors on KH-4B vs modern refs."
     )
     parser.add_argument(
         "--mask-provider", type=str, default="coastal_obia",
@@ -151,8 +156,8 @@ def main():
         help="Optimization iterations for grid warp (default: 300)"
     )
     parser.add_argument(
-        "--arap-weight", type=float, default=1.0,
-        help="ARAP regularization weight (default: 1.0)"
+        "--arap-weight", type=float, default=None,
+        help="Override ARAP regularization weight (default: camera profile)"
     )
     parser.add_argument(
         "--tps-fallback", action="store_true", default=False,
@@ -161,6 +166,18 @@ def main():
     parser.add_argument(
         "--profile", type=str, default=None,
         help="Camera profile name (e.g. kh9, kh4). Auto-detected from filename if omitted."
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint", dest="resume_from_checkpoint", type=str, default=None,
+        choices=["post_setup", "post_coarse", "post_scale_rotation",
+                 "post_match", "post_validate"],
+        help="Skip earlier phases by loading the named checkpoint from "
+             "<diagnostics-dir>/checkpoints/. Requires --diagnostics-dir."
+    )
+    parser.add_argument(
+        "--keep-temp-paths", dest="keep_temp_paths", action="store_true",
+        help="Preserve precorrection / rough-georef scratch files so a later "
+             "--resume-from-checkpoint run can re-read them."
     )
     args = parser.parse_args()
 

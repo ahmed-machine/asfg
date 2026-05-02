@@ -1,0 +1,117 @@
+inherits: _base
+
+# KH-4B CORONA (1967-1972) — Itek J-3 panoramic camera with CONTINUOUSLY
+# ROTATING scan arm + lens-rotation IMC. DO NOT use this profile for KH-4A
+# (missions 1001-1052, Itek J-1, OSCILLATING scanner, scan-head translation
+# IMC) — KH-4A has its own `kh4a.yaml` and the IMC direction is the opposite.
+# Mission-ID routing: `process.py::_profile_name_for_scene` maps DS1101-
+# DS1117 → kh4b; DS1001-DS1052 → kh4a.
+#
+# Authoritative sources:
+#   2OC (Hou 2023) Remote Sensing 15(21):5116 — 14-param adaptive-f model;
+#     Table 6 measures 1.18 % f-spread across 4 sub-images of a single
+#     KH-4B strip (0.6025-0.6096 m). §4.4 model-guided re-matching credits
+#     a 30-45 % accuracy gain and is deferred per `memory/project_2oc_p5_
+#     model_guided.md`.
+#   CoSP (Ghuffar 2022) IEEE TGRS 60:5000151, arXiv:2201.07756 — 13-param
+#     modified collinearity; f fixed at nominal due to f/Zs0 gauge
+#     degeneracy. Validated on KH-4A mission 1108 + KH-4B missions 1104/
+#     1112/1117; σ₀ < 2 px.
+#   Sohn et al. 2004 Photogrammetric Record 19(105):51-66 — earliest
+#     rigorous model, three modified-collinearity + RFM variants; ±1.5 px.
+#   Altmaier & Kany 2002 — film-shrinkage affine pre-warp for 30-50 years
+#     of archival storage; potential preprocessing addition, not wired.
+#   CORONA Atlas (Casana & Cothren 2013) — 3-10 m nadir / 20-80 m edge.
+
+meta:
+  name: kh4b
+  description: KH-4B Corona (1967-1972) — Itek J-3 Petzval, rotating pan arm, lens-rotation IMC
+  cameras: [KH-4B]
+
+camera:
+  type: opticalbar
+  focal_length: 0.6096         # metres (609.6mm Petzval lens)
+  pixel_pitch: 7.0e-6          # metres (7 micron USGS scan)
+  nominal_altitude_km: 215     # mean of 154-276 km KH-4B eccentric orbit
+
+  scan_time: 0.5               # seconds (lens rotation period — continuous)
+  speed: 7700                  # m/s (orbital velocity)
+  forward_tilt: 0.2618         # radians (15° for forward camera)
+  scan_dir: right
+  motion_compensation_factor: 1.0
+  # USGS 4-corner metadata is unreliable for KH-4B: CORONA Atlas reports
+  # 10-30 km errors (commit f36cd42 added in-place coarse-shift specifically
+  # because of this). When preprocess coarse-align abstains, generate_manifest
+  # skips the entity rather than aligning against an ortho positioned only
+  # by USGS corners (which produces wrong-shoreline matches).
+  usgs_corners_reliable: false
+  # Stacked NCC → ELoFTR → phase-correlate fallback (preprocess/coarse_align_ncc_stack.py)
+  # engages when single-shot ELoFTR abstains. ±50 km radius brackets the
+  # KH-4B USGS corner error envelope (CORONA Atlas reports up to 30 km;
+  # measured 44 km on Bahrain DS1104-1057DA025 → bumped from 25 to 50 km).
+  # 50 km still excludes the Saudi mainland coast (~100 km from Bahrain),
+  # so the wrong-coast NCC failure mode stays suppressed by the bound.
+  coarse_ncc_search_radius_m: 50000
+  # Per-axis strip-coherence gate (set 2026-04-26 after Bahrain DA025/DA026
+  # abstained on the 5 km isotropic gate). KH polar-orbit strips fly
+  # nearly N-S so dx is cross-strip and dy is along-strip. USGS-corner
+  # errors along the orbit track produced legitimate ~7 km along-strip
+  # residual on DA026 (vs DA023's validated prior); cross-strip residual
+  # remains the wrong-coast signal so it stays tight at 8 km. Replaces
+  # the legacy isotropic ``coarse_ncc_strip_coherence_max_m`` gate.
+  coarse_ncc_strip_coherence_cross_max_m: 8000
+  coarse_ncc_strip_coherence_along_max_m: 20000
+  # Lower the NCC floor for KH-4B's cross-temporal land-mask matching.
+  # KH-4B (1968) panchromatic vs modern (KH-9 1976 / ESRI WorldImagery)
+  # produces weaker NCC signals on shallow shorelines and reclamation
+  # zones — the default 0.20 throws out real peaks that ELoFTR + strip-
+  # prior corroboration can still validate. The stack's max-peak
+  # fallback also forwards the single best peak below floor for ELoFTR
+  # validation, so this is a safety belt rather than a hard floor.
+  coarse_ncc_min_ncc: 0.10
+  scan_arc_deg: 70.0
+  fix_f: false
+  # Per-sub-frame Zs0 from ASP cam_gen + DEM intersection. Important for
+  # KH-4B because orbits were eccentric (perigee 154 km, apogee 276 km)
+  # and the nominal 170 km is wrong for many frames in a pass.
+  cam_gen_altitude: true
+
+coarse:
+  min_ncc: 0.08
+  search_margin_m: 5000           # KH-4 USGS corners can be 20km+ off; need wide refinement window
+
+scale_rotation:
+  min_valid_frac: 0.15
+
+matching:
+  roma_size: 784
+  # Widened 2026-04-23: more correspondences + denser per-cell quota to
+  # give ROMA coverage at the strip's east/west extremes where matches
+  # were previously sparse (see v27 18 % spatial coverage).
+  roma_num_corresp: 1200
+  match_quota_per_cell: 50
+  land_mask_frac_min: 0.20
+  anchor_min_land_ncc: 0.08
+  # Tightened 2026-04-23: 8 px → 4 px drops borderline outliers so the
+  # surviving GCPs pin the warp more precisely. At matching-res 4.77 m/px
+  # that's ~19 m vs 38 m previously.
+  ransac_reproj_threshold: 4.0
+
+grid_optim:
+  w_data: 1.2
+  w_chamfer: 0.20
+  max_residual_norm: 0.008
+
+normalization:
+  clahe_clip_limit: 2.0
+
+qa:
+  # Bumped 2026-04-27 (v27 validation): DA024 scored image_score=182.0 with
+  # excellent cv=11m and pre-warp holdout p90=20m — the rejection at 180
+  # was driven by cross-temporal shoreline IoU (1968 KH-4B vs 1976 KH-9
+  # has 8 yr of mudflat / land-reclamation drift) rather than alignment
+  # quality. Raising to 200 accepts these borderline cases without
+  # admitting genuinely poor alignments.
+  accept_image_score_max: 200.0
+  accept_holdout_median_max: 120.0
+  accept_cv_mean_max: 120.0

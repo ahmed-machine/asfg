@@ -1,18 +1,82 @@
 inherits: _base
 
+# KH-7 GAMBIT-1 (1963-1967) — Eastman Kodak strip / slit-scan camera with
+# a 1.12 m primary mirror (NOT 1.21 m — that's KH-8; cross-contamination
+# in Wikipedia's infobox has misled prior profiles) and companion index-
+# frame camera. 36 successful missions, entity prefix DZB, mission IDs
+# 4001-4038.
+#
+# **This is NOT a panoramic camera.** Previous `kh7.yaml` set `type:
+# opticalbar` + `scan_arc_deg: 5.4` + `scan_time: 0.5` — all meaningless
+# for a strip camera. Strip cameras don't sweep a lens across a scan arc;
+# they move film at matched ground-projection velocity through a fixed
+# slit. The 5.4° narrow-arc approximation produces acceptable gross
+# alignment because `arc → 0` converges toward pinhole geometry, but
+# any sub-frame-level correction is accidental.
+#
+# **No rigorous photogrammetric sensor model exists for KH-7 in public
+# literature** — neither ASP OpticalBar, CoSP (Ghuffar 2022), 2OC (Hou
+# 2023), nor UW `declass_stereo` cover KH-7. Published KH-7 DEM work
+# falls back to "RPC distortion models as approximations." We follow
+# the same approximation: `type: linescan` flags the camera as strip
+# geometry so downstream panoramic-specific code (14-param LM fit,
+# bow-tie prior) is skipped; cam_gen + mapproject proceed with 4-corner
+# pinhole-like geometry.
+#
+# Authoritative sources:
+#   NRO BYE-16762-70 "Analysis of Gambit (110) Project" — local
+#     `data/camera-manuals/kh7_gambit_system_handbook/*.pdf` (admin
+#     program memos, not technical system handbook).
+#   Wikipedia KH-7 Gambit — focal length 77 in = 1956 mm, primary mirror
+#     1.12 m (44 in), 36 missions, 3 ft → 2 ft resolution improvement
+#     across program.
+#   Gunter's Space Page KH-7 — altitude 92 mi perigee / 186 mi apogee
+#     average (= 148 / 300 km).
+#   GlobalSecurity.org KH-7 — confirms 44-in primary, strip camera,
+#     index frame camera.
+#   USAF Museum KH-7 fact sheet — operational summary.
+#
+# Stereo: along-track only, via roll-joint pointing on successive passes.
+# NO simultaneous fore+aft cameras as on KH-4 / KH-9.
+
 meta:
   name: kh7
-  description: KH-7 GAMBIT (1963-1967), high resolution surveillance
+  description: KH-7 GAMBIT-1 (1963-1967) — Eastman Kodak strip / slit-scan camera
   cameras:
   - KH-7
 
 camera:
-  type: opticalbar
-  focal_length: 1.981          # metres (78 inch focal length)
+  type: linescan               # NOT opticalbar — KH-7 is strip, not panoramic
+  focal_length: 1.956          # metres (77 in — corrected from erroneous 1.981)
   pixel_pitch: 7.0e-6          # metres (7 micron USGS scan)
-  scan_time: 0.5               # seconds (strip camera)
-  speed: 7800                  # m/s (orbital velocity)
-  forward_tilt: 0.0            # near-nadir
+  # Strip camera has NO scan arc — slit aperture defines instantaneous
+  # geometry; film transport velocity matches ground-track projection.
+  scan_arc_deg: 0.0
   scan_dir: right
+  # Strip integration is not a "scan time" in the panoramic sense; keep a
+  # placeholder so profile loaders that expect this key don't crash.
+  scan_time: 0.0
+  speed: 7800                  # m/s orbital velocity
+  forward_tilt: 0.0            # nominal nadir; per-pass attitude varies via roll joint
   motion_compensation_factor: 1.0
-  scan_arc_deg: 5.4            # narrow strip camera
+  # Primary mirror 1.12 m — retained as metadata, not consumed by the
+  # pipeline today but useful for future sensor-model work.
+  primary_mirror_diameter_m: 1.12
+  # 9-inch wide film with variable-length strip exposure.
+  film_width_mm: 228.6
+  nominal_altitude_km: 167     # Gunter's average perigee/apogee midpoint
+  swath_km: 22                 # approximate, varies with altitude
+  # No reseau / PG stripes documented in public KH-7 sources. Fiducial
+  # localisation must rely on 4-corner USGS metadata only (no film-edge
+  # marks to refine against).
+  # USGS 4-corner-only metadata carries the same magnitude of error as
+  # KH-4 (10-30 km). Skip alignment when preprocess coarse-align abstains
+  # rather than producing wrong-shoreline matches.
+  usgs_corners_reliable: false
+  # Stacked NCC → ELoFTR → phase-correlate fallback (preprocess/coarse_align_ncc_stack.py)
+  # engages when single-shot ELoFTR abstains. ±50 km radius matches the
+  # KH-4-class USGS corner error envelope.
+  coarse_ncc_search_radius_m: 50000
+
+matching:
+  anchor_min_land_ncc: 0.08

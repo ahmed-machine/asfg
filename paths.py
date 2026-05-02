@@ -3,7 +3,7 @@
 Every output the pipeline writes lives under one of two roots:
 
 - ``cache_dir``: shared preprocessing cache (downloads, extracted, stitched,
-  georef, ortho, ba). Reused across runs; safe to share between tests.
+  georef, ortho). Reused across runs; safe to share between tests.
 - ``output_dir``: per-run outputs (aligned, mosaic, manifests, diagnostics,
   cropped, match_files, reference).
 
@@ -32,9 +32,40 @@ def stitched_path(cache_dir: str, entity_id: str) -> str:
     return os.path.join(cache_dir, "stitched", f"{entity_id}_stitched.tif")
 
 
-def ortho_path(cache_dir: str, entity_id: str, bundle_adjusted: bool = False) -> str:
-    suffix = "_ortho_ba.tif" if bundle_adjusted else "_ortho.tif"
-    return os.path.join(cache_dir, "ortho", f"{entity_id}{suffix}")
+def ortho_path(cache_dir: str, entity_id: str) -> str:
+    return os.path.join(cache_dir, "ortho", f"{entity_id}_ortho.tif")
+
+
+def ortho_coarse_path(cache_dir: str, entity_id: str) -> str:
+    """Reference-specific coarse-align sidecar next to the canonical ortho.
+
+    The canonical ``_ortho.tif`` is reference-neutral and immutable once
+    written; this sidecar holds the coarse-align geotransform shift for a
+    particular reference basemap. Validity is gated by the companion
+    provenance JSON so that switching ``--reference`` invalidates the sidecar.
+    """
+    return os.path.join(cache_dir, "ortho", f"{entity_id}_ortho.coarse.tif")
+
+
+def ortho_coarse_provenance_path(cache_dir: str, entity_id: str) -> str:
+    return os.path.join(cache_dir, "ortho", f"{entity_id}_ortho.coarse.json")
+
+
+def reference_scratch_cleaned_path(reference_path: str) -> str:
+    """Path of the scratch-cleaned sidecar next to a reference TIF.
+
+    Declassified film references (KH-9 DZB1212 etc.) often carry bright
+    diagonal scratches at the strip edges. The cleaned sidecar holds
+    the inpainted version with the same georeferencing; matchers prefer
+    it when its companion provenance JSON matches the current reference.
+    """
+    base, ext = os.path.splitext(reference_path)
+    return f"{base}.scratch_cleaned{ext or '.tif'}"
+
+
+def reference_scratch_cleaned_provenance_path(reference_path: str) -> str:
+    base, _ = os.path.splitext(reference_path)
+    return f"{base}.scratch_cleaned.json"
 
 
 def ortho_segments_dir(cache_dir: str, entity_id: str) -> str:
@@ -43,10 +74,6 @@ def ortho_segments_dir(cache_dir: str, entity_id: str) -> str:
 
 def extracted_dir(cache_dir: str, entity_id: str) -> str:
     return os.path.join(cache_dir, "extracted", entity_id)
-
-
-def bundle_adjust_dir(cache_dir: str, strip_key: str) -> str:
-    return os.path.join(cache_dir, "ba", strip_key)
 
 
 def ba_camera_path(stitched_path_value: str) -> str:
@@ -107,7 +134,7 @@ def match_files_dir(output_dir: str) -> str:
 # Directory ensurance
 # ---------------------------------------------------------------------------
 
-CACHE_SUBDIRS = ("downloads", "extracted", "stitched", "georef", "ortho", "ba")
+CACHE_SUBDIRS = ("downloads", "extracted", "stitched", "georef", "ortho")
 OUTPUT_SUBDIRS = ("aligned", "mosaic", "manifests", "diagnostics", "match_files")
 
 

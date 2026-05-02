@@ -111,20 +111,10 @@ def _ncc_overlap(frame_a_path: str, frame_b_path: str, rotated: bool = False,
     if max_val < 0.3:
         return 0
 
-    # max_loc[0] is where the template starts in the search area (reduced coords)
-    # This means the right edge of A starts at position max_loc[0] in B's left half
-    # The overlap = (position of template in B + template width) at full resolution
-    # But we need: overlap = tmpl position in B coords at full scale
-    # match_x_full = position of template start in B at full resolution
-    match_x_full = round(max_loc[0] / scale * (search_w_full / (search_w / scale)))
-
-    # Actually simpler: match position in full-res B coords
+    # match_x_full = template's left-edge position in B at full resolution.
     match_x_full = round(max_loc[0] * search_w_full / search_w)
 
-    # Overlap = how far into B frame A extends
-    # The template is from A's right edge (last 5%), and it was found at match_x_full in B
-    # So the overlap is: tmpl_w_full + match_x_full (since template starts at A_rightedge - tmpl_w)
-    # Actually: overlap = (w_a_rightedge maps to B position match_x_full + tmpl_w_full)
+    # Template is the last 5% of A, so overlap_px = match_x_full + tmpl_w_full.
     overlap_px = match_x_full + tmpl_w_full
 
     if overlap_px < 0 or overlap_px > w_a * 0.5:
@@ -466,52 +456,31 @@ def _crop_all_borders(frames: list, output_dir: str) -> tuple:
     return cropped_frames, temp_files
 
 
-def discover_frame_order(frames, scale=0.10):
-    """Discover the correct left-to-right ordering of frames.
+def _order_two_frames(frames, scale):
+    """Two-frame ordering: test both directions, prefer the one with more
+    SIFT matches (20% margin); fall back to overlap when match counts tie."""
+    ov_ab, rot_ab, n_ab = compute_overlap(frames[0], frames[1], scale)
+    ov_ba, rot_ba, n_ba = compute_overlap(frames[1], frames[0], scale)
 
-    Uses all-pairs SIFT matching to build a directed connectivity graph,
-    then chains from the leftmost frame to produce a linear strip ordering.
-    Handles arbitrarily-ordered inputs and detects 180-degree rotations.
+    if n_ba > n_ab * 1.2 and n_ba >= 10:
+        swap = True
+    elif n_ab >= n_ba * 1.2 and n_ab >= 10:
+        swap = False
+    else:
+        swap = ov_ba > ov_ab and ov_ba > 0
 
-    Args:
-        frames: List of frame file paths in arbitrary order.
-        scale: Downscale factor for overlap matching (default 0.10).
+    if swap:
+        print(f"    Swapping frame order (B→A: {n_ba} matches/{ov_ba}px > A→B: {n_ab} matches/{ov_ab}px)")
+        return [frames[1], frames[0]], [ov_ba], [False, rot_ba]
+    if ov_ab > 0 or ov_ba > 0:
+        return list(frames), [ov_ab if ov_ab > 0 else 0], [False, rot_ab if ov_ab > 0 else False]
+    return list(frames), [0], [False, False]
 
-    Returns:
-        (ordered_frames, overlaps, rotated_flags) where:
-        - ordered_frames: frames reordered into correct strip sequence
-        - overlaps: list of overlap pixels between consecutive ordered frames
-        - rotated_flags: list of bools per frame (True = needs 180 rotation)
-    """
+
+def _all_pairs_overlap_matches(frames, scale):
+    """Return ``{(i, j): (overlap, is_rotated)}`` for all directed pairs
+    with overlap > 0, computed in parallel."""
     n = len(frames)
-    if n <= 1:
-        return list(frames), [], [False] * n
-
-    if n == 2:
-        ov_ab, rot_ab, n_ab = compute_overlap(frames[0], frames[1], scale)
-        ov_ba, rot_ba, n_ba = compute_overlap(frames[1], frames[0], scale)
-
-        # Prefer direction with significantly more matches (20% margin)
-        if n_ba > n_ab * 1.2 and n_ba >= 10:
-            swap = True
-        elif n_ab >= n_ba * 1.2 and n_ab >= 10:
-            swap = False
-        else:
-            # Similar match counts — fall back to overlap
-            swap = ov_ba > ov_ab and ov_ba > 0
-
-        if swap:
-            print(f"    Swapping frame order (B→A: {n_ba} matches/{ov_ba}px > A→B: {n_ab} matches/{ov_ab}px)")
-            return [frames[1], frames[0]], [ov_ba], [False, rot_ba]
-        elif ov_ab > 0 or ov_ba > 0:
-            return list(frames), [ov_ab if ov_ab > 0 else 0], [False, rot_ab if ov_ab > 0 else False]
-        else:
-            return list(frames), [0], [False, False]
-
-    print(f"  Discovering frame order ({n} frames, {n*(n-1)} directed pairs)...")
-
-    # Compute all directed pair matches in parallel.
-    # compute_overlap(A, B) tests "is A to the LEFT of B?"
     with ProcessPoolExecutor() as executor:
         futures = {}
         for i in range(n):
@@ -530,26 +499,18 @@ def discover_frame_order(frames, scale=0.10):
                     matches[(i, j)] = (overlap, is_rotated)
             except Exception as e:
                 print(f"    Match ({i},{j}) failed: {e}")
+    return matches
 
-    if not matches:
-        print("  WARNING: No pairwise matches found, using input order")
-        sequential_overlaps = []
-        sequential_rotated = [False]
-        for i in range(n - 1):
-            ov, rot, _ = compute_overlap(frames[i], frames[i + 1], scale)
-            sequential_overlaps.append(ov)
-            sequential_rotated.append(rot)
-        return list(frames), sequential_overlaps, sequential_rotated
 
-    # Build best-right-neighbor map.
-    # right_of[i] = (j, overlap, is_j_rotated)  means j is immediately right of i.
+def _resolve_right_neighbor_graph(matches):
+    """From directed pair overlaps, pick the best right-neighbor per frame
+    and resolve conflicts (two frames claiming the same right-neighbor)
+    by keeping the stronger match."""
     right_of = {}
     for (i, j), (overlap, is_rotated) in matches.items():
         if i not in right_of or overlap > right_of[i][1]:
             right_of[i] = (j, overlap, is_rotated)
 
-    # Resolve conflicts: if two frames claim the same right-neighbor,
-    # keep the stronger match and remove the weaker.
     claimed_right = defaultdict(list)
     for i, (j, ov, rot) in right_of.items():
         claimed_right[j].append((i, ov, rot))
@@ -558,21 +519,24 @@ def discover_frame_order(frames, scale=0.10):
             claimants.sort(key=lambda x: -x[1])
             for loser_i, _, _ in claimants[1:]:
                 del right_of[loser_i]
+    return right_of
 
-    # Leftmost frame = never appears as anyone's right neighbor.
+
+def _chain_from_leftmost(right_of, n, frames):
+    """Walk the right-neighbor chain starting from the frame that never
+    appears as anyone's right-neighbor; append any disconnected frames
+    with zero overlap."""
     appears_as_right = {j for _, (j, _, _) in right_of.items()}
     leftmost = [i for i in range(n) if i not in appears_as_right]
     if not leftmost:
         leftmost = [max(right_of, key=lambda k: right_of[k][1])]
 
-    # Chain from leftmost to build the strip ordering.
     start = leftmost[0]
     ordered = [start]
     overlaps = []
     rot_flags = [False]
     visited = {start}
     current = start
-
     while current in right_of and len(ordered) < n:
         j, ov, is_rot = right_of[current]
         if j in visited:
@@ -583,7 +547,6 @@ def discover_frame_order(frames, scale=0.10):
         visited.add(j)
         current = j
 
-    # Append any disconnected frames with zero overlap.
     for i in range(n):
         if i not in visited:
             ordered.append(i)
@@ -596,8 +559,41 @@ def discover_frame_order(frames, scale=0.10):
     for idx, ov in enumerate(overlaps):
         rot_label = " (B rotated 180)" if rot_flags[idx + 1] else ""
         print(f"    Overlap {idx}: {ov}px{rot_label}")
-
     return result_frames, overlaps, rot_flags
+
+
+def discover_frame_order(frames, scale=0.10):
+    """Discover the correct left-to-right ordering of frames.
+
+    All-pairs SIFT matching builds a directed connectivity graph; we
+    chain from the leftmost frame to produce a linear strip ordering.
+    Handles arbitrarily-ordered inputs and detects 180° rotations.
+
+    Returns ``(ordered_frames, overlaps, rotated_flags)`` where overlaps
+    are pixel counts between consecutive ordered frames and
+    rotated_flags[i] indicates that frame i needs a 180° rotation.
+    """
+    n = len(frames)
+    if n <= 1:
+        return list(frames), [], [False] * n
+    if n == 2:
+        return _order_two_frames(frames, scale)
+
+    print(f"  Discovering frame order ({n} frames, {n*(n-1)} directed pairs)...")
+    matches = _all_pairs_overlap_matches(frames, scale)
+
+    if not matches:
+        print("  WARNING: No pairwise matches found, using input order")
+        sequential_overlaps = []
+        sequential_rotated = [False]
+        for i in range(n - 1):
+            ov, rot, _ = compute_overlap(frames[i], frames[i + 1], scale)
+            sequential_overlaps.append(ov)
+            sequential_rotated.append(rot)
+        return list(frames), sequential_overlaps, sequential_rotated
+
+    right_of = _resolve_right_neighbor_graph(matches)
+    return _chain_from_leftmost(right_of, n, frames)
 
 
 def stitch_with_asp(frames: list, output_path: str, camera_name: str,
@@ -773,146 +769,71 @@ def verify_tiff_decodes_nonempty(path: str, label: str = "TIFF", sample_size: in
     return False
 
 
-def stitch_frames(frames: list, output_path: str, output_dir: str,
-                  preserve_order: bool = False) -> str:
-    """Stitch a list of frame paths into a single panoramic strip.
+def _sequential_two_frame_order(ordered_frames):
+    """Two-frame preserve_order path: test both directions (alphabetical
+    order can disagree with geographic order, e.g. KH-7 _a/_b)."""
+    overlaps = []
+    rotated_flags = [False, False]
+    ov_ab, rot_ab, n_ab = compute_overlap(ordered_frames[0], ordered_frames[1])
+    ov_ba, rot_ba, n_ba = compute_overlap(ordered_frames[1], ordered_frames[0])
 
-    By default, frame ordering is discovered automatically via all-pairs
-    SIFT matching (graph-based), so frames do NOT need to be pre-sorted.
-
-    When preserve_order=True, frames are stitched in the exact order given.
-    Use this for sub-frames split from a single image (e.g. via split_at_seams),
-    where the input order is known correct and should not be rearranged.
-
-    Args:
-        frames: List of frame file paths.
-        output_path: Where to write the stitched output.
-        output_dir: Working directory for temp files.
-        preserve_order: If True, skip graph-based reordering and use input order.
-
-    Returns:
-        Path to the stitched output.
-    """
-    if os.path.exists(output_path):
-        print(f"  [skip] Stitched output already exists: {output_path}")
-        return output_path
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    if len(frames) == 0:
-        raise RuntimeError("No frames to stitch")
-
-    if len(frames) == 1:
-        shutil.copy2(frames[0], output_path)
-        print(f"  Single frame, copied to {output_path}")
-        return output_path
-
-    # Pre-process: crop black borders for better overlap detection
-    cropped_frames, crop_temps = _crop_all_borders(frames, output_dir)
-
-    if preserve_order:
-        # Sequential overlap matching — frames are already in correct order.
-        # Only compute overlap between consecutive pairs.
-        print(f"  Sequential stitching ({len(cropped_frames)} frames, order preserved)...")
-        overlaps = []
-        rotated_flags = [False] * len(cropped_frames)
-        ordered_frames = list(cropped_frames)
-
-        if len(cropped_frames) == 2:
-            # For 2-frame case, test both directions to detect order reversal
-            # (e.g. KH-7 where alphabetical _a/_b doesn't match geographic order)
-            ov_ab, rot_ab, n_ab = compute_overlap(ordered_frames[0], ordered_frames[1])
-            ov_ba, rot_ba, n_ba = compute_overlap(ordered_frames[1], ordered_frames[0])
-
-            # Prefer direction with significantly more matches (20% margin)
-            if n_ba > n_ab * 1.2 and n_ba >= 10:
-                swap = True
-            elif n_ab >= n_ba * 1.2 and n_ab >= 10:
-                swap = False
-            else:
-                # Similar match counts — fall back to overlap
-                swap = ov_ba > ov_ab and ov_ba > 0
-
-            if swap:
-                print(f"    Swapping frame order (B→A: {n_ba} matches/{ov_ba}px > A→B: {n_ab} matches/{ov_ab}px)")
-                ordered_frames[0], ordered_frames[1] = ordered_frames[1], ordered_frames[0]
-                overlaps.append(ov_ba)
-                rotated_flags[1] = rot_ba
-            else:
-                overlaps.append(ov_ab if ov_ab > 0 else 0)
-                rotated_flags[1] = rot_ab if ov_ab > 0 else False
-        else:
-            # For >2 frames, test BOTH directions (a→b→c→d vs d→c→b→a)
-            # and pick the one with higher total phase correlation score.
-            # KH-4 sub-frames are scanner tiles that may be in either
-            # left-to-right or right-to-left order depending on scanner setup.
-            fwd_frames = list(ordered_frames)
-            rev_frames = list(reversed(ordered_frames))
-
-            def _compute_sequential(frame_list):
-                results = []
-                total_score = 0.0
-                for i in range(len(frame_list) - 1):
-                    ov, rot, n = compute_overlap(frame_list[i], frame_list[i + 1])
-                    results.append((ov, rot, n))
-                    # Use overlap as score proxy (phase score not returned)
-                    total_score += ov
-                return results, total_score
-
-            fwd_results, fwd_score = _compute_sequential(fwd_frames)
-            rev_results, rev_score = _compute_sequential(rev_frames)
-
-            if rev_score > fwd_score * 1.05:
-                print(f"    Reversed frame order (score {rev_score:.0f} > {fwd_score:.0f})")
-                ordered_frames = rev_frames
-                chosen_results = rev_results
-            else:
-                chosen_results = fwd_results
-
-            for i, r in enumerate(chosen_results):
-                overlaps.append(r[0] if r else 0)
-                if r and r[1]:
-                    print(f"    Frame {i+1}: overlap detector suggested 180° "
-                          f"rotation — ignoring (sub-frames share orientation)")
+    if n_ba > n_ab * 1.2 and n_ba >= 10:
+        swap = True
+    elif n_ab >= n_ba * 1.2 and n_ab >= 10:
+        swap = False
     else:
-        # Graph-based ordering — discover correct layout from all-pairs matching.
-        ordered_frames, overlaps, rotated_flags = discover_frame_order(cropped_frames)
+        swap = ov_ba > ov_ab and ov_ba > 0
 
-    # Get dimensions of each ordered frame
-    frame_info = []
-    for f in ordered_frames:
-        result = _run_cmd(["gdalinfo", "-json", f])
-        info = json.loads(result.stdout)
-        w, h = info["size"]
-        bands = len(info.get("bands", [{"type": "Byte"}]))
-        dtype = info.get("bands", [{"type": "Byte"}])[0].get("type", "Byte")
-        frame_info.append({"path": f, "w": w, "h": h, "bands": bands, "dtype": dtype})
-        print(f"    Frame {os.path.basename(f)}: {w}x{h}")
+    if swap:
+        print(f"    Swapping frame order (B→A: {n_ba} matches/{ov_ba}px > A→B: {n_ab} matches/{ov_ab}px)")
+        ordered_frames = [ordered_frames[1], ordered_frames[0]]
+        overlaps.append(ov_ba)
+        rotated_flags[1] = rot_ba
+    else:
+        overlaps.append(ov_ab if ov_ab > 0 else 0)
+        rotated_flags[1] = rot_ab if ov_ab > 0 else False
+    return ordered_frames, overlaps, rotated_flags
 
-    # Handle rotated frames: create 180-flipped copies
-    rot180_temps = []
-    for i, is_rotated in enumerate(rotated_flags):
-        if is_rotated:
-            orig_path = frame_info[i]["path"]
-            flipped_path = orig_path.replace(".tif", "_rot180.tif")
-            print(f"  Frame {os.path.basename(orig_path)} is rotated 180 — creating corrected copy")
-            flip_frame_180(orig_path, flipped_path)
-            frame_info[i]["path"] = flipped_path
-            rot180_temps.append(flipped_path)
 
-    # Compute x-offsets accounting for overlap
-    x_offsets = [0]
-    for i, fi in enumerate(frame_info[:-1]):
-        next_x = x_offsets[-1] + fi["w"] - overlaps[i]
-        x_offsets.append(next_x)
+def _sequential_nplus_frame_order(ordered_frames):
+    """≥3 frame preserve_order path: test forward and reversed chains,
+    pick the one with higher total overlap (scanner tiles can be left-
+    to-right or right-to-left depending on setup)."""
+    overlaps = []
+    rotated_flags = [False] * len(ordered_frames)
 
-    total_w = x_offsets[-1] + frame_info[-1]["w"]
-    max_h = max(fi["h"] for fi in frame_info)
-    n_bands = frame_info[0]["bands"]
-    dtype = frame_info[0]["dtype"]
+    def _compute_sequential(frame_list):
+        results = []
+        total_score = 0.0
+        for i in range(len(frame_list) - 1):
+            ov, rot, n = compute_overlap(frame_list[i], frame_list[i + 1])
+            results.append((ov, rot, n))
+            total_score += ov
+        return results, total_score
 
-    # Build VRT
-    vrt_path = output_path.replace(".tif", ".vrt")
+    fwd_frames = list(ordered_frames)
+    rev_frames = list(reversed(ordered_frames))
+    fwd_results, fwd_score = _compute_sequential(fwd_frames)
+    rev_results, rev_score = _compute_sequential(rev_frames)
+
+    if rev_score > fwd_score * 1.05:
+        print(f"    Reversed frame order (score {rev_score:.0f} > {fwd_score:.0f})")
+        ordered_frames = rev_frames
+        chosen_results = rev_results
+    else:
+        chosen_results = fwd_results
+
+    for i, r in enumerate(chosen_results):
+        overlaps.append(r[0] if r else 0)
+        if r and r[1]:
+            print(f"    Frame {i+1}: overlap detector suggested 180° "
+                  f"rotation — ignoring (sub-frames share orientation)")
+    return ordered_frames, overlaps, rotated_flags
+
+
+def _write_vrt_canvas(frame_info, x_offsets, total_w, max_h, n_bands, dtype,
+                      vrt_path):
+    """Emit a VRT that tiles ``frame_info`` left-to-right at ``x_offsets``."""
     vrt_lines = [f'<VRTDataset rasterXSize="{total_w}" rasterYSize="{max_h}">']
     for band_idx in range(1, n_bands + 1):
         vrt_lines.append(f'  <VRTRasterBand dataType="{dtype}" band="{band_idx}">')
@@ -925,13 +846,80 @@ def stitch_frames(frames: list, output_path: str, output_dir: str,
             vrt_lines.append(f'    </SimpleSource>')
         vrt_lines.append(f'  </VRTRasterBand>')
     vrt_lines.append('</VRTDataset>')
-
     with open(vrt_path, "w") as f:
         f.write("\n".join(vrt_lines))
 
+
+def stitch_frames(frames: list, output_path: str, output_dir: str,
+                  preserve_order: bool = False) -> str:
+    """Stitch a list of frame paths into a single panoramic strip.
+
+    Default: graph-based ordering via all-pairs SIFT matching — inputs
+    do not need to be pre-sorted. ``preserve_order=True`` stitches in
+    the exact input order (used for sub-frames split from a single
+    image via ``split_at_seams``).
+    """
+    if os.path.exists(output_path):
+        print(f"  [skip] Stitched output already exists: {output_path}")
+        return output_path
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    if len(frames) == 0:
+        raise RuntimeError("No frames to stitch")
+    if len(frames) == 1:
+        shutil.copy2(frames[0], output_path)
+        print(f"  Single frame, copied to {output_path}")
+        return output_path
+
+    cropped_frames, crop_temps = _crop_all_borders(frames, output_dir)
+
+    if preserve_order:
+        print(f"  Sequential stitching ({len(cropped_frames)} frames, order preserved)...")
+        if len(cropped_frames) == 2:
+            ordered_frames, overlaps, rotated_flags = _sequential_two_frame_order(
+                list(cropped_frames),
+            )
+        else:
+            ordered_frames, overlaps, rotated_flags = _sequential_nplus_frame_order(
+                list(cropped_frames),
+            )
+    else:
+        ordered_frames, overlaps, rotated_flags = discover_frame_order(cropped_frames)
+
+    frame_info = []
+    for f in ordered_frames:
+        result = _run_cmd(["gdalinfo", "-json", f])
+        info = json.loads(result.stdout)
+        w, h = info["size"]
+        bands = len(info.get("bands", [{"type": "Byte"}]))
+        dtype = info.get("bands", [{"type": "Byte"}])[0].get("type", "Byte")
+        frame_info.append({"path": f, "w": w, "h": h, "bands": bands, "dtype": dtype})
+        print(f"    Frame {os.path.basename(f)}: {w}x{h}")
+
+    rot180_temps = []
+    for i, is_rotated in enumerate(rotated_flags):
+        if is_rotated:
+            orig_path = frame_info[i]["path"]
+            flipped_path = orig_path.replace(".tif", "_rot180.tif")
+            print(f"  Frame {os.path.basename(orig_path)} is rotated 180 — creating corrected copy")
+            flip_frame_180(orig_path, flipped_path)
+            frame_info[i]["path"] = flipped_path
+            rot180_temps.append(flipped_path)
+
+    x_offsets = [0]
+    for i, fi in enumerate(frame_info[:-1]):
+        x_offsets.append(x_offsets[-1] + fi["w"] - overlaps[i])
+
+    total_w = x_offsets[-1] + frame_info[-1]["w"]
+    max_h = max(fi["h"] for fi in frame_info)
+    n_bands = frame_info[0]["bands"]
+    dtype = frame_info[0]["dtype"]
+
+    vrt_path = output_path.replace(".tif", ".vrt")
+    _write_vrt_canvas(frame_info, x_offsets, total_w, max_h, n_bands, dtype, vrt_path)
     print(f"  VRT canvas: {total_w}x{max_h} ({len(frames)} frames, overlaps: {overlaps})")
 
-    # Render VRT to GeoTIFF
     _run_cmd([
         "gdal_translate",
         "-co", "COMPRESS=LZW",
@@ -941,15 +929,12 @@ def stitch_frames(frames: list, output_path: str, output_dir: str,
         vrt_path,
         output_path,
     ])
-
     os.remove(vrt_path)
 
-    # Feathered blending in overlap zones
     if any(o > 0 for o in overlaps):
         print(f"  Applying feathered blending to {sum(1 for o in overlaps if o > 0)} overlap zones...")
         _blend_overlaps(output_path, frame_info, x_offsets, overlaps)
 
-    # Clean up temp files (rotated copies and cropped borders)
     for temp_path in rot180_temps + crop_temps:
         if os.path.exists(temp_path):
             os.remove(temp_path)

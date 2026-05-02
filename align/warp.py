@@ -20,6 +20,7 @@ from . import constants as _C
 from .flow_refine import (
     _estimate_flow,
     _estimate_flow_dis,
+    _estimate_flow_raft,
     _forward_backward_mask,
     clamp_flow_magnitude,
     soft_zero_unreliable,
@@ -444,7 +445,46 @@ def _compute_flow_corrections(warper, reference_path, src_data, src_w, src_h,
             warped_u8_c = to_u8_percentile(warped_arr_c, _flow_lo, _flow_hi)
 
         flow_c = _estimate_flow(ref_u8_c, warped_u8_c)
-        fb_mask_c = _forward_backward_mask(ref_u8_c, warped_u8_c, flow_c, _C.FB_CONSISTENCY_PX)
+        fb_mask_c = _forward_backward_mask(
+            ref_u8_c, warped_u8_c, flow_c, _C.FB_CONSISTENCY_PX,
+            use_uncertainty=False,
+        )
+        precheck_c_pct = float(fb_mask_c.sum()) / max(1, fb_mask_c.size) * 100
+        # DIS-to-SEA-RAFT fallback. DIS has a small effective search
+        # radius (~30 px); on cross-system declassified pairs (e.g. KH-4B
+        # 1968 vs KH-9 1976) with non-rigid residuals exceeding that
+        # range, DIS forward-backward consistency drops to ~0% and the
+        # whole flow stage skipped, leaving the coarse-grid alignment
+        # uncorrected. SEA-RAFT has a much larger effective range and a
+        # built-in uncertainty signal; try it once before giving up.
+        if precheck_c_pct < 5.0:
+            print(f"  [FlowRefine] Coarse DIS precheck only "
+                  f"{precheck_c_pct:.0f}% reliable — falling back to "
+                  f"SEA-RAFT...", flush=True)
+            try:
+                flow_raft_c = _estimate_flow_raft(ref_u8_c, warped_u8_c)
+            except Exception as exc:
+                print(f"  [FlowRefine] SEA-RAFT failed ({exc}); "
+                      f"skipping flow entirely", flush=True)
+                raise RuntimeError("Insufficient reliable coarse flow pixels")
+            fb_mask_raft = _forward_backward_mask(
+                ref_u8_c, warped_u8_c, flow_raft_c, _C.FB_CONSISTENCY_PX,
+                use_uncertainty=False,
+            )
+            raft_pct = float(fb_mask_raft.sum()) / max(1, fb_mask_raft.size) * 100
+            if raft_pct < 5.0:
+                print(f"  [FlowRefine] SEA-RAFT precheck also only "
+                      f"{raft_pct:.0f}% reliable — skipping flow entirely",
+                      flush=True)
+                raise RuntimeError("Insufficient reliable coarse flow pixels")
+            print(f"  [FlowRefine] SEA-RAFT recovered: {raft_pct:.0f}% reliable",
+                  flush=True)
+            flow_c = flow_raft_c
+            fb_mask_c = fb_mask_raft
+        fb_mask_c = _forward_backward_mask(
+            ref_u8_c, warped_u8_c, flow_c, _C.FB_CONSISTENCY_PX,
+            use_uncertainty=True,
+        )
 
         _mk = getattr(_C, 'FLOW_MEDIAN_KERNEL', 3)
         _mk = _mk if _mk % 2 == 1 else _mk + 1  # must be odd
@@ -514,7 +554,20 @@ def _compute_flow_corrections(warper, reference_path, src_data, src_w, src_h,
         warped_u8_fr = to_u8_percentile(warped_arr_fr, _flow_lo, _flow_hi)
 
     flow_fwd = _estimate_flow(ref_u8_fr, warped_u8_fr)
-    fb_mask = _forward_backward_mask(ref_u8_fr, warped_u8_fr, flow_fwd, _C.FB_CONSISTENCY_PX)
+    fb_mask = _forward_backward_mask(
+        ref_u8_fr, warped_u8_fr, flow_fwd, _C.FB_CONSISTENCY_PX,
+        use_uncertainty=False,
+    )
+    precheck_pct = float(fb_mask.sum()) / max(1, fb_mask.size) * 100
+    if precheck_pct < 10.0 and not do_two_pass:
+        print(f"  [FlowRefine] Fine DIS precheck only {precheck_pct:.0f}% reliable "
+              f"— skipping before SEA-RAFT uncertainty", flush=True)
+        raise RuntimeError("Insufficient reliable flow pixels")
+    if precheck_pct >= 10.0:
+        fb_mask = _forward_backward_mask(
+            ref_u8_fr, warped_u8_fr, flow_fwd, _C.FB_CONSISTENCY_PX,
+            use_uncertainty=True,
+        )
 
     _mk = getattr(_C, 'FLOW_MEDIAN_KERNEL', 3)
     _mk = _mk if _mk % 2 == 1 else _mk + 1  # must be odd
@@ -734,7 +787,7 @@ def apply_warp_grid_only(
     output_crs=None,
     grid_size: int = 20,
     grid_iters: int = 300,
-    arap_weight: float = 1.0,
+    arap_weight: float | None = None,
     n_real_gcps_in: int | None = None,
     match_weights: np.ndarray | None = None,
     diagnostics_dir: str | None = None,
@@ -771,6 +824,9 @@ def apply_warp_grid_only(
             target_u8_coast, src_u8_coast, coast_scale_t, coast_scale_s, output_res)
 
     with _p.section("grid_optim"):
+        from .params import get_params
+        grid_params = get_params().grid_optim
+        pyramid_levels = [tuple(level) for level in grid_params.pyramid_levels]
         warper = optimize_grid_hierarchical(
             source_img=src_img_rgb,
             target_img=target_img_rgb,
@@ -781,8 +837,14 @@ def apply_warp_grid_only(
             src_shape=(src_h, src_w),
             tgt_shape=(out_h, out_w),
             output_res_m=output_res,
-            levels=_C.DEFAULT_PYRAMID_LEVELS,
-            w_arap=arap_weight,
+            levels=pyramid_levels,
+            lr=grid_params.lr,
+            w_data=grid_params.w_data,
+            w_chamfer=grid_params.w_chamfer,
+            w_arap=grid_params.w_arap if arap_weight is None else arap_weight,
+            w_laplacian=grid_params.w_laplacian,
+            w_disp=grid_params.w_disp,
+            max_residual_norm=grid_params.max_residual_norm,
             reclamation_mask_tgt=reclamation_mask,
             n_real_gcps=n_real_gcps,
             match_weights=match_weights,
@@ -870,7 +932,7 @@ def apply_warp(
     output_crs=None,
     grid_size: int = 20,
     grid_iters: int = 300,
-    arap_weight: float = 1.0,
+    arap_weight: float | None = None,
     n_real_gcps_in: int | None = None,
     match_weights: np.ndarray | None = None,
     diagnostics_dir: str | None = None,

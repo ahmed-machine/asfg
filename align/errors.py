@@ -21,5 +21,9 @@ class AlreadyAlignedError(AlignmentError):
     """Images are already well-aligned; no correction needed."""
 
 
+class RefinementComplete(AlreadyAlignedError):
+    """A recursive coarse-translation refinement pass completed."""
+
+
 class UserAbortError(AlignmentError):
     """User declined to proceed."""

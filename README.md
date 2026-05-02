@@ -75,8 +75,6 @@ align/                  Alignment pipeline
   semantic_masking.py     Land/water/shoreline masking
   image.py                Image utilities (CLAHE, Wallis, Sobel)
   models.py               Torch device detection and model cache
-  experimental/           Experimental threads (opt-in, see below)
-    bundle_adjust.py        ASP bundle_adjust wrapper with RoMa tie points
   romav2/                 Vendored RoMa v2
   sea_raft/               Vendored SEA-RAFT
 
@@ -86,30 +84,14 @@ preprocess/             Preprocessing modules
   georef.py               Rough georeferencing, Sentinel-2 fetch
   orientation.py          Rotation detection and verification
   mosaic.py               Strip assembly and blending
-  camera_model.py         ASP OpticalBar cam_gen + mapproject (+ 2OC per-segment)
+  camera_model.py         ASP OpticalBar cam_gen + mapproject
   auto_anchors.py         Automatic anchor GCP generation via coarse RoMa
   dem.py                  DEM tile fetching (Copernicus GLO-30)
-  experimental/           Experimental threads (opt-in)
-    match_ip.py             RoMa → ASP .match file writer
 
-data/profiles/          Camera-specific YAML profiles (_base, kh4, kh7, kh9)
+data/profiles/          Camera-specific YAML profiles (_base, kh4a, kh4b, kh7, kh8, kh9, kh9_mc)
 scripts/test/           Test harnesses (run_test.py, run_piecewise.py, compare.py)
 scripts/tune/           Optuna-based parameter tuning
-scripts/experimental/   In-progress research threads (opt-in, see "Experimental features")
-  ssd/                    Self-supervised distillation for dense matchers
-  bundle_adjust/          Stereo RoMa + ASP BA research prototype
 ```
-
-## Experimental features
-
-Two research threads are wired in but gated behind explicit opt-in flags because downstream validation is still in progress. Production runs should leave them off.
-
-- **Self-supervised distillation (SSD)** — Fine-tunes RoMa and SEA-RAFT on synthetic historical/modern image pairs. Training lives under `scripts/experimental/ssd/`. To load the fine-tuned weights at inference time, set `DECLASS_EXPERIMENTAL_SSD=1` in the environment. Default is off — base weights are loaded. See `scripts/experimental/ssd/README.md` for the training pipeline and known gaps.
-- **Neural tie points + ASP bundle adjust** — Feeds RoMa dense matches directly into ASP `bundle_adjust` as pre-computed tie points, optionally with 2OC-style adaptive focal length fitting (via `bundle_adjust --solve-intrinsics --intrinsics-to-float focal_length`). Code lives under `align/experimental/bundle_adjust.py` and `preprocess/experimental/match_ip.py`. To run, pass both `--experimental` and `--bundle-adjust` to `process.py`:
-  ```bash
-  python process.py --csv catalog.csv --reference ref.tif --experimental --bundle-adjust
-  ```
-  Without `--experimental`, `--bundle-adjust` errors out. See `scripts/experimental/bundle_adjust/README.md`.
 
 ## Dependencies
 
@@ -129,7 +111,7 @@ Load-bearing prior art for each pipeline stage:
 
 - **[CORONA Atlas](https://corona.cast.uark.edu/)** (Casana & Cothren, CAST). Rigorous orthorectification of 2,200+ KH-4B images using a panoramic sensor model and DEM ortho. Informs the photogrammetric orthorectification stage and the grid optimizer priors.
 - **Sohn, H. G., Kim, G. H., & Yom, J. H. (2004).** Mathematical Modelling of Historical Reconnaissance Corona KH-4B Imagery. *Photogrammetric Record*, 19(105), 51-66. Foundation sensor model for KH-4B panoramic cameras.
-- **Hou, Z., Liu, Y., Zhang, L., Ai, H., Sun, Y., Han, X., & Zhu, C. (2023).** 2OC: A General Automated Orientation and Orthorectification Method for Corona KH-4B Panoramic Imagery. *Remote Sensing*, 15(21), 5116. doi:10.3390/rs15215116. 14-parameter panoramic model (6 pose + 6 linear-in-time pose rates + IMC + focal length), per-sub-image processing, model-guided re-matching loop. `preprocess/camera_model.py` (per-segment ortho) and `align/experimental/bundle_adjust.py` (solve-intrinsics) are direct adoptions.
+- **Hou, Z., Liu, Y., Zhang, L., Ai, H., Sun, Y., Han, X., & Zhu, C. (2023).** 2OC: A General Automated Orientation and Orthorectification Method for Corona KH-4B Panoramic Imagery. *Remote Sensing*, 15(21), 5116. doi:10.3390/rs15215116. 14-parameter panoramic model + model-guided re-matching loop.
 - **Dehecq, A., et al. (2020).** Automated processing of KH-9 Hexagon imagery. *Frontiers in Earth Science*, 8, 566802. UW declass_stereo — GCP-free ASP bundle adjust using TanDEM-X DEM as ground control; inspired the ASP integration approach.
 - **Ghuffar, S., Bolch, T., Dehecq, A., et al. (2022).** CoSP: Corona Stereo Pipeline. *arXiv:2201.07756*. SuperGlue auto-GCPs + rigorous camera model; prior art for auto-GCP generation on declassified imagery.
 - **Edstedt, J., et al. (2025).** RoMa v2: Harder Better Faster Denser Feature Matching. *arXiv:2511.15706*. The dense feature matcher at the heart of the neural matching stage.

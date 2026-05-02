@@ -1,0 +1,14 @@
+# Multi-entity e2e: KH-4B 1968 mission 1104-1, DA022-DA025 (4 frames).
+# Validates the complete multi-entity mosaicing path — each entity
+# produces its own aligned TIFF then `build_all_mosaics` groups them
+# into a single strip mosaic.
+#
+# No entity_id: run_e2e_test.py + process.py use the boundary +
+# prefer_camera to auto-select the best mission+date group, which for
+# Bahrain KH-4B is DS1104-1057DA022..DA025.
+name: bahrain_kh4b_1968_multi
+boundary: data/bahrain_boundary.geojson
+reference_name: bahrain_esri_worldimagery
+catalogs:
+  - data/available/corona2_69b17d89ee62ff28.csv
+prefer_camera: A

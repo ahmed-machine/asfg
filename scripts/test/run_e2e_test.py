@@ -50,8 +50,21 @@ def resolve_paths(config: dict) -> dict:
     """Resolve relative paths in config to absolute paths."""
     from scripts.paths_config import get_reference
 
-    # Reference
-    config["reference_path"] = get_reference(config["reference"])
+    # Reference — accept both `reference_name` (current) and `reference` (legacy).
+    reference_name = config.get("reference_name") or config.get("reference")
+    if not reference_name:
+        print(f"ERROR: config missing reference_name / reference field")
+        sys.exit(1)
+    config["reference_path"] = get_reference(reference_name)
+
+    # Optional list of secondary reference names — these get fed to
+    # `--secondary-reference` on process.py. Order is priority order:
+    # the first secondary is tried before the second when the primary
+    # alignment doesn't accept.
+    sec_names = config.get("secondary_references") or []
+    if isinstance(sec_names, str):
+        sec_names = [sec_names]
+    config["secondary_reference_paths"] = [get_reference(n) for n in sec_names]
 
     # Boundary
     boundary = config["boundary"]
@@ -142,15 +155,33 @@ def collect_per_scene_results(pipeline_output_dir: Path) -> list:
                 qa = json.loads(qa_path.read_text())
                 # Extract key metrics from QA
                 if isinstance(qa, dict):
-                    if "selected" in qa:
+                    selected = None
+                    if isinstance(qa.get("selected"), dict):
                         selected = qa["selected"]
-                        if isinstance(selected, dict):
-                            entry["score"] = selected.get("total_score")
-                            img = selected.get("image_metrics", {})
-                            entry["patch_med"] = img.get("patch_med")
-                            entry["grid_score"] = img.get("grid_score")
-                            entry["grade"] = selected.get("grade")
-                            entry["accepted"] = selected.get("accepted")
+                    else:
+                        selected_name = qa.get("selected_candidate")
+                        reports = qa.get("reports") or []
+                        if selected_name:
+                            selected = next(
+                                (r for r in reports
+                                 if r.get("candidate") == selected_name),
+                                None,
+                            )
+                        if selected is None and reports:
+                            selected = next(
+                                (r for r in reports if r.get("accepted")),
+                                reports[0],
+                            )
+                    if isinstance(selected, dict):
+                        entry["score"] = selected.get("total_score")
+                        img = selected.get("image_metrics", {})
+                        entry["patch_med"] = img.get("patch_med")
+                        entry["grid_score"] = img.get("grid_score")
+                        entry["grade"] = (
+                            selected.get("grade")
+                            or selected.get("quality_grade")
+                        )
+                        entry["accepted"] = selected.get("accepted")
             except Exception:
                 pass
 
@@ -160,10 +191,20 @@ def collect_per_scene_results(pipeline_output_dir: Path) -> list:
 
 
 def find_mosaic_qa(pipeline_output_dir: Path) -> dict:
-    """Find and load mosaic QA results."""
+    """Find and load mosaic QA or explicit mosaic status results."""
     mosaic_dir = pipeline_output_dir / "mosaic"
     if not mosaic_dir.exists():
         return {}
+
+    status_payload = {}
+    for status_file in mosaic_dir.glob("*_status.json"):
+        try:
+            payload = json.loads(status_file.read_text())
+            if payload.get("mosaic_status") == "incoherent":
+                return payload
+            status_payload = status_payload or payload
+        except Exception:
+            continue
 
     for qa_file in mosaic_dir.glob("*_qa.json"):
         try:
@@ -171,7 +212,7 @@ def find_mosaic_qa(pipeline_output_dir: Path) -> dict:
         except Exception:
             continue
 
-    return {}
+    return status_payload
 
 
 def parse_selection_from_log(log_text: str) -> dict:
@@ -270,6 +311,14 @@ def run_e2e_test(config: dict, version: int, timeout: int,
         cmd.extend(["--prefer-camera", config["prefer_camera"]])
     if config.get("device"):
         cmd.extend(["--device", str(config["device"])])
+    for sec_ref in (config.get("secondary_reference_paths") or []):
+        cmd.extend(["--secondary-reference", sec_ref])
+    entity_field = config.get("entity_ids") or config.get("entity_id")
+    if entity_field:
+        if isinstance(entity_field, (list, tuple)):
+            cmd.extend(["--entities", *(str(e) for e in entity_field)])
+        else:
+            cmd.extend(["--entities", str(entity_field)])
 
     if skip_download:
         cmd.append("--skip-download")
@@ -373,13 +422,22 @@ def run_e2e_test(config: dict, version: int, timeout: int,
 
     mosaic = summary.get("mosaic", {})
     if mosaic:
-        qa = mosaic.get("qa", {})
-        print(f"\n  Mosaic QA:")
-        print(f"    score={qa.get('score', '?')}, "
-              f"grid_score={qa.get('grid_score', '?')}, "
-              f"patch_med={qa.get('patch_med', '?')}")
-        if "actual_coverage" in mosaic:
-            print(f"    coverage={mosaic['actual_coverage']*100:.1f}%")
+        if mosaic.get("mosaic_status") == "incoherent":
+            shift = mosaic.get("rejected_pair_shift") or {}
+            print(f"\n  Mosaic status: incoherent")
+            print(f"    rejected_pair={mosaic.get('strip_a', '?')} + "
+                  f"{mosaic.get('strip_b', '?')}")
+            print(f"    shift=({shift.get('dx_m', '?')}, "
+                  f"{shift.get('dy_m', '?')}) m, "
+                  f"magnitude={shift.get('magnitude_m', '?')} m")
+        else:
+            qa = mosaic.get("qa", {})
+            print(f"\n  Mosaic QA:")
+            print(f"    score={qa.get('score', '?')}, "
+                  f"grid_score={qa.get('grid_score', '?')}, "
+                  f"patch_med={qa.get('patch_med', '?')}")
+            if "actual_coverage" in mosaic:
+                print(f"    coverage={mosaic['actual_coverage']*100:.1f}%")
 
     if summary.get("errors"):
         print(f"\n  Errors ({len(summary['errors'])}):")
@@ -449,7 +507,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run end-to-end multi-frame alignment test")
     parser.add_argument(
-        "--config", "-c", required=True,
+        "config_positional", nargs="?",
+        help="Test config name (legacy positional form)")
+    parser.add_argument(
+        "--config", "-c", default=None,
         help="Test config name (from scripts/test/e2e_configs/)")
     parser.add_argument(
         "--version", "-v", type=int, default=None,
@@ -465,7 +526,11 @@ def main():
         help="Delete intermediate files after mosaic")
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config_name = args.config or args.config_positional
+    if not config_name:
+        parser.error("config is required (use --config NAME or positional NAME)")
+
+    config = load_config(config_name)
     config = resolve_paths(config)
 
     version = args.version if args.version is not None else detect_next_version()

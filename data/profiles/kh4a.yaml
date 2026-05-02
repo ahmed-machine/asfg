@@ -1,0 +1,85 @@
+inherits: _base
+
+# KH-4A CORONA (1963-1969) — Itek J-1 panoramic camera with OSCILLATING
+# scan arm + scan-head-translation IMC. Fundamentally different mechanism
+# from KH-4B's J-3 (continuous rotation + lens-rotation IMC).
+#
+# Missions: 1001-1052. Routed via `process.py::_profile_name_for_scene`
+# using `preprocess/mission_altitude.py::_series_from_mission_id`.
+#
+# Authoritative sources:
+#   CoSP (Ghuffar 2022) IEEE TGRS 60:5000151 — 13-param modified
+#     collinearity validated on KH-4A mission 1108 + KH-4B missions.
+#     Paper treats KH-4A and KH-4B identically at the camera-module level;
+#     IMC-direction difference is absorbed by pose + focal-length free
+#     parameters. σ₀ < 2 px.
+#   CORONA Atlas (Casana & Cothren 2013) — 3-10 m nadir / 20-80 m edge
+#     orthorectification on mixed KH-4A/KH-4B imagery without distinguishing.
+#   Apollo Journal "The Itek Panoramic Camera" — primary-source J-1 optics:
+#     8-element Petzval, f/3.5 (not f/3 like J-3), 10°46′ FOV, ~135 l/mm.
+#   Gunter's Space Page KH-4A — altitudes 180-250 km, less eccentric than
+#     KH-4B's 154-276 km.
+
+meta:
+  name: kh4a
+  description: KH-4A Corona (1963-1969) — Itek J-1 Petzval, oscillating pan arm, scan-head-translation IMC
+  cameras: [KH-4A]
+
+camera:
+  type: opticalbar
+  focal_length: 0.6096         # metres (609.6 mm nominal J-1 Petzval)
+  pixel_pitch: 7.0e-6          # metres (7 micron USGS scan)
+  nominal_altitude_km: 215     # mean of 180-250 km KH-4A orbital envelope
+
+  # J-1 uses OSCILLATING scan arm (reverses direction each frame), not
+  # continuous rotation. Scan cycle is longer than KH-4B's 0.5 s per
+  # the slower mechanism. IMC via scan-head translation — forward and
+  # reverse scans have opposite IMC signs. If per-segment solving,
+  # label sub-frames by scan direction.
+  scan_time: 0.9               # seconds (slower oscillating mechanism)
+  speed: 7750                  # m/s (orbital velocity at 215 km mean altitude)
+  forward_tilt: 0.2618         # radians (15° fore/aft — same as KH-4B)
+  scan_dir: right
+  motion_compensation_factor: 1.0
+  # KH-4A USGS corners are unreliable in the same way as KH-4B (±20 km).
+  # When preprocess coarse-align abstains, generate_manifest skips the
+  # entity rather than aligning against an ortho positioned only by USGS
+  # corners.
+  usgs_corners_reliable: false
+  # Stacked NCC → ELoFTR → phase-correlate fallback (preprocess/coarse_align_ncc_stack.py)
+  # engages when single-shot ELoFTR abstains. ±50 km radius brackets the
+  # KH-4A USGS corner error (same magnitude as KH-4B; measured 44 km on
+  # Bahrain frames). 50 km stays inside one coastline.
+  coarse_ncc_search_radius_m: 50000
+  scan_arc_deg: 70.0           # same 70° arc as KH-4B
+  fix_f: false
+  # Per-frame Zs0 refinement via ASP cam_gen + DEM intersection.
+  # KH-4A orbits 180-250 km (mean ~215 km); less eccentric than KH-4B.
+  cam_gen_altitude: true
+
+coarse:
+  min_ncc: 0.08
+  search_margin_m: 5000           # KH-4A USGS corners up to ±20 km off
+
+scale_rotation:
+  min_valid_frac: 0.15
+
+matching:
+  roma_size: 784
+  roma_num_corresp: 800
+  land_mask_frac_min: 0.20
+  anchor_min_land_ncc: 0.08
+  ransac_reproj_threshold: 8.0
+
+grid_optim:
+  w_data: 1.2
+  w_chamfer: 0.20
+  max_residual_norm: 0.008
+
+normalization:
+  clahe_clip_limit: 2.0
+
+qa:
+  accept_image_score_max: 180.0
+  accept_holdout_median_max: 120.0
+  accept_cv_mean_max: 120.0

@@ -1,0 +1,16 @@
+# End-to-end test: Bahrain coverage from KH-7 1967 mission 4036.
+# Entity DZB00403600089H016001 (KH-7 strip / slit-scan camera, 1967/02/08).
+#
+# Added to verify the new kh7 profile (Eastman Kodak strip camera,
+# type: linescan). KH-7 is *not* panoramic — downstream code paths
+# that key on camera.is_panoramic will bypass the 14-param fit and
+# fall through to the standard georef + ASP cam_gen ortho chain.
+#
+# Profile routes automatically: DZB4xxx prefix → kh7 via
+# process.py::_profile_name_for_scene.
+name: bahrain_kh7_1967
+entity_id: DZB00403600089H016001
+boundary: data/bahrain_boundary.geojson
+reference_name: bahrain_esri_worldimagery
+catalogs:
+  - data/available/declassii_69b17e00f346b5bd.csv

@@ -1,0 +1,8 @@
+=== verify_profiles_remaining.sh: starting 2026-04-22T03:18:55Z ===
+--- bahrain_kh4b_1968 --- 2026-04-22T03:18:55Z
+    exit=0  duration_s=297  log=scripts/test/verify_bahrain_kh4b_1968_v2.log
+--- bahrain_kh9_pc_1977 --- 2026-04-22T03:23:52Z
+    exit=1  duration_s=703  log=scripts/test/verify_bahrain_kh9_pc_1977_v2.log
+--- bahrain_kh7_1967 --- 2026-04-22T03:35:35Z
+    exit=0  duration_s=1434  log=scripts/test/verify_bahrain_kh7_1967_v2.log
+=== verify_profiles_remaining.sh: finished 2026-04-22T03:59:29Z ===

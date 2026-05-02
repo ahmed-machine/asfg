@@ -66,6 +66,73 @@ def _clahe_u8(arr):
     return clahe.apply(stretched)
 
 
+def _patch_bounds(cx: float, cy: float, half: int, shape) -> tuple[int, int, int, int]:
+    h, w = shape[:2]
+    y0 = max(0, int(cy) - half)
+    y1 = min(h, int(cy) + half + 1)
+    x0 = max(0, int(cx) - half)
+    x1 = min(w, int(cx) + half + 1)
+    return y0, y1, x0, x1
+
+
+def _laplacian_variance_u8(patch_u8: np.ndarray) -> float:
+    if patch_u8.size < 16:
+        return 0.0
+    return float(cv2.Laplacian(patch_u8, cv2.CV_64F).var())
+
+
+def _anchor_patch_is_valid(
+    cx_tgt: float, cy_tgt: float, cx_ref: float, cy_ref: float,
+    tgt_u8: np.ndarray, ref_u8: np.ndarray,
+    tgt_stable: np.ndarray | None, ref_stable: np.ndarray | None,
+    patch_half: int, min_stable_frac: float, min_texture_var: float,
+) -> bool:
+    ty0, ty1, tx0, tx1 = _patch_bounds(cx_tgt, cy_tgt, patch_half, tgt_u8.shape)
+    ry0, ry1, rx0, rx1 = _patch_bounds(cx_ref, cy_ref, patch_half, ref_u8.shape)
+    expected = (2 * patch_half + 1) ** 2
+    tgt_patch = tgt_u8[ty0:ty1, tx0:tx1]
+    ref_patch = ref_u8[ry0:ry1, rx0:rx1]
+    if tgt_patch.size < expected // 2 or ref_patch.size < expected // 2:
+        return False
+    if _laplacian_variance_u8(tgt_patch) < min_texture_var:
+        return False
+    if _laplacian_variance_u8(ref_patch) < min_texture_var:
+        return False
+    if tgt_stable is not None:
+        if float(tgt_stable[ty0:ty1, tx0:tx1].mean()) < min_stable_frac:
+            return False
+    if ref_stable is not None:
+        if float(ref_stable[ry0:ry1, rx0:rx1].mean()) < min_stable_frac:
+            return False
+    return True
+
+
+def _build_stable_mask(arr: np.ndarray) -> np.ndarray | None:
+    """Wrap ``build_semantic_masks`` and return a float stable-feature mask.
+
+    Returns None when masking fails (corrupt array, missing deps) so the
+    caller can fall back to the texture-only gate without aborting.
+    """
+    try:
+        from align.semantic_masking import build_semantic_masks
+    except Exception as exc:
+        print(f"  [auto_anchors] semantic_masking unavailable ({exc}); "
+              f"falling back to texture-only gate")
+        return None
+    try:
+        bundle = build_semantic_masks(arr)
+    except Exception as exc:
+        print(f"  [auto_anchors] semantic_masking failed ({exc}); "
+              f"falling back to texture-only gate")
+        return None
+    stable = np.asarray(bundle.stable, dtype=np.float32)
+    if stable.shape != arr.shape:
+        # Mask provider resized; tolerate by resampling.
+        stable = cv2.resize(stable, (arr.shape[1], arr.shape[0]),
+                            interpolation=cv2.INTER_NEAREST)
+    return stable
+
+
 def generate_auto_anchors(
     target_path: str,
     reference_path: str,
@@ -74,8 +141,15 @@ def generate_auto_anchors(
     coarse_res_m: float = 10.0,
     grid_cells: int = 4,
     min_matches_per_cell: int = 1,
-    min_total_anchors: int = 4,
+    min_total_anchors: int = 6,
     ransac_thresh_px: float = 8.0,
+    min_occupied_cells: int | None = None,
+    min_rows: int = 2,
+    min_cols: int = 2,
+    patch_half_px: int = 20,
+    min_stable_frac: float = 0.25,
+    min_texture_var: float = 50.0,
+    require_stable_mask: bool = True,
     model_cache=None,
     device_override: str | None = None,
 ) -> str | None:
@@ -83,7 +157,10 @@ def generate_auto_anchors(
 
     Reads the target frame and reference in their overlap region at
     ~10 m/px, runs RoMa matching, filters by RANSAC, and selects
-    spatially-distributed points on a grid.
+    spatially-distributed points on a grid. Candidates are gated on local
+    land/stability fraction and patch texture so open-sea, cloud, or
+    featureless-desert anchors don't reach the alignment pipeline. Files
+    are only written when the survivors clear a spatial-spread floor.
 
     Args:
         target_path: Georeferenced target frame.
@@ -95,6 +172,18 @@ def generate_auto_anchors(
         min_matches_per_cell: Minimum matches to keep per grid cell.
         min_total_anchors: Skip if fewer anchors than this survive.
         ransac_thresh_px: RANSAC inlier threshold in pixels.
+        min_occupied_cells: Minimum distinct grid cells spanned by the final
+            anchor set. Defaults to ``max(min_total_anchors, grid_cells)``.
+        min_rows, min_cols: Minimum distinct grid rows / cols the final
+            anchor set must span (rejects clustered anchors).
+        patch_half_px: Half-width of the validity patch (pixels, at
+            ``coarse_res_m``). Default 20 → ~400 m window at 10 m/px.
+        min_stable_frac: Minimum fraction of the patch that must be
+            classified as stable-land (when the mask is available).
+        min_texture_var: Minimum Laplacian variance of the uint8 patch.
+        require_stable_mask: If True, any anchor must clear the stable-mask
+            floor when the mask is available. If False, fall back to the
+            texture gate when masking is unavailable.
 
     Returns:
         Path to generated anchor JSON, or None on failure.
@@ -255,6 +344,17 @@ def generate_auto_anchors(
     tgt_px = tgt_px[inlier_mask]
     certs = certs[inlier_mask]
 
+    # Build stable-feature masks so we can reject open-sea / featureless-
+    # desert candidates. These rasters share shape with arr_tgt / arr_ref
+    # (the pre-RoMa coarse overlap arrays), matching tgt_px / ref_px coords.
+    tgt_stable = _build_stable_mask(arr_tgt)
+    ref_stable = _build_stable_mask(arr_ref)
+    if require_stable_mask and (tgt_stable is None or ref_stable is None):
+        print("  [auto_anchors] stable mask unavailable — anchor emission is "
+              "gated on stability; skipping rather than trusting the "
+              "texture-only fallback")
+        return None
+
     # Convert reference pixel coords to WGS84 lon/lat.
     # ref_px is in the overlap array which was reprojected to EPSG:3857.
     from pyproj import Transformer
@@ -270,9 +370,11 @@ def generate_auto_anchors(
     if lon_max <= lon_min or lat_max <= lat_min:
         return None
 
-    gcps = []
+    gcps: list[dict] = []
+    occupied_cells: set[tuple[int, int]] = set()
     cell_w = (lon_max - lon_min) / grid_cells
     cell_h = (lat_max - lat_min) / grid_cells
+    rejected_stats = {"texture": 0, "land": 0}
 
     for gi in range(grid_cells):
         for gj in range(grid_cells):
@@ -288,31 +390,67 @@ def generate_auto_anchors(
             if in_cell.sum() < min_matches_per_cell:
                 continue
 
-            # Pick highest-confidence match in this cell
+            # Try candidates in descending-confidence order, accept the
+            # first one that passes land + texture gates.
             cell_indices = np.where(in_cell)[0]
-            best_idx = cell_indices[np.argmax(certs[cell_indices])]
-            gcps.append({
-                "name": f"auto_r{gi}c{gj}",
-                "lon": float(ref_lons[best_idx]),
-                "lat": float(ref_lats[best_idx]),
-                "feature_type": "auto_match",
-                "confidence": "medium" if certs[best_idx] > 0.5 else "low",
-                "patch_size_m": 300,
-            })
+            order = cell_indices[np.argsort(-certs[cell_indices])]
+            for idx in order:
+                cx_tgt, cy_tgt = tgt_px[idx]
+                cx_ref, cy_ref = ref_px[idx]
+                if not _anchor_patch_is_valid(
+                    cx_tgt, cy_tgt, cx_ref, cy_ref,
+                    tgt_u8, ref_u8, tgt_stable, ref_stable,
+                    patch_half_px, min_stable_frac, min_texture_var,
+                ):
+                    # Cheap classification for debug output; rerun on
+                    # the failing patch would be wasteful.
+                    rejected_stats["land" if tgt_stable is not None else "texture"] += 1
+                    continue
+                gcps.append({
+                    "name": f"auto_r{gi}c{gj}",
+                    "lon": float(ref_lons[idx]),
+                    "lat": float(ref_lats[idx]),
+                    "feature_type": "auto_match",
+                    "confidence": "medium" if certs[idx] > 0.5 else "low",
+                    "patch_size_m": 300,
+                })
+                occupied_cells.add((gi, gj))
+                break
 
     if len(gcps) < min_total_anchors:
-        print(f"  [auto_anchors] Only {len(gcps)} spatially-distributed anchors "
-              f"(need {min_total_anchors})")
+        print(f"  [auto_anchors] Only {len(gcps)} anchors passed land/texture "
+              f"gates (need {min_total_anchors}; rejected {rejected_stats})")
+        return None
+
+    # Spread check: the anchors must span enough distinct cells, rows, and
+    # columns. A tight cluster fits an affine locally but doesn't
+    # constrain the whole-image geometry.
+    occupied = len(occupied_cells)
+    rows_seen = {gi for gi, _ in occupied_cells}
+    cols_seen = {gj for _, gj in occupied_cells}
+    floor_occupied = (min_occupied_cells
+                      if min_occupied_cells is not None
+                      else max(min_total_anchors, grid_cells))
+    if (occupied < floor_occupied
+            or len(rows_seen) < min_rows
+            or len(cols_seen) < min_cols):
+        print(f"  [auto_anchors] Anchors too clustered "
+              f"(occupied={occupied}/{grid_cells*grid_cells}, "
+              f"rows={len(rows_seen)}, cols={len(cols_seen)}; "
+              f"need ≥{floor_occupied} cells, ≥{min_rows}×{min_cols}); skipping")
         return None
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     anchor_data = {
         "description": f"Auto-generated anchors ({len(gcps)} points, "
-                       f"{grid_cells}x{grid_cells} grid)",
+                       f"{grid_cells}x{grid_cells} grid, "
+                       f"{occupied}/{grid_cells*grid_cells} cells occupied)",
         "gcps": gcps,
     }
     with open(output_path, "w") as f:
         json.dump(anchor_data, f, indent=2)
 
-    print(f"  [auto_anchors] Generated {len(gcps)} anchors → {os.path.basename(output_path)}")
+    print(f"  [auto_anchors] Generated {len(gcps)} anchors "
+          f"({occupied}/{grid_cells*grid_cells} cells) → "
+          f"{os.path.basename(output_path)}")
     return output_path

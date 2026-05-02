@@ -94,3 +94,14 @@ class AlignState:
     tps_fallback: bool = False
     abstained: bool = False
     temp_paths: List[str] = field(default_factory=list)
+    # Year gap between source and reference acquisition (e.g. 1968 KH-4B vs
+    # 1976 KH-9 ref → 8.0). When >0 the QA scoring engages cross-temporal
+    # corrections: reclamation mask excludes land/water-disagreement pixels
+    # from shoreline scoring, and the grid_weight is downweighted past 5 yr
+    # so undetected drift (vegetation, sediment) doesn't dominate the score.
+    era_gap_years: Optional[float] = None
+
+    # Iteration support: when True, run() preserves precorrection_tmp and the
+    # rough_georef scratch through to the next invocation so a checkpoint
+    # resume can re-read them. Wired from `--keep-temp-paths` on auto-align.py.
+    keep_temp_paths: bool = False

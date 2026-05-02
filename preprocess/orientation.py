@@ -39,9 +39,8 @@ def rotate_corners_cw90(corners: dict) -> dict:
 def rotate_corners_ccw90(corners: dict) -> dict:
     """Rotate corner assignments 90° counter-clockwise.
 
-    After CCW rotation of the image:
-    - Old top edge (NW-NE) becomes left edge → new NW=NE, new SW=SE (wait...)
-    - Actually: old NE becomes new NW, old SE becomes new NE, etc.
+    After CCW rotation: old NE → new NW, old SE → new NE, old SW → new SE,
+    old NW → new SW.
     """
     return {
         "NW": corners["NE"], "NE": corners["SE"],
@@ -268,49 +267,220 @@ def _read_reference_crop(reference_path, west, south, east, north, target_h, tar
     return arr
 
 
+def _reference_bounds_wgs84(reference_path):
+    """Return ``(west, south, east, north)`` of the reference in EPSG:4326,
+    or None if the reference can't be opened."""
+    from osgeo import gdal, osr
+    gdal.UseExceptions()
+    ds = gdal.Open(reference_path)
+    if ds is None:
+        return None
+    gt = ds.GetGeoTransform()
+    w, h = ds.RasterXSize, ds.RasterYSize
+    proj = ds.GetProjection()
+    ds = None
+
+    x_min = gt[0]
+    x_max = gt[0] + w * gt[1]
+    y_max = gt[3]
+    y_min = gt[3] + h * gt[5]
+
+    ref_srs = osr.SpatialReference()
+    ref_srs.ImportFromWkt(proj)
+    wgs84 = osr.SpatialReference()
+    wgs84.ImportFromEPSG(4326)
+    ref_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+    if not ref_srs.IsSame(wgs84):
+        ct = osr.CoordinateTransformation(ref_srs, wgs84)
+        cs = [
+            ct.TransformPoint(x_min, y_min),
+            ct.TransformPoint(x_max, y_max),
+            ct.TransformPoint(x_min, y_max),
+            ct.TransformPoint(x_max, y_min),
+        ]
+        xs = [c[0] for c in cs]
+        ys = [c[1] for c in cs]
+        return min(xs), min(ys), max(xs), max(ys)
+    return x_min, y_min, x_max, y_max
+
+
+def _compute_ref_overlap_or_fetch(corners, reference_path):
+    """Find the (ref_path, clip_bounds) to use for orientation scoring.
+
+    Checks whether ``reference_path`` covers the target corners sufficiently;
+    if not, auto-fetches a Sentinel-2 reference and recomputes overlap.
+    Returns ``(reference_path, clip_bounds)`` or ``None`` if no usable
+    overlap is available.
+    """
+    all_lats = [corners[k][0] for k in ("NW", "NE", "SE", "SW")]
+    all_lons = [corners[k][1] for k in ("NW", "NE", "SE", "SW")]
+    full_west, full_east = min(all_lons), max(all_lons)
+    full_south, full_north = min(all_lats), max(all_lats)
+
+    ref_bounds = _reference_bounds_wgs84(reference_path)
+    if ref_bounds is None:
+        print("  Orientation ref-match: cannot open reference")
+        return None
+    ref_west, ref_south, ref_east, ref_north = ref_bounds
+
+    ovl_west = max(full_west, ref_west)
+    ovl_east = min(full_east, ref_east)
+    ovl_south = max(full_south, ref_south)
+    ovl_north = min(full_north, ref_north)
+
+    need_auto_fetch = (ovl_west >= ovl_east or ovl_south >= ovl_north)
+    if not need_auto_fetch:
+        ovl_area = (ovl_east - ovl_west) * (ovl_north - ovl_south)
+        full_area = max(1e-10, (full_east - full_west) * (full_north - full_south))
+        ovl_frac = ovl_area / full_area
+        if ovl_frac < 0.30:
+            need_auto_fetch = True
+        else:
+            print(f"  Orientation ref-match: {ovl_frac:.0%} of image overlaps "
+                  f"reference ([{ovl_west:.2f},{ovl_south:.2f}]-"
+                  f"[{ovl_east:.2f},{ovl_north:.2f}])")
+
+    if need_auto_fetch:
+        try:
+            from preprocess.georef import fetch_sentinel2_reference
+            import hashlib, tempfile
+            bbox = (full_west - 0.1, full_south - 0.1,
+                    full_east + 0.1, full_north + 0.1)
+            bbox_hash = hashlib.md5(str(bbox).encode()).hexdigest()[:8]
+            auto_ref = os.path.join(
+                tempfile.gettempdir(), f"orient_ref_{bbox_hash}.tif")
+            reference_path = fetch_sentinel2_reference(bbox, auto_ref)
+            print(f"  Orientation ref-match: using auto-fetched Sentinel-2")
+            ref_bounds = _reference_bounds_wgs84(reference_path)
+            if ref_bounds is None:
+                return None
+            ref_west, ref_south, ref_east, ref_north = ref_bounds
+            ovl_west = max(full_west, ref_west)
+            ovl_east = min(full_east, ref_east)
+            ovl_south = max(full_south, ref_south)
+            ovl_north = min(full_north, ref_north)
+            if ovl_west >= ovl_east or ovl_south >= ovl_north:
+                print("  Orientation ref-match: still no overlap after auto-fetch")
+                return None
+        except Exception as e:
+            print(f"  Orientation ref-match: auto-fetch failed ({e}), "
+                  f"falling back to metadata")
+            return None
+
+    return reference_path, (ovl_west, ovl_south, ovl_east, ovl_north)
+
+
+def _score_rotation_candidate(rotation, rot_corners, image_path, reference_path,
+                              img_w, img_h, target_deg, clip):
+    """Score one rotation candidate via land-mask NCC. Returns the
+    normalised cross-correlation in [-1, 1], or None if the overlap
+    isn't measurable (no coverage / no land-water contrast)."""
+    try:
+        warped = _fast_mini_georef(
+            image_path, rot_corners, img_w, img_h, target_deg,
+            clip_bounds=clip,
+        )
+    except Exception as e:
+        print(f"    Rotation {rotation:>3}: georef failed ({e})")
+        return None
+    if warped is None:
+        return None
+
+    warped_arr, w_west, w_south, w_east, w_north = warped
+    wh, ww = warped_arr.shape
+
+    ref_crop = _read_reference_crop(
+        reference_path, w_west, w_south, w_east, w_north,
+        target_h=wh, target_w=ww,
+    )
+    if ref_crop is None:
+        print(f"    Rotation {rotation:>3}: no reference coverage")
+        return None
+
+    # Coastlines are invariant across decades; compare land-vs-water masks
+    # in the region where both images have valid (non-zero) data.
+    valid = (warped_arr > 0) & (ref_crop > 0)
+    valid_frac = np.mean(valid)
+    if valid_frac < 0.05:
+        print(f"    Rotation {rotation:>3}: insufficient overlap "
+              f"(valid={valid_frac:.1%})")
+        return None
+
+    import cv2 as _cv2
+
+    def _to_u8(arr, mask):
+        # Percentile-normalise to uint8 so Otsu threshold works on both
+        # 8-bit historical imagery and 16-bit Sentinel-2.
+        vals = arr[mask]
+        if vals.size == 0:
+            return arr.astype(np.uint8)
+        lo, hi = np.percentile(vals, [2, 98])
+        if hi <= lo:
+            hi = lo + 1
+        clipped = np.clip((arr.astype(np.float32) - lo) / (hi - lo) * 255, 0, 255)
+        return clipped.astype(np.uint8)
+
+    w_u8 = _to_u8(warped_arr, valid)
+    r_u8 = _to_u8(ref_crop, valid)
+
+    w_thresh, _ = _cv2.threshold(w_u8[valid], 0, 1, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
+    r_thresh, _ = _cv2.threshold(r_u8[valid], 0, 1, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
+
+    warped_mask = (w_u8 > w_thresh).astype(np.float32)
+    ref_mask = (r_u8 > r_thresh).astype(np.float32)
+
+    w_vals = warped_mask[valid]
+    r_vals = ref_mask[valid]
+    w_mean = w_vals.mean()
+    r_mean = r_vals.mean()
+    if w_mean < 0.02 or w_mean > 0.98 or r_mean < 0.02 or r_mean > 0.98:
+        print(f"    Rotation {rotation:>3}: no contrast in overlap "
+              f"(w_land={w_mean:.1%}, r_land={r_mean:.1%})")
+        return None
+
+    w_centered = w_vals - w_mean
+    r_centered = r_vals - r_mean
+    w_std = w_centered.std()
+    r_std = r_centered.std()
+
+    if w_std < 1e-6 or r_std < 1e-6:
+        corr = 0.0
+    else:
+        corr = float(np.dot(w_centered, r_centered) / (w_std * r_std * len(w_vals)))
+
+    print(f"    Rotation {rotation:>3}: land corr = {corr:.4f} "
+          f"(valid={valid_frac:.0%})")
+    return corr
+
+
 def detect_orientation_against_reference(image_path, corners, reference_path,
                                          target_res=200.0):
-    """Determine image orientation by fast low-res georef + SIFT matching.
+    """Determine image orientation by low-res georef + land-mask NCC.
 
-    For each candidate rotation (0, 90, 180, 270):
-    1. Apply the rotation to the corner coordinates.
-    2. Use GDAL to warp the raw image to EPSG:4326 at coarse resolution
-       using the rotated corners as GCPs.
-    3. Read the reference at the matching bounds.
-    4. Run SIFT matching between the warped image and reference.
+    Tries each candidate rotation (0/180 for panoramic strips; also
+    90/270 for non-panoramic), warps the raw image to EPSG:4326 at
+    ``target_res`` using rotated corners as GCPs, reads the reference
+    at matching bounds, and scores land-water correlation. The highest-
+    scoring rotation's corners are the correct GCP mapping (no physical
+    image rotation — GDAL handles the affine warp).
 
-    The rotation with the most SIFT RANSAC inliers wins.
-
-    Args:
-        image_path: Path to the raw/stitched image (not yet georeferenced).
-        corners: Dict with NW, NE, SE, SW keys, each (lat, lon).
-        reference_path: Path to a georeferenced reference image.
-        target_res: Approximate resolution in meters for the low-res georef.
-
-    Returns:
-        (rotation_degrees, corrected_corners, n_inliers)
+    Returns ``(rotation_degrees, corrected_corners, confidence)`` where
+    confidence is ``max(0, int(best_corr * 100))``.
     """
-    import cv2
     from osgeo import gdal
-
     gdal.UseExceptions()
 
     ds = gdal.Open(image_path)
     if ds is None:
         print("  Orientation ref-match: could not open image")
         return 0, corners, 0
-
     img_w, img_h = ds.RasterXSize, ds.RasterYSize
     ds = None
 
-    # GCP mappings for testing each rotation in _fast_mini_georef.
-    # These map unrotated pixel positions to geographic corners as if the
-    # image were captured at orientation R.  For 90/270 the GCP mapping is
-    # the INVERSE of the corner rotation applied after actual image rotation.
-    #
-    # For panoramic cameras (KH-4), the strip is always landscape —
-    # only 0° and 180° are valid orientations.
-    is_panoramic = img_w > img_h * 2  # clearly landscape strip
+    # Panoramic strips are always landscape — 90/270 aren't valid.
+    is_panoramic = img_w > img_h * 2
     if is_panoramic:
         candidates = [
             (0,   corners),
@@ -324,226 +494,24 @@ def detect_orientation_against_reference(image_path, corners, reference_path,
             (270, rotate_corners_cw90(corners)),
         ]
 
-    # Target resolution in degrees (~target_res meters / 111km)
-    target_deg = target_res / 111000.0
+    target_deg = target_res / 111000.0  # ~target_res m / 111 km per degree
 
-    # Check if reference covers the target area; if not, try auto-fetching
-    all_lats = [corners[k][0] for k in ("NW", "NE", "SE", "SW")]
-    all_lons = [corners[k][1] for k in ("NW", "NE", "SE", "SW")]
-    full_west, full_east = min(all_lons), max(all_lons)
-    full_south, full_north = min(all_lats), max(all_lats)
-
-    # Determine the reference bounds in EPSG:4326 so we can compute overlap
-    from osgeo import gdal as _gdal_check, osr as _osr_check
-    _gdal_check.UseExceptions()
-    _ref_ds = _gdal_check.Open(reference_path)
-    if _ref_ds is None:
-        print("  Orientation ref-match: cannot open reference")
+    overlap = _compute_ref_overlap_or_fetch(corners, reference_path)
+    if overlap is None:
         return 0, corners, 0
-    _ref_gt = _ref_ds.GetGeoTransform()
-    _ref_w, _ref_h = _ref_ds.RasterXSize, _ref_ds.RasterYSize
-    _ref_proj = _ref_ds.GetProjection()
-    _ref_ds = None
-
-    _rx_min = _ref_gt[0]
-    _rx_max = _ref_gt[0] + _ref_w * _ref_gt[1]
-    _ry_max = _ref_gt[3]
-    _ry_min = _ref_gt[3] + _ref_h * _ref_gt[5]
-
-    _ref_srs = _osr_check.SpatialReference()
-    _ref_srs.ImportFromWkt(_ref_proj)
-    _wgs84 = _osr_check.SpatialReference()
-    _wgs84.ImportFromEPSG(4326)
-    _ref_srs.SetAxisMappingStrategy(_osr_check.OAMS_TRADITIONAL_GIS_ORDER)
-    _wgs84.SetAxisMappingStrategy(_osr_check.OAMS_TRADITIONAL_GIS_ORDER)
-
-    if not _ref_srs.IsSame(_wgs84):
-        _ct = _osr_check.CoordinateTransformation(_ref_srs, _wgs84)
-        _c1 = _ct.TransformPoint(_rx_min, _ry_min)
-        _c2 = _ct.TransformPoint(_rx_max, _ry_max)
-        _c3 = _ct.TransformPoint(_rx_min, _ry_max)
-        _c4 = _ct.TransformPoint(_rx_max, _ry_min)
-        _xs = [_c1[0], _c2[0], _c3[0], _c4[0]]
-        _ys = [_c1[1], _c2[1], _c3[1], _c4[1]]
-        ref_west, ref_east = min(_xs), max(_xs)
-        ref_south, ref_north = min(_ys), max(_ys)
-    else:
-        ref_west, ref_east = _rx_min, _rx_max
-        ref_south, ref_north = _ry_min, _ry_max
-
-    # Compute intersection of target area and reference bounds
-    ovl_west = max(full_west, ref_west)
-    ovl_east = min(full_east, ref_east)
-    ovl_south = max(full_south, ref_south)
-    ovl_north = min(full_north, ref_north)
-
-    need_auto_fetch = False
-    if ovl_west >= ovl_east or ovl_south >= ovl_north:
-        need_auto_fetch = True
-    else:
-        ovl_area = (ovl_east - ovl_west) * (ovl_north - ovl_south)
-        full_area = max(1e-10, (full_east - full_west) * (full_north - full_south))
-        ovl_frac = ovl_area / full_area
-        # Need substantial overlap for reliable land mask matching
-        if ovl_frac < 0.30:
-            need_auto_fetch = True
-        else:
-            print(f"  Orientation ref-match: {ovl_frac:.0%} of image overlaps "
-                  f"reference ([{ovl_west:.2f},{ovl_south:.2f}]-"
-                  f"[{ovl_east:.2f},{ovl_north:.2f}])")
-
-    if need_auto_fetch:
-        # Auto-fetch Sentinel-2 reference for the full strip area
-        try:
-            from preprocess.georef import fetch_sentinel2_reference
-            import hashlib, tempfile
-            bbox = (full_west - 0.1, full_south - 0.1,
-                    full_east + 0.1, full_north + 0.1)
-            bbox_hash = hashlib.md5(str(bbox).encode()).hexdigest()[:8]
-            auto_ref = os.path.join(
-                tempfile.gettempdir(), f"orient_ref_{bbox_hash}.tif")
-            reference_path = fetch_sentinel2_reference(bbox, auto_ref)
-            print(f"  Orientation ref-match: using auto-fetched Sentinel-2")
-
-            # Recompute overlap with new reference (might be EPSG:3857)
-            _ref_ds2 = _gdal_check.Open(reference_path)
-            if _ref_ds2 is None:
-                return 0, corners, 0
-            _rgt2 = _ref_ds2.GetGeoTransform()
-            _rw2, _rh2 = _ref_ds2.RasterXSize, _ref_ds2.RasterYSize
-            _rp2 = _ref_ds2.GetProjection()
-            _ref_ds2 = None
-
-            _rs2 = _osr_check.SpatialReference()
-            _rs2.ImportFromWkt(_rp2)
-            _rs2.SetAxisMappingStrategy(_osr_check.OAMS_TRADITIONAL_GIS_ORDER)
-            _rx2_min = _rgt2[0]
-            _rx2_max = _rgt2[0] + _rw2 * _rgt2[1]
-            _ry2_max = _rgt2[3]
-            _ry2_min = _rgt2[3] + _rh2 * _rgt2[5]
-
-            if not _rs2.IsSame(_wgs84):
-                _ct2 = _osr_check.CoordinateTransformation(_rs2, _wgs84)
-                _corners2 = [_ct2.TransformPoint(_rx2_min, _ry2_min),
-                             _ct2.TransformPoint(_rx2_max, _ry2_max),
-                             _ct2.TransformPoint(_rx2_min, _ry2_max),
-                             _ct2.TransformPoint(_rx2_max, _ry2_min)]
-                ref_west = min(c[0] for c in _corners2)
-                ref_east = max(c[0] for c in _corners2)
-                ref_south = min(c[1] for c in _corners2)
-                ref_north = max(c[1] for c in _corners2)
-            else:
-                ref_west, ref_east = _rx2_min, _rx2_max
-                ref_south, ref_north = _ry2_min, _ry2_max
-
-            ovl_west = max(full_west, ref_west)
-            ovl_east = min(full_east, ref_east)
-            ovl_south = max(full_south, ref_south)
-            ovl_north = min(full_north, ref_north)
-            if ovl_west >= ovl_east or ovl_south >= ovl_north:
-                print("  Orientation ref-match: still no overlap after auto-fetch")
-                return 0, corners, 0
-        except Exception as e:
-            print(f"  Orientation ref-match: auto-fetch failed ({e}), "
-                  f"falling back to metadata")
-            return 0, corners, 0
+    reference_path, clip = overlap
 
     best_rotation = 0
     best_score = -2.0
-
-    clip = (ovl_west, ovl_south, ovl_east, ovl_north)
-
     for rotation, rot_corners in candidates:
-        try:
-            warped = _fast_mini_georef(
-                image_path, rot_corners, img_w, img_h, target_deg,
-                clip_bounds=clip,
-            )
-        except Exception as e:
-            print(f"    Rotation {rotation:>3}: georef failed ({e})")
-            continue
-
-        if warped is None:
-            continue
-
-        warped_arr, warped_west, warped_south, warped_east, warped_north = warped
-        wh, ww = warped_arr.shape
-
-        # Read reference at matching bounds
-        ref_crop = _read_reference_crop(
-            reference_path, warped_west, warped_south, warped_east, warped_north,
-            target_h=wh, target_w=ww,
+        corr = _score_rotation_candidate(
+            rotation, rot_corners, image_path, reference_path,
+            img_w, img_h, target_deg, clip,
         )
-        if ref_crop is None:
-            print(f"    Rotation {rotation:>3}: no reference coverage")
-            continue
-
-        # Compare land masks via normalized cross-correlation.
-        # Only compare in the region where BOTH images have valid (non-zero) data.
-        # This works across decades and camera systems because coastlines
-        # are invariant.
-        valid = (warped_arr > 0) & (ref_crop > 0)
-        valid_frac = np.mean(valid)
-        if valid_frac < 0.05:
-            print(f"    Rotation {rotation:>3}: insufficient overlap "
-                  f"(valid={valid_frac:.1%})")
-            continue
-
-        import cv2 as _cv2
-
-        # Normalize both to uint8 for consistent Otsu thresholding.
-        # Handles both 8-bit historical imagery and 16-bit Sentinel-2.
-        def _to_u8(arr, mask):
-            vals = arr[mask]
-            if vals.size == 0:
-                return arr.astype(np.uint8)
-            lo, hi = np.percentile(vals, [2, 98])
-            if hi <= lo:
-                hi = lo + 1
-            clipped = np.clip((arr.astype(np.float32) - lo) / (hi - lo) * 255, 0, 255)
-            return clipped.astype(np.uint8)
-
-        w_u8 = _to_u8(warped_arr, valid)
-        r_u8 = _to_u8(ref_crop, valid)
-
-        w_thresh, _ = _cv2.threshold(w_u8[valid], 0, 1, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
-        r_thresh, _ = _cv2.threshold(r_u8[valid], 0, 1, _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
-
-        warped_mask = (w_u8 > w_thresh).astype(np.float32)
-        ref_mask = (r_u8 > r_thresh).astype(np.float32)
-
-        # Mask to only the valid overlap region
-        w_vals = warped_mask[valid]
-        r_vals = ref_mask[valid]
-
-        w_mean = w_vals.mean()
-        r_mean = r_vals.mean()
-
-        # Both must have land/water contrast within the overlap
-        if w_mean < 0.02 or w_mean > 0.98 or r_mean < 0.02 or r_mean > 0.98:
-            print(f"    Rotation {rotation:>3}: no contrast in overlap "
-                  f"(w_land={w_mean:.1%}, r_land={r_mean:.1%})")
-            continue
-
-        w_centered = w_vals - w_mean
-        r_centered = r_vals - r_mean
-        w_std = w_centered.std()
-        r_std = r_centered.std()
-
-        if w_std < 1e-6 or r_std < 1e-6:
-            corr = 0.0
-        else:
-            corr = float(np.dot(w_centered, r_centered) / (w_std * r_std * len(w_vals)))
-
-        print(f"    Rotation {rotation:>3}: land corr = {corr:.4f} "
-              f"(valid={valid_frac:.0%})")
-
-        if corr > best_score:
+        if corr is not None and corr > best_score:
             best_score = corr
             best_rotation = rotation
 
-    # The winning candidate's corners ARE the correct GCP mapping — return them
-    # directly. No physical image rotation needed; GDAL handles the affine warp.
     best_corners = dict(candidates)[best_rotation]
     confidence = max(0, int(best_score * 100))
     return best_rotation, best_corners, confidence

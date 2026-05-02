@@ -13,118 +13,42 @@ camera:
   type: opticalbar
   focal_length: 1.524          # metres (60 in — KH-9 panoramic camera)
   pixel_pitch: 7.0e-6          # metres (7 μm USGS scan)
-  scan_time: 0.5               # seconds — nominal; refine via --solve-intrinsics
+  nominal_altitude_km: 197     # catalog-mean from perigee/apogee; 1212 actual 196-217 km
+
+  # Scan time is mode-dependent per NRO Preliminary KH-9 Camera Manual
+  # 1969 (p. 10): max film velocity 204 in/s, synchronous with angular
+  # scan rate, format lengths 2.62/5.24/7.86/10.48 ft for 30°/60°/90°/
+  # 120°. At 204 in/s peak this gives scan times ~0.154/0.308/0.463/0.617
+  # s. Most D3C deliveries are 120° scans, so 0.62 s is the new default.
+  # Override per-scene via USGS titling "Swath Center" + "Swath Indicator"
+  # fields when available.
+  scan_time: 0.62              # seconds — 120° scan mode @ nominal V/H
   speed: 7800                  # m/s orbital velocity (~170 km altitude)
   forward_tilt: 0.1745         # 10° for Fore/Aft stereo pairs (sign flipped by process.py based on A/F designation)
   scan_dir: right
   motion_compensation_factor: 1.0
-  preprocess_matcher: roma
-  panoramic_local_crs: ""
-  # Reduced 10000 → 2000 (2026-04-18): 10 km pad per side inflated each
-  # segment's RoMa-vs-reference search region to ~48 km, so matches
-  # scattered far beyond the 28 km USGS-interpolated per-segment extent
-  # and the 14p fit converged onto a 48-km-wide footprint per segment.
-  # Rendered orthos then overlapped adjacent segments by ~55 %. 2 km
-  # matches extract_reference_gcps's own default — tight enough to
-  # respect the USGS corners without starving the matcher on modest
-  # USGS corner error. See diagnostics/baseline_v7_tight_bbox/.
-  gcp_search_pad_m: 2000
-  gcp_match_res_m_coarse: 4.0
-  gcp_match_res_m_fine: 2.0
-  panoramic_fit_rms_px_max: 4.0
-  # Hard gate relaxed from 20 → 25 to accommodate scenes where Stage B
-  # converges at 20-25 px on water-dominant / low-feature sub-frames.
-  # seg00 on Bahrain D3C1213 sits around 21 px with 208 coarse GCPs; the
-  # single-camera fallback below is far worse than a slightly-loose fit.
-  panoramic_fit_rms_px_hard_max: 25.0
-  # Relaxed from 2.0 → 80.0 so segments with >10 px seam shift reach
-  # Phase 3 TPS seam-warping (the whole point of Phase 3 is to fix
-  # mismatched seams that Stage A/B couldn't). Single-camera fallback
-  # is reserved for wholly pathological fits (e.g. runaway pose).
-  panoramic_seam_shift_px_max: 80.0
-  # Physical scan arc is ~120° but align/grid_optim.py set_panoramic_prior
-  # uses a 1/cos²(θ) approximation that breaks at wide arcs (peak edge
-  # displacement > 1.0 normalised at 120°). ASP mapproject already corrects
-  # the true bow-tie distortion before grid_optim runs, so we disable the
-  # in-house prior by setting scan_arc_deg: 0.0. Revisit if ASP is bypassed.
+  # KH-9 PC USGS corners are within a few km — preprocess coarse-align
+  # reliably converges. Treat the abstain branch as a real failure that
+  # should *not* hard-skip alignment (it's likely a local matching glitch
+  # rather than a fundamentally misplaced ortho).
+  usgs_corners_reliable: true
+  # Physical scan arc ~120° but align/grid_optim.py's 1/cos²(θ) prior
+  # breaks past wide arcs. ASP mapproject already corrects bow-tie, so
+  # we disable the in-house prior. Revisit if ASP is bypassed.
   scan_arc_deg: 0.0
-  # 2OC paper (Hou et al. 2023, Table 6) measured 1.18% focal-length spread
-  # across KH-4B sub-images of a single strip (0.6025-0.6096 m). KH-9 PC
-  # spread is unmeasured in the paper; we assume similar-order drift and
-  # let ASP bundle_adjust float focal_length per frame.
-  bundle_adjust_solve_intrinsics: true
-  # Phase 3c note: unlike kh4.yaml we DO NOT override ``f_frac_range``
-  # or ``f_prior_frac_sigma`` here. The 2OC 1.18% is a KH-4B Petzval
-  # measurement; Dehecq 2020's ~1.4% is KH-9 MC (a frame camera, not
-  # the panoramic PC). Neither is a KH-9 PC measurement — transferring
-  # an empirical spread across different optical systems is not
-  # supported by physics. Our own Bahrain D3C1213 evidence shows f
-  # fits to 1.164 m (24% below nominal 1.524 m) in its healthy basin,
-  # which is itself proof that ±2-5% bounds would over-constrain
-  # KH-9 PC. Defaults of ±30% / 0.5% prior stay. See
-  # ``memory/focal_length_priors.md``.
-  # Orthorectification strategy. Phase 1 of the recovery plan defaults
-  # the production path to ``stitched`` (whole-strip cam_gen + mapproject)
-  # because the per-segment branch still shows geometry failures on the
-  # KH-9 Bahrain benchmark (seam 0-1: no valid overlap; seam 1-2 ZNCC:
-  # -0.01). Opt in to the 2OC-style per-segment path by setting
-  # ``ortho_strategy: per_segment_experimental`` in an override file or
-  # at the CLI. The legacy ``per_segment_ortho: true`` flag is still
-  # honoured as a deprecated alias; new configs should use
-  # ``ortho_strategy`` directly.
-  ortho_strategy: stitched
-  per_segment_ortho: true
-  # Strip-level Zs0 from ASP cam_gen. Runs cam_gen ONCE on the stitched
-  # raw strip (paired with the 4 USGS strip corners), parses altitude-
-  # above-ellipsoid from the refined ECEF camera centre, and uses that
-  # single value as the Zs0 seed for every sub-frame's 14-parameter LM
-  # fit via fix_zs0=True. Breaks the f/Zs0 gauge-freedom basin that
-  # otherwise collapses f to the ±30 % lower bound on narrow-row GCPs.
-  #
-  # Note: fix_f is NOT toggled by this flag. The Stage A/B call sites in
-  # preprocess/camera_model.py pass fix_f=False unconditionally because
-  # narrow-row KH-9 PC GCPs (typical coverage ~2 km out of 20 km sub-
-  # frame) create an 18 % along/cross-track ground-scale asymmetry that
-  # only a free f can absorb (see memory/fix_f_convergence_fix.md and
-  # memory/kh_panoramic_14param_findings.md §2).
-  #
-  # cam_gen is seeded with a TLE-propagated altitude when available. If
-  # cam_gen's refined result falls outside [140, 280] km it is rejected
-  # and the fit falls back to TLE. Phase 3 of the recovery plan will
-  # tighten this gate; today the only check is the range clamp.
+  # Pin focal length per CoSP/Ghuffar-2023 published practice. Both
+  # canonical KH-9 PC workflows (CoSP 2022 §III-C; Ghuffar 2023 Cryosphere)
+  # fix f at 1.524 m nominal to break the f/Zs0 gauge degeneracy.
+  fix_f: true
+  # KH-9 PC uses platen-rotation IMC (Manual p. 10), not KH-4B's lens-
+  # rotation mechanism. CoSP §V-A attributes KH-4B's ω₁ ≈ 0.76–1.09°/t
+  # to absorbing the lens rotation; KH-9's ω₁ shouldn't need that.
+  # Tighten from ±1.0° → ±0.2° to keep attitude rates physical.
+  rate_range_deg: 0.2
+  # Strip-level Zs0 from cam_gen on the stitched raw strip; pinned into
+  # camera generation. cam_gen rejected if outside [140, 280] km with
+  # fallback to TLE.
   cam_gen_altitude: true
-  # Phase 3 (smooth-vector-field seam reconciliation) — post-hoc TPS half-
-  # warp applied to each segment's seam band. feather_px controls how far
-  # into the segment interior the warp tapers; tps_smoothing regularises
-  # the RBF; post_warp_rms_m_max is the hard reject threshold (falls back
-  # to the unwarped blend if the TPS residual exceeds this).
-  panoramic_seam_feather_px: 400
-  panoramic_seam_tps_smoothing: 100.0
-  panoramic_seam_post_warp_rms_m_max: 30.0
-  # 2OC §4.4 model-guided re-matching. After Stage A/B, re-render each
-  # sub-frame ortho, re-match it against the reference to produce new
-  # GCPs distributed across the full sub-frame footprint, then re-fit
-  # the 14p pose. Paper Table 11 ablation credits this loop with most
-  # of 2OC's headline 30–45 % accuracy gain on KH-4B. Was gated at 0
-  # (off) while the recovery-plan Phase 3 (altitude) and Phase 4 (bbox
-  # policy) prerequisites waited to land. Both are now in production
-  # (cam_gen_altitude: true above; bbox_policy defaults to
-  # predicted_union_gcp in preprocess/camera_model.py:1790), so the
-  # gate is stale. _iterative_guided_refit in
-  # preprocess/camera_model.py:3823 rejects any iteration that
-  # regresses RMS or seam shift, so enabling it is safe on hard scenes.
-  guided_refit_max_iter: 2
-  # Per-segment blend: feathered weighted-average so adjacent sub-frame
-  # transitions smooth over ~1 km instead of a hard argmax-Voronoi
-  # boundary. With §4.4 model-guided re-matching populating GCPs across
-  # each sub-frame, the per-segment 14p fits agree closely enough in the
-  # overlap that the legacy "doubled content ghost" risk from averaging
-  # is acceptable. Observed visual stair-step on Bahrain D3C1213 goes
-  # away with feather_px=200 (~1 km at 4.8 m/px reference resolution).
-  # ``argmax`` remains the safe fallback for profiles where the 14p fits
-  # are not yet reliable across the sub-frame.
-  panoramic_blend_mode: feather
-  panoramic_blend_feather_px: 200
 
 coarse:
   coarse_res: 10.0
@@ -158,22 +82,10 @@ grid_optim:
   w_arap: 1.133
   w_laplacian: 0.992
   w_disp: 0.081
-  w_pixel: 3.93
-  pixel_ncc_res: 2.77
-  pixel_ncc_window: 5
-  pixel_ncc_cadence: 3
-  w_feat: 0.0025
-  feat_extract_res: 7.43
-  feat_coverage_gate: false
-  feat_scale_factor: 1.665
-  feat_mid_ratio: 0.359
-  feat_lncc_window: 5
   level_w_data_scale: [1.0, 1.607, 1.963]
   level_w_disp_scale: [1.0, 0.441, 0.301]
   level_reg_scale: [1.0, 1.410, 1.684]
   level_chamfer_scale: [1.0, 0.393, 0.515]
-  level_w_pixel_scale: [0.0, 0.724, 1.637]
-  level_w_feat_scale: [0.0, 1.523, 0.961]
 
 qa:
   accept_image_score_max: 120.0

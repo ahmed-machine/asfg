@@ -6,8 +6,6 @@ at its closest pass over the scene centre on the acquisition date, and
 returns the result. Callers use this as:
 
   * the ``Zs0`` seed for ASP ``cam_gen`` (see :mod:`preprocess.camera_model`)
-  * the ``initial.Zs0`` prior for the 14-parameter LM fit
-    (see :mod:`preprocess.kh_panoramic`)
 
 When anything is missing — catalog entry, TLE file, skyfield dependency,
 acquisition date, or when the satellite was not overhead on that day — the

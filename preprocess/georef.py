@@ -259,6 +259,18 @@ def georef_with_bbox(input_path: str, output_path: str,
 # Coarse-align and crop: find overlap at low res, shift, then crop
 # ---------------------------------------------------------------------------
 
+# The ELoFTR translation estimator and its tunables now live in
+# align/scale.py so both the preprocess coarse-align step (this module)
+# and the in-pipeline coarse-offset step (align/coarse.py) share a single
+# implementation and a single set of thresholds.
+from align.scale import (
+    eloftr_translation_estimate as _eloftr_translation_estimate,
+    _ELOFTR_MIN_AGREEMENT,
+    _ELOFTR_MIN_MATCHES,
+    _ELOFTR_KP_CONF_MIN,
+)
+
+
 def coarse_align_and_crop(
     target_path: str,
     reference_path: str,
@@ -266,7 +278,12 @@ def coarse_align_and_crop(
     coarse_res: float = 50.0,
     margin_m: float = 10000.0,
     target_bbox_wgs: tuple = None,
-) -> str | None:
+    crop: bool = True,
+    model_cache=None,
+    params=None,
+    neighbour_shifts_m: list[tuple[float, float]] | None = None,
+    return_details: bool = False,
+) -> str | tuple[str, dict] | None:
     """Find the coarse offset between a wide target and a reference, then crop.
 
     Film frames (especially KH-4 panoramic strips) cover huge areas but only
@@ -274,10 +291,23 @@ def coarse_align_and_crop(
     be 20km+ off, so we can't just crop to the reference bbox directly.
 
     Algorithm:
-      1. Read both at low resolution (~50m/px) in a common metric CRS
-      2. Slide the reference land mask over the target to find the best match
-      3. Apply the detected offset to the target's geotransform
-      4. Crop the shifted target to the reference bbox + margin
+      1. Read both at low resolution (~50m/px) on a *shared* metric canvas
+         (union of the target+reference extents in a common UTM CRS).
+      2. Run tiled ELoFTR (MatchAnything-EfficientLoFTR via HF) on the two
+         co-gridded rasters; aggregate matches across tiles; estimate the
+         translation as the median of per-match (ref - tgt) pixel deltas.
+      3. Apply the detected offset to the target's geotransform.
+      4. Optionally crop the shifted target to the reference bbox + margin.
+
+    The matcher upgrade (replacing OpenCV ``matchTemplate`` on binary land
+    masks) gives the coarse stage a notion of which shoreline it's looking
+    at — NCC's "best peak in a binary correlation surface" was easily
+    fooled by similar-looking coastlines (e.g., Saudi mainland matching
+    Bahrain's north shore). When ELoFTR can't pin position with enough
+    self-consistency, this function abstains (returns ``None``); the
+    caller in ``process.py`` records ``coarse_align_status="abstained"``
+    and ``generate_manifest`` hard-skips the entity on profiles with
+    unreliable USGS corners.
 
     Args:
         target_path: Wide georeferenced target (e.g. ASP ortho mosaic).
@@ -288,9 +318,16 @@ def coarse_align_and_crop(
         target_bbox_wgs: Optional (west, south, east, north) in EPSG:4326 from
             USGS corners.  Used to check expected overlap with reference and
             reject spurious template matches.
+        crop: When False, returns the shifted target without cropping (used
+            by ``_coarse_align_ortho_to_sidecar`` to keep the canonical
+            footprint and only emit a sidecar shift).
+        model_cache: Optional ``align.models.ModelCache``. Pass one in for
+            batch processing so ELoFTR loads once across many calls; the
+            function lazy-creates and disposes its own cache when omitted.
 
     Returns:
-        Path to the cropped output, or None on failure.
+        Path to the cropped output (or shifted output when ``crop=False``),
+        or ``None`` on abstain / failure.
     """
     import rasterio
     from rasterio.warp import calculate_default_transform, reproject, Resampling
@@ -340,23 +377,31 @@ def coarse_align_and_crop(
         tgt_left, tgt_bottom = t_tgt.transform(tgt_bounds.left, tgt_bounds.bottom)
         tgt_right, tgt_top = t_tgt.transform(tgt_bounds.right, tgt_bounds.top)
 
-        # Compute the union bbox for resampling
+        # Build a shared canvas (union of both extents) at coarse_res so
+        # the ELoFTR matcher sees both rasters on the same grid; per-match
+        # (kp_ref - kp_tgt) pixel deltas convert directly to metric shifts
+        # without per-raster transform bookkeeping.
         union_left = min(ref_left, tgt_left)
         union_bottom = min(ref_bottom, tgt_bottom)
         union_right = max(ref_right, tgt_right)
-        union_top = max(ref_bottom, tgt_top)  # intentional: use ref_bottom as min ref
+        union_top = max(ref_top, tgt_top)
 
-        # Read target at coarse resolution
-        tgt_w = int((tgt_right - tgt_left) / coarse_res)
-        tgt_h = int((tgt_top - tgt_bottom) / coarse_res)
-        tgt_w = max(tgt_w, 1)
-        tgt_h = max(tgt_h, 1)
-
-        # Read reference at coarse resolution
-        ref_w = int((ref_right - ref_left) / coarse_res)
-        ref_h = int((ref_top - ref_bottom) / coarse_res)
-        ref_w = max(ref_w, 1)
-        ref_h = max(ref_h, 1)
+        # Pad the canvas by the stacked-NCC search radius so the ref-content
+        # template never spans the full canvas (which would force the
+        # ``th >= H or tw >= W`` abstain in ``run_stacked_coarse_align``).
+        # When ref's vertical extent dominates the union (KH-4B sub-frame +
+        # 1976 KH-9 strip on Bahrain), the template otherwise locks at full
+        # canvas height. Padding gives the matchTemplate slide head-room
+        # in both axes and accommodates peaks ``radius_m`` away from the
+        # USGS-implied anchor without falling off the canvas.
+        ncc_radius_m = 0.0
+        if params is not None:
+            ncc_radius_m = float(getattr(params.camera, "coarse_ncc_search_radius_m", 0.0) or 0.0)
+        if ncc_radius_m > 0:
+            union_left -= ncc_radius_m
+            union_right += ncc_radius_m
+            union_bottom -= ncc_radius_m
+            union_top += ncc_radius_m
 
         # Build the coarse arrays via GDAL warp to the common grid
         import tempfile
@@ -364,16 +409,21 @@ def coarse_align_and_crop(
             tgt_coarse = os.path.join(tmpdir, "tgt.tif")
             ref_coarse = os.path.join(tmpdir, "ref.tif")
 
+            shared_te = [
+                "-te", str(union_left), str(union_bottom),
+                str(union_right), str(union_top),
+                "-tr", str(coarse_res), str(coarse_res),
+            ]
             _run_cmd([
                 "gdalwarp", "-t_srs", work_crs.to_proj4(),
-                "-tr", str(coarse_res), str(coarse_res),
+                *shared_te,
                 "-r", "average",
                 "-co", "COMPRESS=LZW",
                 target_path, tgt_coarse,
             ])
             _run_cmd([
                 "gdalwarp", "-t_srs", work_crs.to_proj4(),
-                "-tr", str(coarse_res), str(coarse_res),
+                *shared_te,
                 "-r", "average",
                 "-co", "COMPRESS=LZW",
                 reference_path, ref_coarse,
@@ -382,113 +432,109 @@ def coarse_align_and_crop(
             with rasterio.open(tgt_coarse) as ds_t, rasterio.open(ref_coarse) as ds_r:
                 arr_tgt = ds_t.read(1).astype(np.float32)
                 arr_ref = ds_r.read(1).astype(np.float32)
-                tgt_transform = ds_t.transform
-                ref_transform = ds_r.transform
 
-        # Build binary masks (land = bright pixels)
-        tgt_mask = (arr_tgt > 15).astype(np.float32)
-        ref_mask = (arr_ref > 15).astype(np.float32)
-
-        if tgt_mask.sum() < 100 or ref_mask.sum() < 100:
+        if (np.count_nonzero(arr_tgt > 15) < 100
+                or np.count_nonzero(arr_ref > 15) < 100):
             print(f"  [coarse_crop] Insufficient content for matching")
             return None
 
-        # Template match: slide reference mask over target mask.
-        # matchTemplate requires the template to be <= the image in BOTH dims.
-        # KH-4 panoramic strips are very wide but short — the reference can be
-        # taller.  When one dimension exceeds the target, crop the reference
-        # symmetrically so the template fits.
-        import cv2
+        # Run tiled ELoFTR on the shared canvas. Returns metric (dx, dy)
+        # plus an agreement score derived from the per-match MAD; abstain
+        # when matches are too few or too dispersed to support a confident
+        # translation.
+        eloftr_result = _eloftr_translation_estimate(
+            arr_ref, arr_tgt, coarse_res, model_cache=model_cache,
+        )
 
-        if (ref_mask.shape[0] >= tgt_mask.shape[0] and
-                ref_mask.shape[1] >= tgt_mask.shape[1]):
-            # Reference is larger in both dimensions — target is fully contained
-            print(f"  [coarse_crop] Reference larger than target in both dims, "
-                  f"no crop needed")
-            import shutil
-            shutil.copy2(target_path, output_path)
-            return output_path
+        def _single_shot_ok(res) -> bool:
+            """Single-shot ELoFTR cleared all gates: returned a result,
+            passed the agreement floor, and within the 50 km sanity
+            ceiling. Anything else is treated as 'abstained' for
+            fallback purposes."""
+            if res is None:
+                return False
+            _dx, _dy, _n, _ag = res
+            if _ag < _ELOFTR_MIN_AGREEMENT:
+                return False
+            if float(np.hypot(_dx, _dy)) > 50000:
+                return False
+            return True
 
-        # Crop the reference mask to fit within target dims for template matching
-        tmpl = ref_mask.copy()
-        tmpl_row_offset = 0
-        tmpl_col_offset = 0
-        if tmpl.shape[0] >= tgt_mask.shape[0]:
-            # Reference taller than target — crop to target height (centered)
-            excess = tmpl.shape[0] - tgt_mask.shape[0] + 2  # +2 for matchTemplate
-            top = excess // 2
-            tmpl = tmpl[top:top + tgt_mask.shape[0] - 2, :]
-            tmpl_row_offset = top
-        if tmpl.shape[1] >= tgt_mask.shape[1]:
-            # Reference wider than target — crop to target width (centered)
-            excess = tmpl.shape[1] - tgt_mask.shape[1] + 2
-            left = excess // 2
-            tmpl = tmpl[:, left:left + tgt_mask.shape[1] - 2]
-            tmpl_col_offset = left
-
-        if tmpl.shape[0] < 3 or tmpl.shape[1] < 3:
-            print(f"  [coarse_crop] Template too small after cropping "
-                  f"({tmpl.shape}), skipping")
+        # Stacked NCC -> ELoFTR -> phase-correlate fallback. Engaged
+        # whenever single-shot ELoFTR fails ANY of its gates (null
+        # result, agreement < floor, magnitude > 50 km) AND the camera
+        # profile has unreliable USGS corners (KH-4/KH-7/KH-8). KH-9
+        # leaves ``coarse_ncc_search_radius_m`` at 0 so this branch is
+        # skipped — the agreement-floor abstain still fires for KH-9
+        # via the legacy gates below.
+        if (not _single_shot_ok(eloftr_result)
+                and params is not None
+                and not params.camera.usgs_corners_reliable
+                and params.camera.coarse_ncc_search_radius_m > 0):
+            if eloftr_result is not None:
+                _dx0, _dy0, _n0, _ag0 = eloftr_result
+                print(f"  [coarse_crop] single-shot ELoFTR weak "
+                      f"(n={_n0}, agreement={_ag0:.2f}); engaging "
+                      f"stacked fallback")
+            # Forward the rejected single-shot ELoFTR (dx, dy) so the
+            # stack's strip-prior tie-breaker can corroborate the prior
+            # against this frame's own (weak) measurement. Without this
+            # signal an N=1 prior can mis-shift the frame by tens of km
+            # when intra-strip USGS errors disagree; with it the prior
+            # is only believed when it lines up with the local ELoFTR
+            # estimate within the per-axis strip-coherence bounds.
+            single_shot_dxdy_m = None
+            if eloftr_result is not None:
+                _dx0, _dy0, _n0, _ag0 = eloftr_result
+                single_shot_dxdy_m = (float(_dx0), float(_dy0))
+            from preprocess.coarse_align_ncc_stack import run_stacked_coarse_align
+            stacked = run_stacked_coarse_align(
+                arr_ref, arr_tgt, coarse_res,
+                work_crs=work_crs,
+                union_bounds=(union_left, union_bottom, union_right, union_top),
+                target_bbox_wgs=target_bbox_wgs,
+                params=params,
+                model_cache=model_cache,
+                target_path=target_path,
+                reference_path=reference_path,
+                neighbour_shifts_m=neighbour_shifts_m,
+                single_shot_dxdy_m=single_shot_dxdy_m,
+            )
+            if stacked is not None:
+                eloftr_result = stacked
+        if eloftr_result is None:
+            print(f"  [coarse_crop] ELoFTR coarse match abstained "
+                  f"(insufficient or dispersed matches)")
             return None
+        dx_m, dy_m, n_matches, agreement = eloftr_result
 
-        result = cv2.matchTemplate(tgt_mask, tmpl, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        total_offset = float(np.hypot(dx_m, dy_m))
+        print(f"  [coarse_crop] ELoFTR coarse offset: dx={dx_m:+.0f}m, "
+              f"dy={dy_m:+.0f}m (total={total_offset:.0f}m, "
+              f"matches={n_matches}, agreement={agreement:.2f})")
 
-        # max_loc is (col, row) of the best match in target pixel coords
-        match_col, match_row = max_loc
-
-        # Convert pixel offset to metric offset
-        # The offset = where the reference template's origin lands in target coords.
-        # Account for any template cropping applied above.
-        # Target origin in work CRS:
-        tgt_origin_x = tgt_transform.c  # left
-        tgt_origin_y = tgt_transform.f  # top
-        # Match position in work CRS (adjust for template crop offset):
-        match_x = tgt_origin_x + (match_col - tmpl_col_offset) * coarse_res
-        match_y = tgt_origin_y - (match_row - tmpl_row_offset) * coarse_res
-
-        # Reference origin in work CRS:
-        ref_origin_x = ref_transform.c
-        ref_origin_y = ref_transform.f
-
-        # Offset: how much to shift the target so its content aligns with reference
-        dx_m = ref_origin_x - match_x
-        dy_m = ref_origin_y - match_y
-
-        total_offset = np.sqrt(dx_m**2 + dy_m**2)
-        print(f"  [coarse_crop] Coarse offset: dx={dx_m:+.0f}m, dy={dy_m:+.0f}m "
-              f"(total={total_offset:.0f}m, corr={max_val:.3f})")
-
-        # Decide whether to trust the template match.  For predominantly-ocean
-        # frames (Bahrain, coastal strips) the land mask correlation is low and
-        # the match can be completely wrong.  When the match is unreliable, fall
-        # back to zero offset (trust USGS corners) and still crop so the
-        # alignment pipeline gets a manageable-sized image.
-        use_offset = True
-        if max_val < 0.15:
-            print(f"  [coarse_crop] Correlation too low ({max_val:.3f}), "
-                  f"using zero offset (USGS corners)")
-            dx_m, dy_m = 0.0, 0.0
-            use_offset = False
-        elif max_val < 0.25 and total_offset > 25000:
-            # Low-confidence match with large shift — likely spurious.
-            # Lowered 0.40 → 0.25 (2026-04-20) because on KH-4B film vs
-            # a modern optical basemap (ESRI World Imagery), the land-mask
-            # correlation tops out around 0.30 even when the detected
-            # shift is physically consistent with USGS corner offset
-            # (observed: Bahrain DS1104-1057DA023 detected 39 km shift
-            # correctly at corr=0.308; 0.40 threshold was rejecting it).
-            # Values below 0.25 remain ambiguous enough to reject.
-            print(f"  [coarse_crop] Low-confidence large shift "
-                  f"({total_offset/1000:.0f}km, corr={max_val:.3f}), "
-                  f"using zero offset")
-            dx_m, dy_m = 0.0, 0.0
-            use_offset = False
-        elif total_offset > 50000:
-            print(f"  [coarse_crop] Shift too large ({total_offset/1000:.0f}km > 50km), "
-                  f"using zero offset")
-            dx_m, dy_m = 0.0, 0.0
-            use_offset = False
+        # ELoFTR has its own internal "no peak" path (returns None earlier
+        # when matches are insufficient by count). Two further gates:
+        #
+        #   1. Agreement floor: per-match MAD-derived agreement must clear
+        #      the ``_ELOFTR_MIN_AGREEMENT`` threshold. agreement≈0 means
+        #      161 keypoint pairs may be scattered across competing
+        #      geographies (Bahrain coast + Saudi coast), so the median
+        #      translation is meaningless. v5 found this exact mode and
+        #      wrote a 12.9 km bogus shift to the sidecar.
+        #
+        #   2. Sanity ceiling on shift magnitude: a >50 km translation
+        #      implies the matcher latched onto the wrong geography
+        #      entirely.
+        if agreement < _ELOFTR_MIN_AGREEMENT:
+            print(f"  [coarse_crop] Match dispersion too high "
+                  f"(agreement={agreement:.2f} < {_ELOFTR_MIN_AGREEMENT}), "
+                  f"abstaining")
+            return None
+        if total_offset > 50000:
+            print(f"  [coarse_crop] Shift too large "
+                  f"({total_offset/1000:.0f}km > 50km), abstaining")
+            return None
 
     # Apply the shift to the target by adjusting its geotransform, then crop
     # to the reference bbox + margin
@@ -515,7 +561,7 @@ def coarse_align_and_crop(
         gt[3] += dy_m
 
     # Write shifted version
-    shifted_path = output_path.replace(".tif", "_shifted.tif")
+    shifted_path = output_path.replace(".tif", "_shifted.tif") if crop else output_path
     ds_in = gdal.Open(target_path)
     driver = gdal.GetDriverByName("GTiff")
     ds_out = driver.CreateCopy(shifted_path, ds_in, options=[
@@ -525,6 +571,20 @@ def coarse_align_and_crop(
     ds_out.FlushCache()
     ds_out = None
     ds_in = None
+
+    if not crop:
+        # Shift-only path: the shifted TIFF IS the output; no cropping.
+        if not os.path.exists(output_path):
+            return None
+        if return_details:
+            return output_path, {
+                "dx_m": float(dx_m),
+                "dy_m": float(dy_m),
+                "n_matches": int(n_matches),
+                "agreement": float(agreement),
+                "validated": int(n_matches) > 0,
+            }
+        return output_path
 
     # Crop to reference bbox + margin (in reference CRS, typically EPSG:4326)
     with rasterio.open(reference_path) as src_ref:
@@ -543,8 +603,13 @@ def coarse_align_and_crop(
             crop_n = rb.top + margin_m
             te_srs = src_ref.crs.to_string()
 
+    # -overwrite: gdalwarp defaults to refusing to write over an existing
+    # file. On cache-warm re-runs the prior cropped ortho is still in
+    # place from an earlier run, which caused KH-9 PC e2e_v17 to abort
+    # mid-pipeline ("Output dataset ... exists ... Please delete").
     _run_cmd([
         "gdalwarp",
+        "-overwrite",
         "-te_srs", te_srs,
         "-te", str(crop_w), str(crop_s), str(crop_e), str(crop_n),
         "-co", "COMPRESS=LZW", "-co", "TILED=YES", "-co", "BIGTIFF=YES",
@@ -567,6 +632,14 @@ def coarse_align_and_crop(
 
     print(f"  [coarse_crop] Cropped to reference bbox + {margin_m/1000:.0f}km margin "
           f"({valid_pct:.0f}% valid content)")
+    if return_details:
+        return output_path, {
+            "dx_m": float(dx_m),
+            "dy_m": float(dy_m),
+            "n_matches": int(n_matches),
+            "agreement": float(agreement),
+            "validated": int(n_matches) > 0,
+        }
     return output_path
 
 
@@ -578,97 +651,110 @@ STAC_API = os.environ.get("STAC_API_URL", "https://earth-search.aws.element84.co
 COLLECTION = "sentinel-2-l2a"
 
 
-def fetch_sentinel2_reference(bbox: tuple, output_path: str,
-                              max_cloud_cover: int = 10) -> str:
-    """Download a recent cloud-free Sentinel-2 composite for an area.
-
-    For large bboxes spanning multiple MGRS tiles, selects the best image
-    per tile and mosaics them into a single output covering the full area.
-
-    Args:
-        bbox: (west, south, east, north) in decimal degrees.
-        output_path: Where to write the reference GeoTIFF (EPSG:3857).
-        max_cloud_cover: Maximum cloud cover percentage (default 10).
-
-    Returns:
-        Path to the reference GeoTIFF.
-    """
-    if os.path.exists(output_path):
-        print(f"  [skip] Reference already exists: {output_path}")
-        return output_path
-
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-
+def _stac_search_sentinel2(bbox, max_cloud_cover):
+    """Search the STAC API and return all features in bbox under the
+    cloud-cover threshold, sorted newest-first."""
     west, south, east, north = bbox
-    print(f"  Searching Sentinel-2 for bbox: {west:.2f},{south:.2f},{east:.2f},{north:.2f}")
-
-    # Search with high limit to find all tiles covering the bbox
     search_body = json.dumps({
         "collections": [COLLECTION],
         "bbox": [west, south, east, north],
-        "query": {
-            "eo:cloud_cover": {"lt": max_cloud_cover},
-        },
+        "query": {"eo:cloud_cover": {"lt": max_cloud_cover}},
         "sortby": [{"field": "properties.datetime", "direction": "desc"}],
         "limit": 100,
     }).encode("utf-8")
-
     req = urllib.request.Request(
         f"{STAC_API}/search",
         data=search_body,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-
     with urllib.request.urlopen(req, timeout=30) as resp:
         results = json.loads(resp.read().decode("utf-8"))
-
     features = results.get("features", [])
     if not features:
         raise RuntimeError(
             f"No Sentinel-2 images found with <{max_cloud_cover}% cloud cover. "
             f"Try increasing --max-cloud-cover or provide a reference manually."
         )
+    return features
 
-    # Group features by MGRS tile and select the best (lowest cloud) per tile
+
+def _select_best_per_mgrs_tile(features):
+    """Group features by MGRS tile code and pick the lowest-cloud scene
+    per tile."""
     tiles = defaultdict(list)
     for f in features:
         grid = f["properties"].get("grid:code", f["id"][:10])
         tiles[grid].append(f)
-
     selected = []
     for grid, items in sorted(tiles.items()):
         best = min(items, key=lambda x: x["properties"].get("eo:cloud_cover", 99))
         selected.append(best)
-        item_id = best["id"]
         cloud = best["properties"].get("eo:cloud_cover", "?")
         date = best["properties"].get("datetime", "?")[:10]
-        print(f"    Tile {grid}: {item_id} ({date}, {cloud}% cloud)")
-
+        print(f"    Tile {grid}: {best['id']} ({date}, {cloud}% cloud)")
     print(f"  Selected {len(selected)} tile(s) for composite")
+    return selected
 
-    # Collect band URLs from all selected tiles
-    band_keys = ["red", "green", "blue"]
-    temp_dir = os.path.dirname(output_path) or "."
 
-    if len(selected) == 1:
-        # Single tile: simple path (original behavior)
-        item = selected[0]
-        assets = item.get("assets", {})
-        band_urls = []
-        for key in band_keys:
-            if key in assets:
-                band_urls.append(assets[key]["href"])
-            else:
-                raise RuntimeError(f"Missing '{key}' band in {item['id']}")
+def _extract_band_urls(item, band_keys):
+    """Return vsicurl URLs for each band in order, or None if any band
+    is missing (caller decides whether to skip or fail)."""
+    assets = item.get("assets", {})
+    urls = []
+    for key in band_keys:
+        if key not in assets:
+            return None
+        urls.append(f"/vsicurl/{assets[key]['href']}")
+    return urls
 
-        # Generate a unique VRT path to avoid race conditions when multiprocessing
-        import uuid
+
+def _build_single_tile_reference(item, bbox, output_path, band_keys, temp_dir):
+    """Single-tile path: build VRT of bands, warp to EPSG:3857 at bbox."""
+    import uuid
+    urls = _extract_band_urls(item, band_keys)
+    if urls is None:
+        missing = [k for k in band_keys if k not in item.get("assets", {})]
+        raise RuntimeError(f"Missing bands {missing} in {item['id']}")
+    uid = str(uuid.uuid4())[:8]
+    vrt_path = os.path.join(temp_dir, f"sentinel2_ref_{uid}.vrt")
+    _run_cmd(["gdalbuildvrt", "-separate", vrt_path] + urls)
+    west, south, east, north = bbox
+    _run_cmd([
+        "gdalwarp",
+        "-t_srs", "EPSG:3857",
+        "-te_srs", "EPSG:4326",
+        "-te", str(west), str(south), str(east), str(north),
+        "-r", "bilinear",
+        "-co", "COMPRESS=LZW", "-co", "PREDICTOR=2", "-co", "TILED=YES",
+        vrt_path, output_path,
+    ])
+    if os.path.exists(vrt_path):
+        os.remove(vrt_path)
+
+
+def _build_multi_tile_mosaic_reference(selected, bbox, output_path, band_keys, temp_dir):
+    """Multi-tile path: per-tile VRT → per-tile warp → mosaic."""
+    import uuid
+    tile_vrts = []
+    for i, item in enumerate(selected):
+        urls = _extract_band_urls(item, band_keys)
+        if urls is None:
+            print(f"    WARNING: missing bands in {item['id']}, skipping tile")
+            continue
         uid = str(uuid.uuid4())[:8]
-        vrt_path = os.path.join(temp_dir, f"sentinel2_ref_{uid}.vrt")
-        vsicurl_urls = [f"/vsicurl/{url}" for url in band_urls]
-        _run_cmd(["gdalbuildvrt", "-separate", vrt_path] + vsicurl_urls)
+        tile_vrt = os.path.join(temp_dir, f"sentinel2_tile_{i}_{uid}.vrt")
+        _run_cmd(["gdalbuildvrt", "-separate", tile_vrt] + urls)
+        tile_vrts.append(tile_vrt)
 
+    if not tile_vrts:
+        raise RuntimeError("No valid tiles after filtering")
+
+    west, south, east, north = bbox
+    tile_warped = []
+    for i, tvrt in enumerate(tile_vrts):
+        uid = str(uuid.uuid4())[:8]
+        tw = os.path.join(temp_dir, f"sentinel2_warped_{i}_{uid}.tif")
         _run_cmd([
             "gdalwarp",
             "-t_srs", "EPSG:3857",
@@ -676,157 +762,90 @@ def fetch_sentinel2_reference(bbox: tuple, output_path: str,
             "-te", str(west), str(south), str(east), str(north),
             "-r", "bilinear",
             "-co", "COMPRESS=LZW", "-co", "PREDICTOR=2", "-co", "TILED=YES",
-            vrt_path, output_path,
+            tvrt, tw,
         ])
+        tile_warped.append(tw)
 
-        if os.path.exists(vrt_path):
-            os.remove(vrt_path)
+    uid = str(uuid.uuid4())[:8]
+    mosaic_vrt = os.path.join(temp_dir, f"sentinel2_mosaic_{uid}.vrt")
+    _run_cmd(["gdalbuildvrt", mosaic_vrt] + tile_warped)
+    _run_cmd([
+        "gdal_translate",
+        "-co", "COMPRESS=LZW", "-co", "PREDICTOR=2", "-co", "TILED=YES",
+        mosaic_vrt, output_path,
+    ])
+
+    for f in tile_vrts + tile_warped + [mosaic_vrt]:
+        if os.path.exists(f):
+            os.remove(f)
+
+
+def fetch_sentinel2_reference(bbox: tuple, output_path: str,
+                              max_cloud_cover: int = 10) -> str:
+    """Download a recent cloud-free Sentinel-2 composite for an area.
+
+    For large bboxes spanning multiple MGRS tiles, selects the best image
+    per tile and mosaics them into a single output covering the full area.
+
+    Returns the path to the EPSG:3857 GeoTIFF.
+    """
+    if os.path.exists(output_path):
+        print(f"  [skip] Reference already exists: {output_path}")
+        return output_path
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    west, south, east, north = bbox
+    print(f"  Searching Sentinel-2 for bbox: {west:.2f},{south:.2f},{east:.2f},{north:.2f}")
+
+    features = _stac_search_sentinel2(bbox, max_cloud_cover)
+    selected = _select_best_per_mgrs_tile(features)
+
+    band_keys = ["red", "green", "blue"]
+    temp_dir = os.path.dirname(output_path) or "."
+    if len(selected) == 1:
+        _build_single_tile_reference(selected[0], bbox, output_path, band_keys, temp_dir)
     else:
-        # Multi-tile: build per-tile VRTs, then mosaic, then warp
-        tile_vrts = []
-        for i, item in enumerate(selected):
-            assets = item.get("assets", {})
-            band_urls = []
-            for key in band_keys:
-                if key in assets:
-                    band_urls.append(assets[key]["href"])
-                else:
-                    print(f"    WARNING: missing '{key}' in {item['id']}, skipping tile")
-                    break
-            else:
-                import uuid
-                uid = str(uuid.uuid4())[:8]
-                tile_vrt = os.path.join(temp_dir, f"sentinel2_tile_{i}_{uid}.vrt")
-                vsicurl_urls = [f"/vsicurl/{url}" for url in band_urls]
-                _run_cmd(["gdalbuildvrt", "-separate", tile_vrt] + vsicurl_urls)
-                tile_vrts.append(tile_vrt)
-
-        if not tile_vrts:
-            raise RuntimeError("No valid tiles after filtering")
-
-        # Warp each tile to EPSG:3857 clipped to bbox, then mosaic
-        tile_warped = []
-        for i, tvrt in enumerate(tile_vrts):
-            import uuid
-            uid = str(uuid.uuid4())[:8]
-            tw = os.path.join(temp_dir, f"sentinel2_warped_{i}_{uid}.tif")
-            _run_cmd([
-                "gdalwarp",
-                "-t_srs", "EPSG:3857",
-                "-te_srs", "EPSG:4326",
-                "-te", str(west), str(south), str(east), str(north),
-                "-r", "bilinear",
-                "-co", "COMPRESS=LZW", "-co", "PREDICTOR=2", "-co", "TILED=YES",
-                tvrt, tw,
-            ])
-            tile_warped.append(tw)
-
-        # Merge warped tiles into final output
-        import uuid
-        uid = str(uuid.uuid4())[:8]
-        mosaic_vrt = os.path.join(temp_dir, f"sentinel2_mosaic_{uid}.vrt")
-        _run_cmd(["gdalbuildvrt", mosaic_vrt] + tile_warped)
-        _run_cmd([
-            "gdal_translate",
-            "-co", "COMPRESS=LZW", "-co", "PREDICTOR=2", "-co", "TILED=YES",
-            mosaic_vrt, output_path,
-        ])
-
-        # Clean up temp files
-        for f in tile_vrts + tile_warped + [mosaic_vrt]:
-            if os.path.exists(f):
-                os.remove(f)
+        _build_multi_tile_mosaic_reference(selected, bbox, output_path, band_keys, temp_dir)
 
     print(f"  Sentinel-2 reference: {output_path}")
     return output_path
 
 
-def build_composite_reference(primary_path: str, target_bbox: tuple,
-                              output_path: str, margin_deg: float = 0.1,
-                              max_cloud_cover: int = 10) -> str:
-    """Build a composite reference: primary where available, Sentinel-2 elsewhere.
-
-    Uses the primary reference (e.g. KH-9 historical image) where it has coverage,
-    and fills gaps with Sentinel-2 imagery for areas outside the primary's footprint.
-    This gives the alignment pipeline features to match against in areas beyond the
-    primary reference, improving edge alignment.
-
-    The output is a single-band grayscale GeoTIFF in the primary's CRS.
-
-    Args:
-        primary_path: Path to the primary reference GeoTIFF.
-        target_bbox: (west, south, east, north) in decimal degrees — area needing coverage.
-        output_path: Where to write the composite GeoTIFF.
-        margin_deg: Extra margin beyond target_bbox for Sentinel-2 fetch.
-        max_cloud_cover: Max cloud cover % for Sentinel-2 search.
-
-    Returns:
-        Path to the composite reference (may be primary_path if it already covers everything).
-    """
-    import numpy as np
-    import rasterio
-    from rasterio.warp import transform_bounds
-    from osgeo import gdal
-
-    if os.path.exists(output_path):
-        print(f"  [skip] Composite reference already exists: {output_path}")
-        return output_path
-
-    # Read primary reference bounds
-    with rasterio.open(primary_path) as src:
-        primary_crs = src.crs
-        primary_res = src.res
-        primary_bounds_native = src.bounds
-        primary_bounds_wgs = transform_bounds(primary_crs, "EPSG:4326", *src.bounds)
-
+def _check_primary_covers_target(primary_bounds_wgs, target_bbox, margin_deg):
+    """Return the expanded bbox, or ``None`` when primary already covers it."""
     west, south, east, north = target_bbox
     p_west, p_south, p_east, p_north = primary_bounds_wgs
-
-    # Expand target bbox by margin for reference context beyond crop area
     expanded = (west - margin_deg, south - margin_deg,
                 east + margin_deg, north + margin_deg)
-
-    # Check if primary already covers the expanded bbox
     if (p_west <= expanded[0] and p_south <= expanded[1] and
             p_east >= expanded[2] and p_north >= expanded[3]):
-        print(f"  Primary reference fully covers target area, no composite needed")
-        return primary_path
+        return None
+    return expanded
 
-    print(f"  Primary reference covers {p_west:.3f}-{p_east:.3f}E, "
-          f"{p_south:.3f}-{p_north:.3f}N")
-    print(f"  Target area needs {expanded[0]:.3f}-{expanded[2]:.3f}E, "
-          f"{expanded[1]:.3f}-{expanded[3]:.3f}N")
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    temp_dir = os.path.dirname(output_path)
+def _prepare_s2_grayscale_at_primary_grid(s2_path, primary_crs, primary_res,
+                                          expanded, temp_dir):
+    """Convert Sentinel-2 RGB to luminance then warp to primary's CRS + res.
 
-    # Fetch Sentinel-2 for the expanded area
-    s2_path = os.path.join(temp_dir, "sentinel2_fill.tif")
-    try:
-        fetch_sentinel2_reference(expanded, s2_path, max_cloud_cover=max_cloud_cover)
-    except RuntimeError as e:
-        print(f"  WARNING: Could not fetch Sentinel-2: {e}")
-        print(f"  Falling back to primary reference only")
-        return primary_path
-
+    Returns the warped grayscale path plus an intermediate path to clean
+    up afterwards.
+    """
+    import numpy as np
+    from osgeo import gdal
     gdal.UseExceptions()
 
-    # Convert Sentinel-2 RGB to grayscale and warp to primary's CRS/resolution
     s2_gray_path = os.path.join(temp_dir, "sentinel2_gray.tif")
     ds_s2 = gdal.Open(s2_path)
     s2_bands = ds_s2.RasterCount
     s2_w, s2_h = ds_s2.RasterXSize, ds_s2.RasterYSize
-
     if s2_bands >= 3:
-        # Read RGB and convert to luminance
         r = ds_s2.GetRasterBand(1).ReadAsArray().astype(np.float32)
         g = ds_s2.GetRasterBand(2).ReadAsArray().astype(np.float32)
         b = ds_s2.GetRasterBand(3).ReadAsArray().astype(np.float32)
-        gray = (0.299 * r + 0.587 * g + 0.114 * b)
+        gray = 0.299 * r + 0.587 * g + 0.114 * b
     else:
         gray = ds_s2.GetRasterBand(1).ReadAsArray().astype(np.float32)
 
-    # Write grayscale S2 with same geotransform
     drv = gdal.GetDriverByName("GTiff")
     ds_gray = drv.Create(s2_gray_path, s2_w, s2_h, 1, gdal.GDT_Float32,
                          ["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES"])
@@ -837,7 +856,6 @@ def build_composite_reference(primary_path: str, target_bbox: tuple,
     ds_gray = None
     ds_s2 = None
 
-    # Warp S2 grayscale to primary's CRS and resolution
     s2_warped_path = os.path.join(temp_dir, "sentinel2_warped.tif")
     _run_cmd([
         "gdalwarp",
@@ -850,8 +868,120 @@ def build_composite_reference(primary_path: str, target_bbox: tuple,
         "-co", "BIGTIFF=IF_SAFER",
         s2_gray_path, s2_warped_path,
     ])
+    return s2_warped_path, s2_gray_path
 
-    # Warp primary to the same expanded extent (filling with nodata outside its bounds)
+
+def _feathered_composite_chunks(pri_path, s2_path, output_path, feather_px=50,
+                                chunk_h=512):
+    """Composite primary + S2 into a single uint8 raster, with a feathered
+    alpha at the primary/S2 boundary. Processes in row chunks for memory."""
+    import numpy as np
+    from osgeo import gdal
+    gdal.UseExceptions()
+
+    drv = gdal.GetDriverByName("GTiff")
+    ds_pri = gdal.Open(pri_path)
+    ds_s2 = gdal.Open(s2_path)
+    out_w = ds_pri.RasterXSize
+    out_h = ds_pri.RasterYSize
+    ds_out = drv.Create(output_path, out_w, out_h, 1, gdal.GDT_Byte,
+                        ["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES",
+                         "BIGTIFF=IF_SAFER"])
+    ds_out.SetGeoTransform(ds_pri.GetGeoTransform())
+    ds_out.SetProjection(ds_pri.GetProjection())
+
+    for y0 in range(0, out_h, chunk_h):
+        y1 = min(y0 + chunk_h, out_h)
+        rows = y1 - y0
+        pri_data = ds_pri.GetRasterBand(1).ReadAsArray(0, y0, out_w, rows).astype(np.float32)
+
+        s2_w_actual = ds_s2.RasterXSize
+        s2_h_actual = ds_s2.RasterYSize
+        read_w = min(out_w, s2_w_actual)
+        read_h = min(rows, s2_h_actual - y0) if y0 < s2_h_actual else 0
+        s2_data = np.zeros((rows, out_w), dtype=np.float32)
+        if read_h > 0 and read_w > 0:
+            s2_chunk = ds_s2.GetRasterBand(1).ReadAsArray(0, y0, read_w, read_h)
+            if s2_chunk is not None:
+                s2_data[:read_h, :read_w] = s2_chunk.astype(np.float32)
+
+        # Rescale S2 to primary's 0–255 range; keep nodata as 0.
+        s2_valid = s2_data > 0
+        if s2_valid.any():
+            s2_max = np.percentile(s2_data[s2_valid], 99)
+            if s2_max > 0:
+                s2_scaled = np.clip(s2_data / s2_max * 255, 0, 255)
+                s2_data = np.where(s2_valid, s2_scaled, 0)
+
+        pri_valid = pri_data > 0
+        if feather_px > 0 and pri_valid.any() and (~pri_valid).any():
+            import cv2
+            dist = cv2.distanceTransform(
+                pri_valid.astype(np.uint8), cv2.DIST_L2, 3)
+            alpha = np.clip(dist / feather_px, 0.0, 1.0)
+        else:
+            alpha = pri_valid.astype(np.float32)
+
+        result = alpha * pri_data + (1.0 - alpha) * s2_data
+        result[~pri_valid & ~s2_valid] = 0
+        ds_out.GetRasterBand(1).WriteArray(
+            np.clip(result, 0, 255).astype(np.uint8), 0, y0)
+
+    ds_out.FlushCache()
+    ds_out = None
+    ds_pri = None
+    ds_s2 = None
+
+
+def build_composite_reference(primary_path: str, target_bbox: tuple,
+                              output_path: str, margin_deg: float = 0.1,
+                              max_cloud_cover: int = 10) -> str:
+    """Build a composite reference: primary where available, Sentinel-2 elsewhere.
+
+    Gives the alignment pipeline features to match against beyond the
+    primary's footprint (improves edge alignment). Output is a single-band
+    grayscale GeoTIFF in the primary's CRS.
+
+    Returns ``primary_path`` when it already covers the target area.
+    """
+    import rasterio
+    from rasterio.warp import transform_bounds
+
+    if os.path.exists(output_path):
+        print(f"  [skip] Composite reference already exists: {output_path}")
+        return output_path
+
+    with rasterio.open(primary_path) as src:
+        primary_crs = src.crs
+        primary_res = src.res
+        primary_bounds_wgs = transform_bounds(primary_crs, "EPSG:4326", *src.bounds)
+
+    expanded = _check_primary_covers_target(primary_bounds_wgs, target_bbox, margin_deg)
+    if expanded is None:
+        print(f"  Primary reference fully covers target area, no composite needed")
+        return primary_path
+    p_west, p_south, p_east, p_north = primary_bounds_wgs
+    print(f"  Primary reference covers {p_west:.3f}-{p_east:.3f}E, "
+          f"{p_south:.3f}-{p_north:.3f}N")
+    print(f"  Target area needs {expanded[0]:.3f}-{expanded[2]:.3f}E, "
+          f"{expanded[1]:.3f}-{expanded[3]:.3f}N")
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    temp_dir = os.path.dirname(output_path)
+
+    s2_path = os.path.join(temp_dir, "sentinel2_fill.tif")
+    try:
+        fetch_sentinel2_reference(expanded, s2_path, max_cloud_cover=max_cloud_cover)
+    except RuntimeError as e:
+        print(f"  WARNING: Could not fetch Sentinel-2: {e}")
+        print(f"  Falling back to primary reference only")
+        return primary_path
+
+    s2_warped_path, s2_gray_path = _prepare_s2_grayscale_at_primary_grid(
+        s2_path, primary_crs, primary_res, expanded, temp_dir,
+    )
+
+    # Warp primary to the same extent, nodata outside its bounds.
     primary_expanded_path = os.path.join(temp_dir, "primary_expanded.tif")
     _run_cmd([
         "gdalwarp",
@@ -864,79 +994,8 @@ def build_composite_reference(primary_path: str, target_bbox: tuple,
         primary_path, primary_expanded_path,
     ])
 
-    # Composite: primary where valid, S2 elsewhere, with feathered blend at boundary
-    ds_pri = gdal.Open(primary_expanded_path)
-    ds_s2w = gdal.Open(s2_warped_path)
+    _feathered_composite_chunks(primary_expanded_path, s2_warped_path, output_path)
 
-    out_w = ds_pri.RasterXSize
-    out_h = ds_pri.RasterYSize
-
-    ds_out = drv.Create(output_path, out_w, out_h, 1, gdal.GDT_Byte,
-                        ["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES",
-                         "BIGTIFF=IF_SAFER"])
-    ds_out.SetGeoTransform(ds_pri.GetGeoTransform())
-    ds_out.SetProjection(ds_pri.GetProjection())
-
-    # Process in row chunks for memory efficiency
-    chunk_h = 512
-    feather_px = 50  # feather width at primary/S2 boundary
-
-    for y0 in range(0, out_h, chunk_h):
-        y1 = min(y0 + chunk_h, out_h)
-        rows = y1 - y0
-
-        pri_data = ds_pri.GetRasterBand(1).ReadAsArray(0, y0, out_w, rows).astype(np.float32)
-
-        # Read S2 — handle size mismatch gracefully
-        s2_w_actual = ds_s2w.RasterXSize
-        s2_h_actual = ds_s2w.RasterYSize
-        read_w = min(out_w, s2_w_actual)
-        read_h = min(rows, s2_h_actual - y0) if y0 < s2_h_actual else 0
-
-        s2_data = np.zeros((rows, out_w), dtype=np.float32)
-        if read_h > 0 and read_w > 0:
-            s2_chunk = ds_s2w.GetRasterBand(1).ReadAsArray(0, y0, read_w, read_h)
-            if s2_chunk is not None:
-                s2_data[:read_h, :read_w] = s2_chunk.astype(np.float32)
-
-        # Scale S2 to match primary's radiometric range
-        # (S2 reflectance values are typically 0-10000, primary is 0-255)
-        # Track which S2 pixels have actual data (not MGRS tile nodata)
-        s2_valid = s2_data > 0
-        if s2_valid.any():
-            s2_max = np.percentile(s2_data[s2_valid], 99)
-            if s2_max > 0:
-                s2_scaled = np.clip(s2_data / s2_max * 255, 0, 255)
-                # Only keep scaled values where original was valid
-                s2_data = np.where(s2_valid, s2_scaled, 0)
-
-        # Build alpha mask for primary (0 where nodata, 1 where valid)
-        pri_valid = pri_data > 0
-
-        # Distance transform for feathered blend at boundary
-        if feather_px > 0 and pri_valid.any() and (~pri_valid).any():
-            import cv2
-            dist = cv2.distanceTransform(
-                pri_valid.astype(np.uint8), cv2.DIST_L2, 3)
-            alpha = np.clip(dist / feather_px, 0.0, 1.0)
-        else:
-            alpha = pri_valid.astype(np.float32)
-
-        # Composite: primary where valid (feathered at edge), S2 where no primary
-        # Where S2 has nodata (MGRS tile gaps), keep primary or leave as 0
-        result = alpha * pri_data + (1.0 - alpha) * s2_data
-        neither = ~pri_valid & ~s2_valid
-        result[neither] = 0
-
-        ds_out.GetRasterBand(1).WriteArray(
-            np.clip(result, 0, 255).astype(np.uint8), 0, y0)
-
-    ds_out.FlushCache()
-    ds_out = None
-    ds_pri = None
-    ds_s2w = None
-
-    # Clean up intermediates
     for f in [s2_path, s2_gray_path, s2_warped_path, primary_expanded_path]:
         if os.path.exists(f):
             os.remove(f)

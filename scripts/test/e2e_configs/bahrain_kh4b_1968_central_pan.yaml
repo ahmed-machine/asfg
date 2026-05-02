@@ -1,0 +1,44 @@
+# KH-4B 1968 Bahrain — central four frames, ESRI panchromatic primary +
+# era-matched 1976 KH-9 + chained-frame secondaries.
+#
+# Why ESRI panchromatic instead of the 1976 KH-9 reference (used by
+# bahrain_kh4b_1968_central.yaml)?
+#   - kh9_dzb1212 covers Bahrain only — it doesn't reach Saudi mainland.
+#     DA025 / DA026 frames extend ~30 km east of Bahrain, so the primary
+#     ref provides almost zero overlap → 0-2 RoMa matches → alignment
+#     fails with "Not enough matched points (need ≥4)".
+#   - The original ESRI World Imagery is RGB; matching cross-modal RGB
+#     vs 1968 panchromatic film leaves 0 RANSAC survivors on DA026
+#     (e2e_v39 confirmed). The pan version (Rec.601 luminance from RGB)
+#     converts ESRI to single-band grayscale that approximates the
+#     panchromatic film response — within-modality matching.
+#   - ESRI covers Bahrain + Saudi mainland, so DA025/26 have content
+#     overlap with the reference for the first time.
+#
+# Risk: ESRI is post-reclamation modern imagery, so cross-temporal change
+# is severe (1968→2024+ has ~60 years of land use change). The "wrong-
+# coast" risk that originally motivated switching to kh9_dzb1212 was
+# documented as `agreement=0.00` on every coarse stage. With panchromatic
+# instead of RGB, the matcher may handle the cross-temporal gap better,
+# but this is still cross-modal in age. If the primary fails on DA023/24
+# we want kh9_dzb1212 as a known-good era-matched fallback.
+#
+# Secondary chain (tried in order when primary doesn't accept):
+#   1. kh9_dzb1212 — era-matched (1976) but Bahrain-only, helps DA023/24
+#      if ESRI cross-temporal matching breaks
+#   2. accepted_outputs[-2:] — auto-appended by run_strip_manifest from
+#      previously-aligned frames; gives DA025 → DA024_aligned chaining
+#      (same KH-4B film aesthetic, location-overlapping).
+name: bahrain_kh4b_1968_central_pan
+boundary: data/bahrain_boundary.geojson
+reference_name: bahrain_esri_worldimagery_pan
+secondary_references:
+  - kh9_dzb1212
+catalogs:
+  - data/available/corona2_69b17d89ee62ff28.csv
+prefer_camera: A
+entity_ids:
+  - DS1104-1057DA023
+  - DS1104-1057DA024
+  - DS1104-1057DA025
+  - DS1104-1057DA026

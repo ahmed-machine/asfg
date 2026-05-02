@@ -1,0 +1,14 @@
+# End-to-end test: Bahrain coverage from KH-4A 1965 mission 1022-1.
+# Entity DS1022-1024DA007 (Aft, 1965/07/21).
+#
+# Added to verify the new kh4a profile (Itek J-1 Petzval, oscillating
+# scan arm, scan-head-translation IMC) that was split off from the
+# legacy kh4 profile. Process.py routes DS1001–DS1099 to kh4a via
+# _profile_name_for_scene → parse_entity_id.
+name: bahrain_kh4a_1965
+entity_id: DS1022-1024DA007
+boundary: data/bahrain_boundary.geojson
+reference_name: bahrain_esri_worldimagery
+catalogs:
+  - data/available/corona2_69b17d89ee62ff28.csv
+prefer_camera: A

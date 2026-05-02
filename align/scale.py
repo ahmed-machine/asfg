@@ -3,12 +3,10 @@
 Method A (ELoFTR) runs first. Methods B+C (NCC grids) run sequentially as fallback.
 """
 
-import multiprocessing as mp
 import os
 import subprocess
 import tempfile
 from collections import namedtuple
-from concurrent.futures import ProcessPoolExecutor
 
 import cv2
 import numpy as np
@@ -22,7 +20,7 @@ import torch
 from . import constants as _C
 from .geo import read_overlap_region
 from .models import get_torch_device
-from .image import shift_array, make_land_mask, clahe_normalize, sobel_gradient
+from .image import shift_array, clahe_normalize
 
 # ---------------------------------------------------------------------------
 # Result containers
@@ -158,6 +156,22 @@ def _get_matcher_crops(ref_img, off_img):
         })
     return crops
 
+def _prepare_eloftr_pair(ref_arr, off_arr, multiple: int = 32):
+    """Crop to common size and pad bottom/right for ELoFTR backbones."""
+    h = min(ref_arr.shape[0], off_arr.shape[0])
+    w = min(ref_arr.shape[1], off_arr.shape[1])
+    if h <= 0 or w <= 0:
+        return None, None, 0, 0
+    ref = ref_arr[:h, :w]
+    off = off_arr[:h, :w]
+    pad_h = (multiple - h % multiple) % multiple
+    pad_w = (multiple - w % multiple) % multiple
+    if pad_h or pad_w:
+        ref = np.pad(ref, ((0, pad_h), (0, pad_w)), mode="constant")
+        off = np.pad(off, ((0, pad_h), (0, pad_w)), mode="constant")
+    return ref, off, h, w
+
+
 def _run_eloftr_batch(crops, model, device, batch_size=4):
     """Run ELoFTR on a list of crops using batching.
 
@@ -178,26 +192,36 @@ def _run_eloftr_batch(crops, model, device, batch_size=4):
         batch_slice = crops[i:i+batch_size]
         indices_slice = range(i, i+len(batch_slice))
         
-        # Group by shape to handle different crop sizes
+        # Group by model input shape to handle different crop sizes.
+        # ELoFTR's backbone expects compatible image dimensions, so each
+        # pair is first cropped to a common ref/off size and padded to a
+        # stride-friendly shape. Matches landing in the padded area are
+        # filtered back out below.
         groups = {}
         for idx, item in zip(indices_slice, batch_slice):
-            sh = item['ref'].shape
+            ref_pre, off_pre, orig_h, orig_w = _prepare_eloftr_pair(
+                item['ref'], item['off'])
+            if ref_pre is None or off_pre is None:
+                continue
+            sh = ref_pre.shape
             if sh not in groups:
                 groups[sh] = []
-            groups[sh].append((idx, item))
+            groups[sh].append((idx, item, ref_pre, off_pre, orig_h, orig_w))
             
         for shape, group_items in groups.items():
             # Build tensors
             ref_tensors = []
             off_tensors = []
             original_indices = []
+            original_dims = []
             
-            for idx, item in group_items:
-                rt = torch.from_numpy(item['ref']).float()[None, None] / 255.0
-                ot = torch.from_numpy(item['off']).float()[None, None] / 255.0
+            for idx, item, ref_pre, off_pre, orig_h, orig_w in group_items:
+                rt = torch.from_numpy(ref_pre).float()[None, None] / 255.0
+                ot = torch.from_numpy(off_pre).float()[None, None] / 255.0
                 ref_tensors.append(rt)
                 off_tensors.append(ot)
                 original_indices.append(idx)
+                original_dims.append((orig_h, orig_w))
                 
             batch_ref = torch.cat(ref_tensors, dim=0).to(device)
             batch_off = torch.cat(off_tensors, dim=0).to(device)
@@ -215,7 +239,20 @@ def _run_eloftr_batch(crops, model, device, batch_size=4):
                     # Extract matches for this item
                     mask = (batch_ids == local_idx)
                     if mask.any():
-                        results[global_idx] = (kpts0[mask], kpts1[mask], conf[mask])
+                        kp0_i = kpts0[mask]
+                        kp1_i = kpts1[mask]
+                        conf_i = conf[mask]
+                        if kp0_i.ndim != 2 or kp1_i.ndim != 2 or len(kp0_i) == 0:
+                            results[global_idx] = (np.array([]), np.array([]), np.array([]))
+                            continue
+                        orig_h, orig_w = original_dims[local_idx]
+                        inside = (
+                            (kp0_i[:, 0] >= 0) & (kp0_i[:, 0] < orig_w) &
+                            (kp0_i[:, 1] >= 0) & (kp0_i[:, 1] < orig_h) &
+                            (kp1_i[:, 0] >= 0) & (kp1_i[:, 0] < orig_w) &
+                            (kp1_i[:, 1] >= 0) & (kp1_i[:, 1] < orig_h)
+                        )
+                        results[global_idx] = (kp0_i[inside], kp1_i[inside], conf_i[inside])
                     else:
                         # No matches found for this item
                         results[global_idx] = (np.array([]), np.array([]), np.array([]))
@@ -229,10 +266,10 @@ def _run_eloftr_batch(crops, model, device, batch_size=4):
                 elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
                     torch.mps.empty_cache()
                 print(f"      ELoFTR batch OOM ({len(group_items)} items), retrying one-by-one")
-                for local_idx, (global_idx, item) in enumerate(group_items):
+                for local_idx, (global_idx, item, ref_pre, off_pre, orig_h, orig_w) in enumerate(group_items):
                     try:
-                        rt = torch.from_numpy(item['ref']).float()[None, None] / 255.0
-                        ot = torch.from_numpy(item['off']).float()[None, None] / 255.0
+                        rt = torch.from_numpy(ref_pre).float()[None, None] / 255.0
+                        ot = torch.from_numpy(off_pre).float()[None, None] / 255.0
                         single_ref = rt.to(device)
                         single_off = ot.to(device)
                         with torch.no_grad():
@@ -240,7 +277,16 @@ def _run_eloftr_batch(crops, model, device, batch_size=4):
                         kp0 = out['mkpts0_f'].cpu().numpy()
                         kp1 = out['mkpts1_f'].cpu().numpy()
                         cf = out['mconf'].cpu().numpy()
-                        results[global_idx] = (kp0, kp1, cf)
+                        if kp0.ndim != 2 or kp1.ndim != 2 or len(kp0) == 0:
+                            results[global_idx] = (np.array([]), np.array([]), np.array([]))
+                            continue
+                        inside = (
+                            (kp0[:, 0] >= 0) & (kp0[:, 0] < orig_w) &
+                            (kp0[:, 1] >= 0) & (kp0[:, 1] < orig_h) &
+                            (kp1[:, 0] >= 0) & (kp1[:, 0] < orig_w) &
+                            (kp1[:, 1] >= 0) & (kp1[:, 1] < orig_h)
+                        )
+                        results[global_idx] = (kp0[inside], kp1[inside], cf[inside])
                         del single_ref, single_off
                     except Exception as e2:
                         print(f"      ELoFTR single-item retry also failed: {e2}")
@@ -314,83 +360,170 @@ def detect_eloftr_scale(ref_img, offset_img, model=None, diagnostics_dir=None):
     return scale_x, scale_y, rotation_deg, n_inliers
 
 
-# Module-level shared data for ProcessPoolExecutor workers
-_scale_worker_data = {}
+# ---------------------------------------------------------------------------
+# Shared ELoFTR translation estimator
+# ---------------------------------------------------------------------------
+#
+# Used by both the preprocess coarse-align step (preprocess/georef.py) and
+# the in-pipeline coarse-offset step (align/coarse.py::detect_offset_at_
+# resolution). Operates on a *shared canvas* (same shape, same metric grid)
+# and returns ``(dx_m, dy_m, n_matches, agreement)`` or ``None`` on abstain.
+
+# Minimum number of post-confidence-filter matches before we trust the
+# median translation. Below this, dispersion estimates from MAD are too
+# noisy to be meaningful and the function abstains.
+_ELOFTR_MIN_MATCHES = 30
+# Minimum N-corrected agreement before we trust the median translation.
+#
+# ``agreement = 1 / (1 + SE_px)`` where ``SE_px ≈ (MAD_x + MAD_y) *
+# 1.4826 / sqrt(N)`` is the standard error of the median in pixels.
+# This credits high-N matches with their statistical precision: 559
+# matches at MAD≈16 px (KH-4B Bahrain v8 preprocess) give SE≈1.0 px and
+# agreement≈0.50, even though raw 1/(1+MAD) would have been 0.06 — the
+# median IS reliable when N is large, and the gate now reflects that.
+# A floor of 0.30 corresponds to SE ≈ 2.3 px (≈115 m at 50 m/px coarse
+# resolution); above that the matches are scattered across multiple
+# geographies and even a high-N median can't be trusted.
+_ELOFTR_MIN_AGREEMENT = 0.30
+# Per-tile keypoint confidence floor; matches the value used in
+# detect_eloftr_scale.
+_ELOFTR_KP_CONF_MIN = 0.20
 
 
-def _try_scale_rotation(args):
-    """Worker: try a single (scale, rotation) combination."""
-    scale_val, rot_val = args
-    d = _scale_worker_data
-    template = d['template']
-    offset_land = d['offset_land']
+def eloftr_translation_estimate(arr_ref, arr_tgt, coarse_res, *,
+                                model_cache=None,
+                                tile_px: int = 800,
+                                conf_min: float = _ELOFTR_KP_CONF_MIN,
+                                min_matches: int = _ELOFTR_MIN_MATCHES,
+                                ):
+    """Estimate the (target -> reference) metric translation via tiled
+    ELoFTR matching on a *shared canvas*.
 
-    new_h = max(10, int(template.shape[0] * scale_val))
-    new_w = max(10, int(template.shape[1] * scale_val))
-    resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    ``arr_ref`` and ``arr_tgt`` MUST share the same shape and the same
+    metric grid (e.g. resampled via ``gdalwarp -te -tr``, or read with
+    matching parameters via ``read_overlap_region``). Each match yields
+    a per-pixel delta in shared canvas coords; the median is the
+    translation, and an N-corrected agreement score gates abstain.
 
-    if abs(rot_val) > 0.01:
-        center = (new_w // 2, new_h // 2)
-        M_rot = cv2.getRotationMatrix2D(center, rot_val, 1.0)
-        resized = cv2.warpAffine(resized, M_rot, (new_w, new_h),
-                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    The agreement metric is the standard-error-of-the-median based
+    confidence ``1 / (1 + SE_px)`` where ``SE_px = (MAD_x + MAD_y) *
+    1.4826 / sqrt(N)``. Compared to raw ``1/(1+MAD)``, this credits
+    high-N runs: 500 matches scattered with MAD ≈ 16 px have SE ≈ 1 px
+    and clear a 0.30 floor that the same MAD with N = 30 would not.
 
-    if (resized.shape[0] >= offset_land.shape[0] or
-            resized.shape[1] >= offset_land.shape[1]):
-        return scale_val, rot_val, -1
+    Returns ``(dx_m, dy_m, n_matches, agreement)`` or ``None`` on
+    failure (insufficient content, model load failure, too few matches,
+    or too dispersed). Sign convention: positive ``dx_m`` / ``dy_m``
+    means shift the target east / north to align with the reference.
 
-    if resized.shape[0] < 10 or resized.shape[1] < 10:
-        return scale_val, rot_val, -1
-
-    result = cv2.matchTemplate(offset_land, resized, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, _ = cv2.minMaxLoc(result)
-    return scale_val, rot_val, max_val
-
-
-def detect_multiscale_ncc(ref_land, offset_land, expected_scale):
-    """Brute-force multi-scale NCC on land masks or gradient images.
-
-    Returns (scale, rotation_deg, correlation) or None.
+    ``model_cache`` may be passed in for batch processing; otherwise a
+    fresh ``ModelCache`` is created and disposed inside the call.
     """
-    h, w = ref_land.shape
-    th, tw = h // 3, w // 3
-    cy, cx = h // 2, w // 2
-    template = ref_land[cy - th // 2:cy + th // 2, cx - tw // 2:cx + tw // 2]
-
-    if template.shape[0] < 20 or template.shape[1] < 20:
+    if arr_ref.shape != arr_tgt.shape:
+        print(f"  [coarse:eloftr] shape mismatch ref={arr_ref.shape} "
+              f"tgt={arr_tgt.shape}; skipping")
         return None
 
-    # Adaptive scale range centered on expected_scale
-    scale_min = max(0.4, expected_scale * 0.7)
-    scale_max = min(2.0, expected_scale * 1.5)
-    n_scales = 25
-    scales = np.linspace(scale_min, scale_max, n_scales)
-    rotations = np.linspace(-6, 6, 13)
+    ref_u8 = clahe_normalize(arr_ref)
+    tgt_u8 = clahe_normalize(arr_tgt)
 
-    best_corr = -1
-    best_scale = 1.0
-    best_rot = 0.0
-
-    global _scale_worker_data
-    _scale_worker_data = {'template': template, 'offset_land': offset_land}
-
-    combos = [(s, r) for s in scales for r in rotations]
-    n_workers = min(len(combos), max(1, (os.cpu_count() or 4) - 1))
-
-    ctx = mp.get_context('fork')
-    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
-        for s, r, corr in pool.map(_try_scale_rotation, combos, chunksize=8):
-            if corr > best_corr:
-                best_corr = corr
-                best_scale = s
-                best_rot = r
-
-    _scale_worker_data = {}
-
-    if best_corr < 0.3:
+    if (np.mean(ref_u8 > 0) < 0.05) or (np.mean(tgt_u8 > 0) < 0.05):
+        print(f"  [coarse:eloftr] insufficient valid content")
         return None
 
-    return best_scale, best_rot, best_corr
+    h, w = ref_u8.shape
+    if h < 64 or w < 64:
+        print(f"  [coarse:eloftr] canvas too small ({h}x{w} < 64x64)")
+        return None
+
+    # Tile into ~tile_px windows with 50% overlap. Single tile when the
+    # canvas already fits.
+    if h <= tile_px and w <= tile_px:
+        tiles = [{"ref": ref_u8, "off": tgt_u8, "r0": 0, "c0": 0}]
+    else:
+        stride = tile_px // 2
+        rows = list(range(0, max(1, h - tile_px) + 1, stride))
+        cols = list(range(0, max(1, w - tile_px) + 1, stride))
+        if rows[-1] + tile_px < h:
+            rows.append(h - tile_px)
+        if cols[-1] + tile_px < w:
+            cols.append(w - tile_px)
+        tiles = []
+        for r0 in rows:
+            for c0 in cols:
+                ref_p = ref_u8[r0:r0 + tile_px, c0:c0 + tile_px]
+                tgt_p = tgt_u8[r0:r0 + tile_px, c0:c0 + tile_px]
+                if (np.mean(ref_p > 0) < 0.05) or (np.mean(tgt_p > 0) < 0.05):
+                    continue
+                tiles.append({"ref": ref_p, "off": tgt_p, "r0": r0, "c0": c0})
+    if not tiles:
+        print(f"  [coarse:eloftr] no tiles passed content check")
+        return None
+
+    cache = model_cache
+    created_cache = False
+    if cache is None:
+        try:
+            from .models import ModelCache
+            cache = ModelCache(get_torch_device())
+            created_cache = True
+        except Exception as exc:
+            print(f"  [coarse:eloftr] ModelCache unavailable ({exc})")
+            return None
+
+    try:
+        try:
+            batch_results = _run_eloftr_batch(
+                tiles, cache.eloftr, cache.device, batch_size=4,
+            )
+        except Exception as exc:
+            print(f"  [coarse:eloftr] inference failed ({exc})")
+            return None
+
+        all_ref = []
+        all_tgt = []
+        for tile, (kp_ref, kp_tgt, conf) in zip(tiles, batch_results):
+            if kp_ref is None or len(kp_ref) == 0:
+                continue
+            mask = conf > conf_min
+            if mask.sum() < 3:
+                continue
+            offset = np.array([tile["c0"], tile["r0"]], dtype=np.float32)
+            all_ref.append(kp_ref[mask] + offset)
+            all_tgt.append(kp_tgt[mask] + offset)
+    finally:
+        if created_cache:
+            cache.close()
+
+    if not all_ref:
+        print(f"  [coarse:eloftr] no tile produced confident matches")
+        return None
+
+    kpts_ref = np.vstack(all_ref).astype(np.float32)
+    kpts_tgt = np.vstack(all_tgt).astype(np.float32)
+    if len(kpts_ref) < min_matches:
+        print(f"  [coarse:eloftr] only {len(kpts_ref)} confident matches "
+              f"(need {min_matches})")
+        return None
+
+    # Per-match pixel delta on the shared canvas. dx_px > 0 means a
+    # feature appears east in ref vs target → shift target east.
+    dx_px = kpts_ref[:, 0] - kpts_tgt[:, 0]
+    # Rows increase downward; world y increases upward → dy_m flips sign.
+    dy_px = kpts_tgt[:, 1] - kpts_ref[:, 1]
+
+    dx_m = float(np.median(dx_px) * coarse_res)
+    dy_m = float(np.median(dy_px) * coarse_res)
+    mad_x = float(np.median(np.abs(dx_px - np.median(dx_px))))
+    mad_y = float(np.median(np.abs(dy_px - np.median(dy_px))))
+    # Standard-error-of-the-median (in pixels). MAD * 1.4826 = sigma
+    # estimate; SE = sigma / sqrt(N). Use the sum of axes as a single
+    # scalar so agreement maps to "translation precision in either axis."
+    n = max(1, len(kpts_ref))
+    se_px = (mad_x + mad_y) * 1.4826 / np.sqrt(n)
+    agreement = float(1.0 / (1.0 + se_px))
+
+    return dx_m, dy_m, int(len(kpts_ref)), agreement
 
 
 # ---------------------------------------------------------------------------
@@ -405,36 +538,25 @@ def _gate_neural(result):
     return n_inliers >= 8 and 0.45 < avg < 1.80
 
 
-def _gate_ncc_land(result):
-    if result is None:
-        return False
-    scale, rot, corr = result
-    return corr >= 0.55 and 0.45 < scale < 1.80
-
-
-def _gate_ncc_gradient(result):
-    if result is None:
-        return False
-    scale, rot, corr = result
-    return corr >= 0.4 and 0.45 < scale < 1.80
-
-
 def _to_scale_result_4(result, method):
     """Convert (sx, sy, rot, n_inliers) -> ScaleResult."""
     return ScaleResult(result[0], result[1], result[2], method)
 
 
-def _to_scale_result_ncc(result, method):
-    """Convert (scale, rot, corr) -> ScaleResult (isotropic)."""
-    return ScaleResult(result[0], result[0], result[1], method)
-
-
 def detect_scale_rotation(src_offset, src_ref, overlap, work_crs,
                           coarse_dx, coarse_dy, expected_scale, model_cache=None,
                           diagnostics_dir=None):
-    """Orchestrate scale/rotation detection: ELoFTR first, NCC grids as fallback.
+    """Detect scale/rotation via ELoFTR.
 
-    Returns ScaleResult (scale_x, scale_y, rotation, method_name).
+    The historic NCC fallbacks (multiscale land-mask NCC, gradient NCC,
+    brute-force scale-rotation grid search) were removed in 2026-04 —
+    they relied on the same cv2.matchTemplate primitive that fails on
+    the wrong-shoreline ambiguity present in coastal scenes. ELoFTR with
+    its inlier-count gate either succeeds with a confident neural fit or
+    returns the identity transform (scale 1.0, rotation 0). Downstream
+    flow refinement absorbs sub-degree residuals on accepted scenes.
+
+    Returns ``ScaleResult(scale_x, scale_y, rotation, method_name)``.
     """
     detection_res = 5.0
 
@@ -459,56 +581,25 @@ def detect_scale_rotation(src_offset, src_ref, overlap, work_crs,
     arr_off_shifted = cv2.warpAffine(arr_off, M_shift, (w, h),
                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
-    # --- Method A: ELoFTR ---
     print("    Method: ELoFTR...")
     try:
         eloftr_model = model_cache.eloftr if model_cache else None
         result = detect_eloftr_scale(arr_ref, arr_off_shifted, model=eloftr_model,
-                                        diagnostics_dir=diagnostics_dir)
+                                     diagnostics_dir=diagnostics_dir)
         if _gate_neural(result):
             sr = _to_scale_result_4(result, "eloftr")
             avg = (sr.scale_x + sr.scale_y) / 2
             print(f"      Accepted (scale={avg:.4f}, rotation={sr.rotation:.3f} deg)")
             return sr
-        elif result is not None:
-            print("      Gate rejected, trying NCC fallback")
+        if result is not None:
+            sx, sy, rot, n_inliers = result
+            print(f"      Gate rejected (scale={(sx+sy)/2:.4f}, "
+                  f"inliers={n_inliers}); skipping scale/rotation correction")
         else:
-            print("      Failed to detect, trying NCC fallback")
+            print("      Failed to detect; skipping scale/rotation correction")
     except Exception as e:
-        print(f"      Error: {e}, trying NCC fallback")
+        print(f"      Error: {e}; skipping scale/rotation correction")
 
-    # --- Methods B+C: parallel NCC grids ---
-    ref_land = make_land_mask(arr_ref)
-    off_land = make_land_mask(arr_off_shifted)
-
-    ref_u8 = clahe_normalize(arr_ref)
-    off_u8 = clahe_normalize(arr_off_shifted)
-    ref_grad = sobel_gradient(ref_u8).astype(np.float32)
-    off_grad = sobel_gradient(off_u8).astype(np.float32)
-
-    parallel_specs = [
-        ("NCC-land", ref_land, off_land, _gate_ncc_land, _to_scale_result_ncc, "multiscale-ncc"),
-        ("NCC-gradient", ref_grad, off_grad, _gate_ncc_gradient, _to_scale_result_ncc, "gradient-ncc"),
-    ]
-
-    print("    Methods B+C: NCC-land and NCC-gradient (sequential)...")
-    for label, ref_data, off_data, gate, convert, method_name in parallel_specs:
-        try:
-            result = detect_multiscale_ncc(ref_data, off_data, expected_scale)
-            if gate(result):
-                sr = convert(result, method_name)
-                avg = (sr.scale_x + sr.scale_y) / 2
-                print(f"      {label}: Accepted (scale={avg:.4f}, rotation={sr.rotation:.3f} deg)")
-                return sr
-            elif result is not None:
-                scale_val, rot_val, corr_val = result
-                print(f"      {label}: Gate rejected (scale={scale_val:.4f}, corr={corr_val:.3f})")
-            else:
-                print(f"      {label}: Failed to detect")
-        except Exception as e:
-            print(f"      {label}: Error: {e}")
-
-    print("    No significant scale/rotation detected")
     return ScaleResult(1.0, 1.0, 0.0, None)
 
 

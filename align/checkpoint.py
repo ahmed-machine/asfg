@@ -167,6 +167,11 @@ def load_checkpoint(phase_id: str, checkpoint_dir: str) -> "AlignState":
         if bv is not None:
             data[bk] = tuple(bv)
 
+    for tk in ("anchor_presearch_offset_m", "residual_translation_calibration_m"):
+        tv = data.get(tk)
+        if tv is not None:
+            data[tk] = tuple(tv)
+
     # Apply numpy arrays
     for k, v in np_arrays.items():
         data[k] = v

@@ -31,11 +31,9 @@ from preprocess.mosaic import build_all_mosaics, build_mosaic
 from preprocess.georef import fetch_sentinel2_reference, build_composite_reference
 from preprocess.orientation import swap_corners_180, detect_orientation, verify_orientation_against_reference
 from preprocess.auto_anchors import generate_auto_anchors
-from preprocess.experimental.match_ip import generate_strip_matches, normalize_preprocess_matcher
-from preprocess.camera_model import generate_camera, mapproject_image
+from preprocess.camera_model import generate_camera, interpolate_camera_pose, mapproject_image
 from preprocess.mission_altitude import altitude_m_at, parse_entity_id
 from preprocess.dem import fetch_and_prepare_dem
-from align.experimental.bundle_adjust import run_strip_bundle_adjustment
 from align.params import load_profile
 from align.models import ModelCache, get_torch_device
 import paths
@@ -117,7 +115,6 @@ def _default_scene_metadata(scene, cache_dir: str) -> dict:
         "entity_id": eid,
         "camera_designation": _camera_designation(scene),
         "profile": _profile_name_for_scene(scene),
-        "preprocess_matcher": "roma",
         "gcp_corners": {k: list(v) for k, v in scene.corners.items()},
         "georef_path": os.path.abspath(paths.georef_path(cache_dir, eid)),
         "stitched_path": os.path.abspath(paths.stitched_path(cache_dir, eid)),
@@ -126,6 +123,18 @@ def _default_scene_metadata(scene, cache_dir: str) -> dict:
         "primary_input_kind": None,
         "primary_input_path": None,
         "alignment_crop_path": None,
+        # Outcome of the most recent _coarse_align_ortho_to_sidecar call.
+        # "ok" → sidecar written; "abstained" → coarse_align_and_crop
+        # could not pin position; None → never attempted (no reference).
+        # Consumed by generate_manifest's hard-fail skip on profiles
+        # whose USGS corners are flagged unreliable.
+        "coarse_align_status": None,
+        # Reference-sensitive cache identity for the georef/ortho state.
+        # Older caches lack this key and are treated as untrusted for
+        # unreliable-corner profiles until preprocessing refreshes them.
+        "georef_cache_key": None,
+        "georef_cache_reuse_status": None,
+        "georef_cache_reuse_reason": None,
     }
 
 
@@ -134,6 +143,74 @@ def _merge_scene_metadata(cache_dir: str, scene, **updates) -> dict:
     metadata.update(updates)
     _save_scene_metadata(cache_dir, scene.entity_id, metadata)
     return metadata
+
+
+def _reference_cache_identity(reference: str | None) -> dict | None:
+    if not reference or not os.path.exists(reference):
+        return None
+    try:
+        st = os.stat(reference)
+    except OSError:
+        return None
+    return {
+        "basename": os.path.basename(reference),
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+
+
+def _georef_output_identity(path: str | None) -> dict | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return {
+        "basename": os.path.basename(path),
+        "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+
+
+def _scene_corner_cache_identity(scene) -> dict:
+    corners = getattr(scene, "corners", {}) or {}
+    return {
+        str(k).upper(): [round(float(v[0]), 8), round(float(v[1]), 8)]
+        for k, v in sorted(corners.items())
+        if isinstance(v, (list, tuple)) and len(v) >= 2
+    }
+
+
+def _build_georef_cache_key(scene, reference: str | None,
+                            georef_path: str | None) -> dict:
+    return {
+        "schema_version": 1,
+        "entity_id": scene.entity_id,
+        "profile": _profile_name_for_scene(scene),
+        "camera_designation": _camera_designation(scene),
+        "corners": _scene_corner_cache_identity(scene),
+        "reference": _reference_cache_identity(reference),
+        "georef": _georef_output_identity(georef_path),
+    }
+
+
+def _georef_cache_reject(cache_dir: str, scene, georef_path: str,
+                         reason: str, cache_key: dict | None = None) -> bool:
+    """Mark a georef cache miss and remove the stale completion sentinel."""
+    print(f"  [cache] Rejecting georef cache for {scene.entity_id}: {reason}")
+    metadata = _load_scene_metadata(cache_dir, scene.entity_id)
+    if metadata is not None:
+        metadata["georef_cache_key"] = cache_key
+        metadata["georef_cache_reuse_status"] = "rejected"
+        metadata["georef_cache_reuse_reason"] = reason
+        _save_scene_metadata(cache_dir, scene.entity_id, metadata)
+    try:
+        if os.path.exists(georef_path):
+            os.remove(georef_path)
+    except OSError as exc:
+        print(f"  [cache] WARNING: could not remove stale georef {georef_path}: {exc}")
+    return False
 
 
 def _camera_designation(scene) -> str:
@@ -162,36 +239,71 @@ def _camera_designation(scene) -> str:
 
 
 def _profile_name_for_scene(scene) -> str:
+    """Map a scene to its profile YAML stem.
+
+    DS1 entities (CORONA) split by mission-ID: DS1001-DS1052 → kh4a
+    (Itek J-1, oscillating scanner, scan-head-translation IMC), DS1101-
+    DS1117 → kh4b (Itek J-3, rotating scanner, lens-rotation IMC). The
+    J-1/J-3 difference in IMC direction + scan kinematics is real, even
+    though CoSP (Ghuffar 2022) absorbs it in pose + focal-length free
+    parameters. Mission-ID ranges sourced from
+    `preprocess/mission_altitude.py::_series_from_mission_id`.
+    """
     prefix = scene.camera_system.entity_prefix
     if prefix == "DS1":
-        return "kh4"
+        # Parse mission ID from entity_id (format: DS<4-digit mission>-<frame>).
+        from preprocess.mission_altitude import parse_entity_id
+        ref = parse_entity_id(scene.entity_id)
+        if ref is not None:
+            if ref.system == "KH-4A":
+                return "kh4a"
+            if ref.system == "KH-4B":
+                return "kh4b"
+            # KH-4 (missions 9001-9099) — treat as KH-4A-adjacent. No
+            # separate profile; route to kh4a for now since the Itek lens
+            # is closer to J-1 than J-3, and no catalog rows ever exist
+            # (the original KH-4 is pre-1963 and unscanned).
+            if ref.system == "KH-4":
+                return "kh4a"
+        # Fallback: unknown DS1 mission → kh4b (preserves legacy behaviour
+        # for catalog rows that predate parse_entity_id's coverage).
+        return "kh4b"
     if prefix == "DZB":
+        # DZB4xxx → KH-7 (GAMBIT-1 strip camera).
+        # DZB12xx → KH-9 Mapping Camera (Hexagon frame camera, Declass-II).
+        # See `preprocess/mission_altitude.py::_series_from_mission_id` for ranges.
+        from preprocess.mission_altitude import parse_entity_id
+        ref = parse_entity_id(scene.entity_id)
+        if ref is not None:
+            if ref.system == "KH-7":
+                return "kh7"
+            if ref.system == "KH-9":
+                return "kh9_mc"
+        # Unknown DZB mission → KH-7 legacy behaviour.
         return "kh7"
     if prefix == "D3C":
         return "kh9"
     raise ValueError(f"Unsupported camera system for {scene.entity_id}")
 
 
-def _metadata_preprocess_matcher(metadata: dict | None, fallback: str = "roma") -> str:
-    try:
-        return normalize_preprocess_matcher((metadata or {}).get("preprocess_matcher", fallback))
-    except Exception:
-        return normalize_preprocess_matcher(fallback)
+def _camera_params_for_scene(scene) -> dict | None:
+    """Return a camera-params dict suitable for `preprocess.camera_model.generate_camera`.
 
-
-def _camera_params_for_scene(scene, preprocess_matcher: str | None = None) -> dict | None:
+    Returns None when the profile declares no known geometry (e.g. the KH-8
+    stub). Panoramic (KH-4, KH-9 PC), pinhole / frame (KH-9 MC), and strip /
+    linescan (KH-7) all return populated dicts; ``generate_camera`` dispatches
+    on the ``type`` field to pick the ASP cam_gen model.
+    """
     profile = load_profile(_profile_name_for_scene(scene))
-    if not profile.camera.is_panoramic:
+    if not profile.camera.is_known_geometry:
         return None
     params = copy.deepcopy(profile.camera.to_dict())
-    params["preprocess_matcher"] = normalize_preprocess_matcher(
-        preprocess_matcher or params.get("preprocess_matcher", "roma")
-    )
-    designation = _camera_designation(scene)
-    if designation == "A":
-        params["forward_tilt"] = -abs(params.get("forward_tilt", 0.0))
-    elif designation == "F":
-        params["forward_tilt"] = abs(params.get("forward_tilt", 0.0))
+    if profile.camera.is_panoramic:
+        designation = _camera_designation(scene)
+        if designation == "A":
+            params["forward_tilt"] = -abs(params.get("forward_tilt", 0.0))
+        elif designation == "F":
+            params["forward_tilt"] = abs(params.get("forward_tilt", 0.0))
     return params
 
 
@@ -205,6 +317,34 @@ def _bbox_from_corners(corners: dict) -> tuple[float, float, float, float]:
     lats = [float(v[0]) for v in corners.values()]
     lons = [float(v[1]) for v in corners.values()]
     return (min(lons), min(lats), max(lons), max(lats))
+
+
+def _native_ortho_resolution_m(scene, camera_params: dict | None) -> float | None:
+    """Compute the scene's native GSD (ground-sampling distance) in metres.
+
+    Returns ``altitude × pixel_pitch / focal_length`` with altitude from
+    (in precedence order): TLE-derived per-scene altitude, profile
+    ``nominal_altitude_km``, or None when unavailable. The native GSD
+    is what the film actually resolves — orthos rendered at this pitch
+    preserve full detail (the user complaint that "all outputs are
+    downscaled from the original" comes from mapproject inheriting the
+    basemap's coarser pixel size).
+    """
+    if camera_params is None:
+        return None
+    f = camera_params.get("focal_length")
+    p = camera_params.get("pixel_pitch")
+    if not f or not p or f <= 0 or p <= 0:
+        return None
+    # Prefer per-scene altitude from TLE / catalog.
+    alt = _altitude_seed_for_scene(scene) if scene is not None else None
+    if alt is None or alt <= 0:
+        nom_km = camera_params.get("nominal_altitude_km")
+        if nom_km:
+            alt = float(nom_km) * 1000.0
+    if alt is None or alt <= 0:
+        return None
+    return float(alt) * float(p) / float(f)
 
 
 def _reference_resolution(reference_path: str) -> float | None:
@@ -245,6 +385,40 @@ def _path_is_stale(path: str | None, *dependencies: str | None) -> bool:
     return False
 
 
+def _ortho_has_content(ortho_path: str, *,
+                       min_valid_fraction: float = 0.001) -> bool:
+    """Return True iff the ortho TIFF at ``ortho_path`` has at least
+    ``min_valid_fraction`` of valid (>0) pixels. Reads a decimated
+    overview to keep the check cheap (under ~50 ms even on a 3 GB raster).
+
+    Used as a defensive gate after ``mapproject_image`` because
+    ASP/mapproject can silently emit an all-nodata sparse-tiled raster
+    when projection geometry fails (camera entirely off-DEM, numerical
+    blow-up, killed mid-write). Detected case: KH-4B DS1104-1057DA024
+    in v13/v14/v17/v19 — 49 MB output with 0 valid pixels.
+    """
+    try:
+        import rasterio
+    except Exception:
+        return True   # if rasterio is unavailable assume content
+    if not os.path.exists(ortho_path):
+        return False
+    try:
+        with rasterio.open(ortho_path) as src:
+            decim = 256
+            arr = src.read(
+                1,
+                out_shape=(max(1, src.height // decim),
+                           max(1, src.width // decim)),
+            )
+        valid = float((arr > 0).mean())
+        return valid >= min_valid_fraction
+    except Exception:
+        # Treat read failures as broken — better safe than letting a
+        # corrupt ortho through.
+        return False
+
+
 def _primary_input_update(georef_path: str | None, asp_ortho_path: str | None) -> dict:
     if asp_ortho_path and os.path.exists(asp_ortho_path):
         return {
@@ -268,170 +442,321 @@ def _alignment_crop_path(cache_dir: str, entity_id: str, input_kind: str) -> str
     return os.path.join(cache_dir, crop_dir, f"{entity_id}_{safe_kind}_cropped.tif")
 
 
-def _filter_frames_to_bbox(frames: list[str], corners: dict, scene, reference: str) -> list[str] | None:
-    """Return the subset of *frames* whose geographic extent overlaps the reference bbox.
-
-    Each frame covers 1/N of the strip.  For Aft cameras the geographic
-    order is reversed (last delivered frame = geographic west).  Uses a
-    generous margin so adjacent frames that partially overlap are included.
-    """
+def _coarse_shift_from_geotransforms(source_path: str, shifted_path: str) -> tuple[float, float] | None:
+    """Return the sidecar geotransform delta in approximate metres."""
     try:
         import rasterio
-        from rasterio.warp import transform_bounds
-        from preprocess.camera_model import is_aft_camera, interpolate_segment_corners
-    except ImportError:
+        with rasterio.open(source_path) as src, rasterio.open(shifted_path) as shifted:
+            dx = float(shifted.transform.c - src.transform.c)
+            dy = float(shifted.transform.f - src.transform.f)
+            crs = shifted.crs or src.crs
+            if crs is not None and crs.is_geographic:
+                dx *= 111000.0
+                dy *= 111000.0
+            return dx, dy
+    except Exception:
         return None
 
-    n = len(frames)
-    if n < 3:
-        return None  # not worth filtering
 
-    with rasterio.open(reference) as ref:
-        ref_4326 = transform_bounds(ref.crs, "EPSG:4326", *ref.bounds)
-    margin = 0.02  # ~2 km
-    ref_west, ref_east = ref_4326[0] - margin, ref_4326[2] + margin
-
-    cam_name = (scene.camera_system.name or "").upper().replace("-", "")
-    aft = is_aft_camera(scene.entity_id, cam_name)
-
-    keep = []
-    for i in range(n):
-        # In delivery order, frame i maps to segment index seg_i.
-        # For Aft, image_mosaic --rotate reverses the mosaic, so
-        # delivery frame 0 (='a') ends up at the geographic east end.
-        seg_i = (n - 1 - i) if aft else i
-        seg_corners = interpolate_segment_corners(corners, n, seg_i)
-        lc = {str(k).lower(): v for k, v in seg_corners.items()}
-        seg_west = min(lc["nw"][1], lc["sw"][1])
-        seg_east = max(lc["ne"][1], lc["se"][1])
-        if seg_east > ref_west and seg_west < ref_east:
-            keep.append(frames[i])
-
-    return keep if keep else None
+def _entity_frame_key(entity_id: str) -> tuple[str, int] | None:
+    match = re.match(r"^(?P<prefix>.*?)(?P<frame>\d{3})$", entity_id or "")
+    if not match:
+        return None
+    return match.group("prefix"), int(match.group("frame"))
 
 
-def _per_segment_sub_frames(scene, cache_dir: str) -> list[str] | None:
-    """Locate the extracted sub-frames for a scene in stitch order.
+def _validated_neighbour_coarse_shifts(cache_dir: str, entity_id: str,
+                                       reference: str) -> list[tuple[float, float]]:
+    """Read validated sibling coarse shifts for strip-coherence priors."""
+    key = _entity_frame_key(entity_id)
+    if key is None:
+        return []
+    prefix, frame = key
+    ortho_dir = os.path.join(cache_dir, "ortho")
+    try:
+        names = os.listdir(ortho_dir)
+    except OSError:
+        return []
+    shifts: list[tuple[float, float]] = []
+    for name in names:
+        if not name.endswith("_ortho.coarse.json"):
+            continue
+        other_eid = name[:-len("_ortho.coarse.json")]
+        other_key = _entity_frame_key(other_eid)
+        if other_key is None:
+            continue
+        other_prefix, other_frame = other_key
+        if other_prefix != prefix or other_frame == frame:
+            continue
+        path = os.path.join(ortho_dir, name)
+        try:
+            with open(path) as f:
+                prov = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        try:
+            if int(prov.get("schema_version", 0)) < 2:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if not bool(prov.get("coarse_validated", False)):
+            continue
+        # The shift corrects USGS-corner error in the target's geotransform
+        # and is invariant to which correctly-georeferenced reference was
+        # used to measure it; accept sibling priors across references so a
+        # frame validated against (e.g.) the 1976 KH-9 reference can still
+        # seed neighbours run against ESRI WorldImagery. Drift between
+        # modern references is sub-pixel; the per-axis gate downstream
+        # rejects any prior that disagrees with the local NCC peak by more
+        # than the strip-coherence bound.
+        try:
+            shifts.append((float(prov["coarse_dx_m"]), float(prov["coarse_dy_m"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return shifts
 
-    KH-4 sub-frames are delivered (a, b, c, d) but stitched in reverse
-    so the scan axis runs left-to-right; KH-7/KH-9 are stitched in
-    delivery order. The per-segment processor needs them in stitch order
-    (left-to-right along the scan axis), so we mirror what
-    ``stitch_with_asp`` does.
+
+def _bracketing_stitched_camera_neighbors(cache_dir: str, entity_id: str) -> tuple[list[str], float, list[str]] | None:
+    """Return lower/upper stitched .tsai neighbors and interpolation alpha."""
+    key = _entity_frame_key(entity_id)
+    if key is None:
+        return None
+    prefix, frame = key
+    stitched_dir = os.path.join(cache_dir, "stitched")
+    try:
+        names = os.listdir(stitched_dir)
+    except OSError:
+        return None
+    candidates: list[tuple[int, str, str]] = []
+    for name in names:
+        if not name.endswith("_stitched.tsai") or name.endswith(".interp.tsai"):
+            continue
+        other_eid = name[:-len("_stitched.tsai")]
+        other_key = _entity_frame_key(other_eid)
+        if other_key is None:
+            continue
+        other_prefix, other_frame = other_key
+        if other_prefix != prefix or other_frame == frame:
+            continue
+        candidates.append((other_frame, other_eid, os.path.join(stitched_dir, name)))
+    lower = [item for item in candidates if item[0] < frame]
+    upper = [item for item in candidates if item[0] > frame]
+    if not lower or not upper:
+        return None
+    left = max(lower, key=lambda item: item[0])
+    right = min(upper, key=lambda item: item[0])
+    span = max(1, right[0] - left[0])
+    alpha = (frame - left[0]) / span
+    return [left[2], right[2]], float(alpha), [left[1], right[1]]
+
+
+def _write_coarse_ortho_provenance(provenance_path: str, source_path: str,
+                                   reference: str,
+                                   coarse_details: dict | None = None) -> None:
+    data = {
+        "schema_version": 2,
+        "reference_basename": os.path.basename(reference),
+        "reference_mtime_ns": os.stat(reference).st_mtime_ns,
+        "reference_size": os.path.getsize(reference),
+        "source_path": os.path.abspath(source_path),
+        "source_mtime_ns": os.stat(source_path).st_mtime_ns,
+        "source_size": os.path.getsize(source_path),
+    }
+    if coarse_details:
+        data.update({
+            "coarse_dx_m": float(coarse_details.get("dx_m", 0.0)),
+            "coarse_dy_m": float(coarse_details.get("dy_m", 0.0)),
+            "coarse_n_matches": int(coarse_details.get("n_matches", 0)),
+            "coarse_agreement": float(coarse_details.get("agreement", 0.0)),
+            "coarse_validated": bool(coarse_details.get("validated", False)),
+        })
+    os.makedirs(os.path.dirname(provenance_path), exist_ok=True)
+    tmp = provenance_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, provenance_path)
+
+
+def _coarse_sidecar_provenance_matches(provenance_path: str, source_path: str,
+                                       reference: str) -> bool:
+    """True iff the sidecar provenance records the given reference + source."""
+    if not os.path.exists(provenance_path):
+        return False
+    try:
+        with open(provenance_path) as f:
+            prov = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    try:
+        try:
+            if int(prov.get("schema_version", 0)) < 2:
+                return False
+        except (TypeError, ValueError):
+            return False
+        if prov.get("reference_basename") != os.path.basename(reference):
+            return False
+        if prov.get("reference_size") != os.path.getsize(reference):
+            return False
+        if prov.get("reference_mtime_ns") != os.stat(reference).st_mtime_ns:
+            return False
+        if prov.get("source_size") != os.path.getsize(source_path):
+            return False
+        if prov.get("source_mtime_ns") != os.stat(source_path).st_mtime_ns:
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def _record_coarse_align_status(cache_dir: str, entity_id: str,
+                                status: str) -> None:
+    """Persist the coarse-align outcome on the scene metadata so the
+    align-loop can hard-fail unreliable-corners profiles whose preprocess
+    coarse-align abstained. Tolerant of missing metadata (we only stamp
+    the field if a metadata file exists; first-time scenes get the field
+    written by the success path).
     """
-    frames = list_frames(paths.extracted_dir(cache_dir, scene.entity_id))
-    if not frames:
+    metadata = _load_scene_metadata(cache_dir, entity_id)
+    if metadata is None:
+        return
+    if metadata.get("coarse_align_status") == status:
+        return
+    metadata["coarse_align_status"] = status
+    _save_scene_metadata(cache_dir, entity_id, metadata)
+
+
+def _coarse_align_ortho_to_sidecar(source_path: str, reference: str, bbox,
+                                   label: str, cache_dir: str,
+                                   entity_id: str, *,
+                                   model_cache=None,
+                                   params=None) -> str | None:
+    """Coarse-align ``source_path`` against ``reference`` by SHIFTING the
+    geotransform and write the shifted copy to a reference-specific
+    sidecar. Do NOT mutate ``source_path`` in place; the canonical ortho
+    (and per-segment VRT) stays reference-neutral so switching
+    ``--reference`` doesn't poison the shared preprocessing cache.
+
+    Returns the sidecar path on success, ``None`` on failure. The sidecar
+    is at ``paths.ortho_coarse_path`` with a companion provenance JSON that
+    records which (source, reference) pair produced it; runs with a
+    different reference rebuild the sidecar rather than inherit a stale
+    shift.
+
+    Side effect: stamps ``coarse_align_status`` ("ok" | "abstained") on
+    the scene metadata so ``generate_manifest`` can hard-fail entities on
+    profiles flagged ``usgs_corners_reliable: false``.
+    """
+    if not reference or not os.path.exists(reference):
         return None
-    cam_name = (scene.camera_system.name or "").upper().replace("-", "")
-    if cam_name.startswith("KH4"):
-        return list(reversed(frames))
-    return frames
-
-
-def _maybe_generate_asp_ortho(scene, cache_dir: str, stitched_path: str,
-                              corners: dict, reference: str | None,
-                              preprocess_matcher: str | None = None) -> str | None:
-    selected_matcher = normalize_preprocess_matcher(preprocess_matcher)
-    camera_params = _camera_params_for_scene(scene, selected_matcher)
-    if camera_params is None:
+    if not os.path.exists(source_path):
         return None
-    skip_stitched_fallback = os.environ.get(
-        "DECLASS_SKIP_STITCHED_FALLBACK", ""
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    sidecar = paths.ortho_coarse_path(cache_dir, entity_id)
+    provenance = paths.ortho_coarse_provenance_path(cache_dir, entity_id)
+    if (os.path.exists(sidecar)
+            and _coarse_sidecar_provenance_matches(provenance, source_path, reference)):
+        print(f"  [coarse_crop] {label} sidecar up-to-date: {sidecar}")
+        _record_coarse_align_status(cache_dir, entity_id, "ok")
+        return sidecar
+    # Lazy-load profile params from scene metadata when callers didn't
+    # pass ``params``. Used by the stacked NCC fallback in
+    # preprocess.coarse_align_ncc_stack to read camera knobs.
+    if params is None:
+        meta = _load_scene_metadata(cache_dir, entity_id) or {}
+        profile_name = meta.get("profile")
+        if profile_name:
+            try:
+                params = load_profile(profile_name)
+            except Exception:
+                params = None
+    try:
+        neighbour_shifts = _validated_neighbour_coarse_shifts(
+            cache_dir, entity_id, reference)
+        if neighbour_shifts:
+            med_dx = sorted(s[0] for s in neighbour_shifts)[len(neighbour_shifts) // 2]
+            med_dy = sorted(s[1] for s in neighbour_shifts)[len(neighbour_shifts) // 2]
+            print(f"  [coarse_crop] validated strip prior from "
+                  f"{len(neighbour_shifts)} neighbour(s): "
+                  f"dx≈{med_dx:+.0f}m, dy≈{med_dy:+.0f}m")
+        coarse_result = coarse_align_and_crop(
+            source_path, reference, sidecar,
+            target_bbox_wgs=bbox, crop=False,
+            model_cache=model_cache,
+            params=params,
+            neighbour_shifts_m=neighbour_shifts,
+            return_details=True,
+        )
+    except Exception as exc:
+        print(f"  [coarse_crop] {label} coarse-align failed: {exc}")
+        _record_coarse_align_status(cache_dir, entity_id, "abstained")
+        return None
+    coarse_details = None
+    if isinstance(coarse_result, tuple):
+        coarse_result, coarse_details = coarse_result
+    if not coarse_result or not os.path.exists(coarse_result):
+        _record_coarse_align_status(cache_dir, entity_id, "abstained")
+        return None
+    if coarse_details is None:
+        shift = _coarse_shift_from_geotransforms(source_path, coarse_result)
+        if shift is not None:
+            coarse_details = {
+                "dx_m": shift[0],
+                "dy_m": shift[1],
+                "n_matches": 0,
+                "agreement": 0.0,
+                "validated": False,
+            }
+    try:
+        _write_coarse_ortho_provenance(
+            provenance, source_path, reference, coarse_details)
+    except OSError as exc:
+        print(f"  [coarse_crop] provenance write failed ({exc}); discarding sidecar")
+        try:
+            os.remove(sidecar)
+        except OSError:
+            pass
+        _record_coarse_align_status(cache_dir, entity_id, "abstained")
+        return None
+    print(f"  [coarse_crop] {label} coarse-shifted to sidecar "
+          f"(canonical preserved): {sidecar}")
+    _record_coarse_align_status(cache_dir, entity_id, "ok")
+    return sidecar
 
-    bbox = _bbox_from_corners(corners)
-    dem_path = fetch_and_prepare_dem(
-        west=bbox[0] - 0.1, south=bbox[1] - 0.1,
-        east=bbox[2] + 0.1, north=bbox[3] + 0.1,
-    )
 
-    # 2OC §3.1 per-sub-image processing is gated on the profile's explicit
-    # ``ortho_strategy`` policy field. ``stitched`` (the Phase 1 default)
-    # runs whole-strip cam_gen + mapproject; ``per_segment_experimental``
-    # runs per-sub-frame cam_gen + mapproject + blend. The older
-    # ``per_segment_ortho: true`` boolean is honoured as a deprecated
-    # alias. See ``CameraParams.resolve_ortho_strategy`` for precedence.
-    from align.params import resolve_ortho_strategy as _resolve_ortho_strategy
-    profile = load_profile(_profile_name_for_scene(scene))
-    ortho_strategy = _resolve_ortho_strategy(profile.camera)
-    use_per_segment = ortho_strategy == "per_segment_experimental"
-    profile_name = getattr(getattr(profile, "meta", None), "name", "?")
-    print(f"  [ortho] strategy={ortho_strategy} (profile={profile_name})")
-    if use_per_segment:
-        sub_frames = _per_segment_sub_frames(scene, cache_dir)
-        if sub_frames and len(sub_frames) > 1:
-            from preprocess.camera_model import opticalbar_per_segment_precorrect, is_aft_camera
-            seg_dir = paths.ortho_segments_dir(cache_dir, scene.entity_id)
-            cam_name = (scene.camera_system.name or "").upper().replace("-", "")
-            aft = is_aft_camera(scene.entity_id, cam_name)
-            print(f"  [per_segment_ortho] {len(sub_frames)} sub-frames found for {scene.entity_id}"
-                  f"{' (Aft camera)' if aft else ''}")
-            vrt_path = opticalbar_per_segment_precorrect(
-                sub_frames=sub_frames,
-                camera_params=camera_params,
-                strip_corners=corners,
-                output_dir=seg_dir,
-                dem_path=dem_path,
-                resolution=_reference_resolution(reference),  # TODO: switch to 0.87 for native
-                t_srs="EPSG:3857",
-                scene_id=scene.entity_id,
-                is_aft=aft,
-                reference_path=reference,
-                acq_date=_parse_acquisition_date(scene.acquisition_date),
-            )
-            if vrt_path:
-                # Coarse-align the per-segment mosaic against the reference
-                # so the whole mosaic lands at the correct absolute position.
-                # The segments are geometrically correct relative to each
-                # other (scan slant preserved) — this shifts the composite
-                # as one rigid block. Uses the same helper the stitched path
-                # runs (see below); if the land-mask correlation is too low
-                # or the shift is outlandish it returns the ortho unshifted.
-                if reference and os.path.exists(reference):
-                    coarse_tmp = os.path.splitext(vrt_path)[0] + "_coarse.tif"
-                    try:
-                        coarse_result = coarse_align_and_crop(
-                            vrt_path,
-                            reference,
-                            coarse_tmp,
-                            target_bbox_wgs=bbox,
-                        )
-                    except Exception as exc:
-                        print(f"  [coarse_crop] per-segment coarse-align "
-                              f"failed: {exc}")
-                        coarse_result = None
-                    if coarse_result and os.path.exists(coarse_result):
-                        try:
-                            os.replace(coarse_result, vrt_path)
-                            print(f"  [coarse_crop] per-segment mosaic "
-                                  f"coarse-aligned in place: {vrt_path}")
-                        except OSError as exc:
-                            print(f"  [coarse_crop] replace failed ({exc}); "
-                                  f"keeping unaligned {vrt_path}")
-                return vrt_path
-            if skip_stitched_fallback:
-                print("  [per_segment_ortho] failed; stitched fallback suppressed "
-                      "by DECLASS_SKIP_STITCHED_FALLBACK")
-                return None
-            print(f"  [per_segment_ortho] failed; falling back to stitched cam_gen")
-        else:
-            if skip_stitched_fallback:
-                print("  [per_segment_ortho] no usable sub-frames; stitched fallback "
-                      "suppressed by DECLASS_SKIP_STITCHED_FALLBACK")
-                return None
-            print(f"  [per_segment_ortho] no usable sub-frames for {scene.entity_id}; falling back to stitched cam_gen")
+def _coarse_ortho_for_reference(cache_dir: str, entity_id: str,
+                                source_path: str | None,
+                                reference: str | None) -> str | None:
+    """Return the coarse-align sidecar path iff its provenance matches the
+    given ``(source_path, reference)``. ``source_path`` is the canonical
+    ortho or per-segment VRT that was shifted to produce the sidecar.
+    """
+    if not reference or not os.path.exists(reference):
+        return None
+    if not source_path or not os.path.exists(source_path):
+        return None
+    sidecar = paths.ortho_coarse_path(cache_dir, entity_id)
+    if not os.path.exists(sidecar):
+        return None
+    provenance = paths.ortho_coarse_provenance_path(cache_dir, entity_id)
+    if _coarse_sidecar_provenance_matches(provenance, source_path, reference):
+        return sidecar
+    return None
 
-    # Single-camera fallback requires the stitched image.
+
+def _build_stitched_ortho(scene, cache_dir: str, stitched_path: str,
+                          camera_params: dict, corners: dict,
+                          reference: str | None, bbox,
+                          dem_path: str, *,
+                          model_cache=None, params=None) -> str | None:
+    """Whole-strip cam_gen + mapproject. Returns the (reference-neutral)
+    canonical ortho path and — when a reference is given — also writes a
+    coarse-align sidecar at ``paths.ortho_coarse_path`` so alignment can
+    pick it up without mutating the canonical cache."""
     if not os.path.exists(stitched_path):
         entity_dir = paths.extracted_dir(cache_dir, scene.entity_id)
         frames = list_frames(entity_dir)
         if frames:
             stitched_path = _stitch_if_needed(
-                frames,
-                scene.entity_id,
-                scene.camera_system,
-                stitched_path,
-                cache_dir,
+                frames, scene.entity_id, scene.camera_system, stitched_path, cache_dir,
             )
     if not os.path.exists(stitched_path):
         return None
@@ -441,68 +766,141 @@ def _maybe_generate_asp_ortho(scene, cache_dir: str, stitched_path: str,
     )
     if cam_path is None:
         return None
-
+    # Render at native GSD (altitude × pixel_pitch / focal_length) by
+    # default so orthos preserve the original film resolution. Users
+    # can force reference-resolution rendering via
+    # DECLASS_REFERENCE_ORTHO=1 when alignment runtime is tight.
+    _native = _native_ortho_resolution_m(scene, camera_params)
+    _ref = _reference_resolution(reference)
+    force_ref = os.environ.get("DECLASS_REFERENCE_ORTHO", "").lower() in {"1", "true", "yes"}
+    ortho_res = (_ref if force_ref and _ref else _native) or _ref
     stitched_ortho = mapproject_image(
         stitched_path,
         cam_path,
         dem_path=dem_path,
         output_path=paths.ortho_path(cache_dir, scene.entity_id),
-        resolution=_reference_resolution(reference),
+        resolution=ortho_res,
         t_srs="EPSG:3857",
     )
-    if not stitched_ortho or not reference or not os.path.exists(reference):
+    if not stitched_ortho:
         return stitched_ortho
-
-    # Coarse-align the stitched ortho against the reference and replace the
-    # original file with the aligned+cropped version. cam_gen seeds its iC
-    # from the USGS 4-corner centroid, which for KH-4 / KH-4B scenes is
-    # commonly 10–30 km off; without this step the ortho lands mispositioned
-    # in the reference frame and the downstream run_test intersection-based
-    # crop lops off valid Bahrain content. ``coarse_align_and_crop`` does
-    # a low-res template match on land masks, shifts the geotransform,
-    # then crops to the reference bbox + 10 km margin. On success we
-    # overwrite the original stitched ortho in place so any caller reading
-    # ``paths.ortho_path`` gets the aligned version.
-    coarse_tmp = os.path.splitext(stitched_ortho)[0] + "_coarse.tif"
-    try:
-        coarse_result = coarse_align_and_crop(
-            stitched_ortho,
-            reference,
-            coarse_tmp,
-            target_bbox_wgs=bbox,
-        )
-    except Exception as exc:
-        print(f"  [coarse_crop] stitched coarse-align failed: {exc}")
-        coarse_result = None
-    if coarse_result and os.path.exists(coarse_result):
+    # Validity gate: mapproject can silently write an all-nodata raster
+    # (sparse-tiled GeoTIFF) when the camera pose projects entirely
+    # outside the DEM, the projection geometry blows up numerically, or
+    # the run was killed mid-write. The downstream coarse-align trips
+    # its "Insufficient content for matching" early gate and the entity
+    # is dropped without any clear failure signal. Validate the ortho
+    # actually has content; if not, remove the empty file so the next
+    # run regenerates from scratch.
+    if not _ortho_has_content(stitched_ortho, min_valid_fraction=0.001):
+        print(f"  [ortho] mapproject output {os.path.basename(stitched_ortho)} "
+              f"has < 0.1% valid pixels; removing as broken")
         try:
-            os.replace(coarse_result, stitched_ortho)
-            print(f"  [coarse_crop] stitched ortho coarse-aligned in place: "
-                  f"{stitched_ortho}")
-        except OSError as exc:
-            print(f"  [coarse_crop] replace failed ({exc}); keeping unaligned "
-                  f"{stitched_ortho}")
+            os.remove(stitched_ortho)
+        except OSError:
+            pass
+        neighbour_info = _bracketing_stitched_camera_neighbors(
+            cache_dir, scene.entity_id)
+        if neighbour_info is None:
+            return None
+        neighbour_tsais, alpha, neighbour_ids = neighbour_info
+        interp_cam = os.path.splitext(stitched_path)[0] + ".interp.tsai"
+        interp_path = interpolate_camera_pose(
+            neighbour_tsais, interp_cam, alpha=alpha, base_tsai_path=cam_path)
+        if not interp_path:
+            return None
+        print(f"  [ortho] retrying mapproject with interpolated pose from "
+              f"neighbours {neighbour_ids}")
+        stitched_ortho = mapproject_image(
+            stitched_path,
+            interp_path,
+            dem_path=dem_path,
+            output_path=paths.ortho_path(cache_dir, scene.entity_id),
+            resolution=ortho_res,
+            t_srs="EPSG:3857",
+        )
+        if (not stitched_ortho
+                or not _ortho_has_content(stitched_ortho, min_valid_fraction=0.001)):
+            if stitched_ortho:
+                print(f"  [ortho] interpolated mapproject output "
+                      f"{os.path.basename(stitched_ortho)} still has "
+                      f"< 0.1% valid pixels; removing as broken")
+                try:
+                    os.remove(stitched_ortho)
+                except OSError:
+                    pass
+            return None
+    # cam_gen's seed from the USGS 4-corner centroid is often 10–30 km
+    # off on KH-4/4B. The shift lands in a reference-specific sidecar
+    # (paths.ortho_coarse_path); the canonical stays reference-neutral.
+    _coarse_align_ortho_to_sidecar(
+        stitched_ortho, reference, bbox, "stitched ortho",
+        cache_dir, scene.entity_id,
+        model_cache=model_cache,
+        params=params,
+    )
     return stitched_ortho
+
+
+def _maybe_generate_asp_ortho(scene, cache_dir: str, stitched_path: str,
+                              corners: dict, reference: str | None,
+                              *,
+                              model_cache=None) -> str | None:
+    camera_params = _camera_params_for_scene(scene)
+    if camera_params is None:
+        return None
+
+    bbox = _bbox_from_corners(corners)
+    dem_path = fetch_and_prepare_dem(
+        west=bbox[0] - 0.1, south=bbox[1] - 0.1,
+        east=bbox[2] + 0.1, north=bbox[3] + 0.1,
+    )
+
+    # Per-segment ortho is hard-disabled (see align/params.py); always
+    # build the whole-strip cam_gen + mapproject ortho.
+    profile = load_profile(_profile_name_for_scene(scene))
+    profile_name = getattr(getattr(profile, "meta", None), "name", "?")
+    print(f"  [ortho] strategy=stitched (profile={profile_name})")
+
+    return _build_stitched_ortho(
+        scene, cache_dir, stitched_path, camera_params, corners, reference, bbox, dem_path,
+        model_cache=model_cache, params=profile,
+    )
 
 
 def _ensure_scene_asp_ortho(scene, cache_dir: str, reference: str | None,
                             metadata: dict | None = None, file_map: dict | None = None,
-                            preprocess_matcher: str | None = None) -> dict:
+                            *,
+                            model_cache=None) -> dict:
     metadata = metadata or (_load_scene_metadata(cache_dir, scene.entity_id) or _default_scene_metadata(scene, cache_dir))
-    selected_matcher = normalize_preprocess_matcher(preprocess_matcher)
     if not reference or not os.path.exists(reference):
         return metadata
-    if _camera_params_for_scene(scene, selected_matcher) is None:
+    if _camera_params_for_scene(scene) is None:
         return metadata
 
     asp_ortho_path = metadata.get("asp_ortho_path")
-    if asp_ortho_path and os.path.exists(asp_ortho_path) and asp_ortho_path.endswith("_ortho_ba.tif"):
-        return metadata
 
     georef_path = metadata.get("georef_path") or paths.georef_path(cache_dir, scene.entity_id)
     stitched_path = metadata.get("stitched_path") or paths.stitched_path(cache_dir, scene.entity_id)
-    matcher_changed = _metadata_preprocess_matcher(metadata) != selected_matcher
-    if not matcher_changed and not _path_is_stale(asp_ortho_path, stitched_path, georef_path):
+    if not _path_is_stale(asp_ortho_path, stitched_path, georef_path):
+        # Canonical is fresh, but the *sidecar* may be stale (e.g. the
+        # caller switched ``--reference`` since the last run, or the
+        # sidecar was never built because the previous run predates this
+        # logic). Refresh the sidecar so its provenance always tracks the
+        # current reference and ``coarse_align_status`` lands in metadata
+        # for generate_manifest's hard-fail abstain skip to consult.
+        if asp_ortho_path:
+            corners = _corners_from_metadata(scene, metadata)
+            try:
+                _scene_profile = load_profile(_profile_name_for_scene(scene))
+            except Exception:
+                _scene_profile = None
+            _coarse_align_ortho_to_sidecar(
+                asp_ortho_path, reference, _bbox_from_corners(corners),
+                "stitched ortho", cache_dir, scene.entity_id,
+                model_cache=model_cache,
+                params=_scene_profile,
+            )
         return metadata
 
     if not os.path.exists(stitched_path):
@@ -531,7 +929,7 @@ def _ensure_scene_asp_ortho(scene, cache_dir: str, reference: str | None,
         stitched_path,
         corners,
         reference,
-        preprocess_matcher=selected_matcher,
+        model_cache=model_cache,
     )
     if not asp_ortho_path:
         return metadata
@@ -543,33 +941,49 @@ def _ensure_scene_asp_ortho(scene, cache_dir: str, reference: str | None,
         stitched_path=os.path.abspath(stitched_path),
         asp_camera_path=os.path.abspath(asp_camera_path) if os.path.exists(asp_camera_path) else None,
         asp_ortho_path=os.path.abspath(asp_ortho_path),
-        preprocess_matcher=selected_matcher,
         **_primary_input_update(georef_path, asp_ortho_path),
     )
 
 
-def _preferred_alignment_input_info(cache_dir: str, entity_id: str) -> tuple[str | None, str | None]:
+def _preferred_alignment_input_info(cache_dir: str, entity_id: str,
+                                    reference: str | None = None
+                                    ) -> tuple[str | None, str | None]:
+    """Return ``(kind, path)`` for the best alignment input.
+
+    When ``reference`` is given and a coarse-align sidecar exists whose
+    provenance matches ``(primary_source, reference)``, that sidecar is
+    preferred over the reference-neutral canonical. The canonical path
+    itself is never mutated, so switching reference only invalidates the
+    sidecar — the canonical stays shared across runs.
+    """
     metadata = _load_scene_metadata(cache_dir, entity_id)
+    primary_kind: str | None = None
+    primary_path: str | None = None
     if metadata:
         primary_kind = metadata.get("primary_input_kind")
         primary_path = metadata.get("primary_input_path")
-        if primary_kind and primary_path and os.path.exists(primary_path):
-            return (primary_kind, primary_path)
-        ortho_path = metadata.get("asp_ortho_path")
-        if ortho_path and os.path.exists(ortho_path):
-            return ("asp_ortho", ortho_path)
-        georef_path = metadata.get("georef_path")
-        if georef_path and os.path.exists(georef_path):
-            return ("georef", georef_path)
-    georef_path = paths.georef_path(cache_dir, entity_id)
-    if os.path.exists(georef_path):
-        return ("georef", georef_path)
-    return (None, None)
-
-
-def _preferred_alignment_input(cache_dir: str, entity_id: str) -> str | None:
-    _, path = _preferred_alignment_input_info(cache_dir, entity_id)
-    return path
+    if not (primary_kind and primary_path and os.path.exists(primary_path)):
+        if metadata:
+            ortho_path = metadata.get("asp_ortho_path")
+            if ortho_path and os.path.exists(ortho_path):
+                primary_kind, primary_path = "asp_ortho", ortho_path
+            else:
+                georef_path = metadata.get("georef_path")
+                if georef_path and os.path.exists(georef_path):
+                    primary_kind, primary_path = "georef", georef_path
+        if not (primary_kind and primary_path):
+            georef_path = paths.georef_path(cache_dir, entity_id)
+            if os.path.exists(georef_path):
+                primary_kind, primary_path = "georef", georef_path
+    if not (primary_kind and primary_path and os.path.exists(primary_path)):
+        return (None, None)
+    if primary_kind == "asp_ortho" and reference:
+        sidecar = _coarse_ortho_for_reference(
+            cache_dir, entity_id, primary_path, reference,
+        )
+        if sidecar:
+            return ("asp_ortho_coarse", sidecar)
+    return (primary_kind, primary_path)
 
 
 def _check_duplicate_scans(frame_a: str, frame_b: str) -> bool:
@@ -707,11 +1121,144 @@ def _stitch_if_needed(frames: list[str], eid: str, camera,
     return frames[0]
 
 
+def _reuse_georef_cache(scene, cd: str, reference: str, file_map: dict,
+                        georef_path: str,
+                        progress: dict, eid: str,
+                        *,
+                        model_cache=None) -> bool:
+    """Short-circuit when georef already exists: refresh metadata and skip.
+
+    When metadata is missing (cold cache), write fresh metadata and proceed
+    with ortho generation. When metadata exists but the cache key drifted,
+    reject (deletes the georef so the next call rebuilds from scratch).
+    """
+    metadata = _load_scene_metadata(cd, eid)
+    cache_key = _build_georef_cache_key(scene, reference, georef_path)
+
+    if metadata is not None and metadata.get("georef_cache_key") != cache_key:
+        return _georef_cache_reject(
+            cd, scene, georef_path, "cache_key_changed", cache_key)
+
+    if metadata is not None:
+        try:
+            profile = load_profile(_profile_name_for_scene(scene))
+            unreliable_corners = not bool(profile.camera.usgs_corners_reliable)
+        except Exception:
+            unreliable_corners = True
+        if unreliable_corners and reference and os.path.exists(reference):
+            coarse_status = metadata.get("coarse_align_status")
+            if coarse_status != "ok":
+                return _georef_cache_reject(
+                    cd, scene, georef_path,
+                    f"coarse_align_status_not_ok:{coarse_status}", cache_key)
+            primary_kind = metadata.get("primary_input_kind")
+            primary_path = metadata.get("primary_input_path")
+            if primary_kind == "asp_ortho" and primary_path:
+                sidecar = _coarse_ortho_for_reference(
+                    cd, eid, primary_path, reference)
+                if sidecar is None:
+                    return _georef_cache_reject(
+                        cd, scene, georef_path,
+                        "coarse_sidecar_provenance_mismatch", cache_key)
+
+    metadata = _merge_scene_metadata(
+        cd, scene,
+        georef_path=os.path.abspath(georef_path),
+        georef_cache_key=cache_key,
+        georef_cache_reuse_status="accepted",
+        georef_cache_reuse_reason="cache_valid",
+    )
+    metadata = _ensure_scene_asp_ortho(
+        scene, cd, reference,
+        metadata=metadata, file_map=file_map,
+        model_cache=model_cache,
+    )
+    _merge_scene_metadata(
+        cd, scene,
+        georef_cache_key=cache_key,
+        georef_cache_reuse_status="accepted",
+        georef_cache_reuse_reason="cache_valid",
+        **_primary_input_update(
+            metadata.get("georef_path"),
+            metadata.get("asp_ortho_path"),
+        ),
+    )
+    print(f"  [skip] Already georeferenced: {eid}")
+    progress["completed"][eid] = {"stage": "georef"}
+    progress["failed"].pop(eid, None)
+    return True
+
+
+def _run_scene_standard_path(scene, cd: str, eid: str, camera, frames, corners,
+                             reference: str,
+                             georef_path: str, preserve_stitched: bool,
+                             *,
+                             model_cache=None) -> None:
+    """Standard path: stitch → orient → georef → verify → ortho."""
+    stitched_path = paths.stitched_path(cd, eid)
+    input_for_orient = _stitch_if_needed(frames, eid, camera, stitched_path, cd)
+
+    print(f"\n  --- Orientation: {eid} ---")
+    rotation, gcp_corners = detect_orientation(
+        input_for_orient, corners, camera, reference_path=reference)
+    if rotation != 0:
+        print(f"  Orientation: {rotation} CW (via GCP assignment, no image rotation)")
+
+    is_panoramic = camera.program == "CORONA"
+    print(f"\n  --- Georef: {eid} ---")
+    georef_with_corners(input_for_orient, georef_path, gcp_corners,
+                        panoramic=is_panoramic)
+
+    if reference and os.path.exists(reference):
+        print(f"\n  --- Post-georef orientation check: {eid} ---")
+        correction = verify_orientation_against_reference(georef_path, reference)
+        if correction == 180:
+            print(f"  Auto-correcting: re-georeferencing with 180° flipped corners")
+            flipped_corners = swap_corners_180(gcp_corners)
+            os.remove(georef_path)
+            georef_with_corners(input_for_orient, georef_path, flipped_corners,
+                                panoramic=is_panoramic)
+            gcp_corners = flipped_corners
+
+    asp_ortho_path = None
+    if reference and os.path.exists(reference):
+        print(f"\n  --- ASP orthorectify: {eid} ---")
+        try:
+            asp_ortho_path = _maybe_generate_asp_ortho(
+                scene, cd, input_for_orient, gcp_corners, reference,
+                model_cache=model_cache,
+            )
+            if asp_ortho_path:
+                print(f"  ASP ortho ready: {os.path.basename(asp_ortho_path)}")
+        except Exception as e:
+            print(f"  WARNING: ASP orthorectification failed for {eid}: {e}")
+
+    asp_camera_path = paths.ba_camera_path(input_for_orient)
+    _merge_scene_metadata(
+        cd, scene,
+        gcp_corners={k: list(v) for k, v in gcp_corners.items()},
+        georef_path=os.path.abspath(georef_path),
+        stitched_path=os.path.abspath(input_for_orient),
+        asp_camera_path=os.path.abspath(asp_camera_path) if os.path.exists(asp_camera_path) else None,
+        asp_ortho_path=os.path.abspath(asp_ortho_path) if asp_ortho_path else None,
+        georef_cache_key=_build_georef_cache_key(scene, reference, georef_path),
+        georef_cache_reuse_status="refreshed",
+        georef_cache_reuse_reason="processed",
+        **_primary_input_update(georef_path, asp_ortho_path),
+    )
+
+    stitched_int = paths.stitched_path(cd, eid)
+    if os.path.exists(stitched_int) and not preserve_stitched:
+        os.remove(stitched_int)
+        print(f"  Removed intermediate: {os.path.basename(stitched_int)}")
+
+
 def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, reference: str,
                                 progress: dict, dry_run: bool = False,
                                 cache_dir: str | None = None,
                                 preserve_stitched: bool = False,
-                                preprocess_matcher: str | None = None) -> bool:
+                                *,
+                                model_cache=None) -> bool:
     """Run the extract → stitch → georef cascade on a single scene.
 
     Preprocessing outputs (extracted, stitched, georef) go under *cache_dir*
@@ -722,44 +1269,19 @@ def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, referenc
     cd = cache_dir or output_dir
     eid = scene.entity_id
     camera = scene.camera_system
-    selected_matcher = normalize_preprocess_matcher(preprocess_matcher)
 
-    # Check if already completed
     georef_path = paths.georef_path(cd, eid)
     if os.path.exists(georef_path):
-        metadata = _merge_scene_metadata(
-            cd,
-            scene,
-            georef_path=os.path.abspath(georef_path),
-            preprocess_matcher=selected_matcher,
-        )
-        metadata = _ensure_scene_asp_ortho(
-            scene,
-            cd,
-            reference,
-            metadata=metadata,
-            file_map=file_map,
-            preprocess_matcher=selected_matcher,
-        )
-        metadata = _merge_scene_metadata(
-            cd,
-            scene,
-            preprocess_matcher=selected_matcher,
-            **_primary_input_update(
-                metadata.get("georef_path"),
-                metadata.get("asp_ortho_path"),
-            ),
-        )
-        print(f"  [skip] Already georeferenced: {eid}")
-        progress["completed"][eid] = {"stage": "georef"}
-        progress["failed"].pop(eid, None)
-        return True
+        if _reuse_georef_cache(scene, cd, reference, file_map,
+                               georef_path, progress, eid,
+                               model_cache=model_cache):
+            return True
+        # Cache rejected (deleted georef); fall through to fresh extraction.
 
     if dry_run:
         print(f"  [dry-run] Would process: {eid} ({camera.name})")
         return True
 
-    # Check for downloaded file
     file_path = file_map.get(eid)
     if not file_path or not os.path.exists(file_path):
         print(f"  WARNING: No downloaded file for {eid}, skipping")
@@ -767,7 +1289,6 @@ def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, referenc
         return False
 
     try:
-        # Step 3: Extract
         print(f"\n  --- Extract: {eid} ---")
         entity_dir = extract_archive(file_path, cd, eid)
         frames = list_frames(entity_dir)
@@ -778,129 +1299,11 @@ def extract_stitch_georef_scene(scene, output_dir: str, file_map: dict, referenc
             return False
 
         corners = scene.corners
-        from align.params import resolve_ortho_strategy as _resolve_ortho_strategy
-        profile = load_profile(_profile_name_for_scene(scene))
-        ortho_strategy = _resolve_ortho_strategy(profile.camera)
-        use_per_segment = ortho_strategy == "per_segment_experimental"
-
-        # --- Fast path: skip stitch/georef only for the experimental
-        # per-segment strategy. Phase 1 of the recovery plan flipped the
-        # default to ``stitched`` so production runs no longer take the
-        # fast-path shortcut (which bypasses orientation detection and
-        # post-georef orientation verification). Explicit experimental
-        # profiles still opt in and keep the fast path.
-        if use_per_segment and reference and os.path.exists(reference):
-            from preprocess.camera_model import is_aft_camera
-            cam_name = (camera.name or "").upper().replace("-", "")
-            aft = is_aft_camera(eid, cam_name)
-            # Do NOT swap corners here — opticalbar_per_segment_precorrect
-            # handles Aft internally (frame reversal + 180° rotation).  The
-            # strip corners stay in their original USGS orientation.
-            gcp_corners = corners
-            print(f"\n  --- Fast-path orientation: {eid} ---")
-            print(f"  Camera: {'Aft' if aft else 'Forward'} "
-                  f"(per-segment handles rotation internally)")
-
-            # Create a tiny georef placeholder — per-segment doesn't use the
-            # georef file, but metadata needs the path for cache checks.
-            if not os.path.exists(georef_path):
-                os.makedirs(os.path.dirname(georef_path), exist_ok=True)
-                from osgeo import gdal as _gdal_ph
-                _gdal_ph.UseExceptions()
-                drv = _gdal_ph.GetDriverByName("GTiff")
-                ds = drv.Create(georef_path, 1, 1, 1, _gdal_ph.GDT_Byte)
-                ds.FlushCache()
-                ds = None
-
-            asp_ortho_path = None
-            print(f"\n  --- ASP orthorectify: {eid} ---")
-            try:
-                stitched_path = paths.stitched_path(cd, eid)
-                asp_ortho_path = _maybe_generate_asp_ortho(
-                    scene,
-                    cd,
-                    stitched_path,
-                    gcp_corners,
-                    reference,
-                    preprocess_matcher=selected_matcher,
-                )
-                if asp_ortho_path:
-                    print(f"  ASP ortho ready: {os.path.basename(asp_ortho_path)}")
-            except Exception as e:
-                print(f"  WARNING: ASP orthorectification failed for {eid}: {e}")
-
-            _merge_scene_metadata(
-                cd, scene,
-                preprocess_matcher=selected_matcher,
-                ortho_strategy=ortho_strategy,
-                gcp_corners={k: list(v) for k, v in gcp_corners.items()},
-                georef_path=os.path.abspath(georef_path),
-                asp_ortho_path=os.path.abspath(asp_ortho_path) if asp_ortho_path else None,
-                **_primary_input_update(georef_path, asp_ortho_path),
-            )
-
-        else:
-            # --- Standard path: stitch → orient → georef → verify ---
-            stitched_path = paths.stitched_path(cd, eid)
-            input_for_orient = _stitch_if_needed(frames, eid, camera, stitched_path, cd)
-
-            print(f"\n  --- Orientation: {eid} ---")
-            rotation, gcp_corners = detect_orientation(
-                input_for_orient, corners, camera, reference_path=reference)
-            if rotation != 0:
-                print(f"  Orientation: {rotation} CW (via GCP assignment, no image rotation)")
-
-            is_panoramic = camera.program == "CORONA"
-            print(f"\n  --- Georef: {eid} ---")
-            georef_with_corners(input_for_orient, georef_path, gcp_corners,
-                                panoramic=is_panoramic)
-
-            if reference and os.path.exists(reference):
-                print(f"\n  --- Post-georef orientation check: {eid} ---")
-                correction = verify_orientation_against_reference(georef_path, reference)
-                if correction == 180:
-                    print(f"  Auto-correcting: re-georeferencing with 180° flipped corners")
-                    flipped_corners = swap_corners_180(gcp_corners)
-                    os.remove(georef_path)
-                    georef_with_corners(input_for_orient, georef_path, flipped_corners,
-                                        panoramic=is_panoramic)
-                    gcp_corners = flipped_corners
-
-            asp_ortho_path = None
-            if reference and os.path.exists(reference):
-                print(f"\n  --- ASP orthorectify: {eid} ---")
-                try:
-                    asp_ortho_path = _maybe_generate_asp_ortho(
-                        scene,
-                        cd,
-                        input_for_orient,
-                        gcp_corners,
-                        reference,
-                        preprocess_matcher=selected_matcher,
-                    )
-                    if asp_ortho_path:
-                        print(f"  ASP ortho ready: {os.path.basename(asp_ortho_path)}")
-                except Exception as e:
-                    print(f"  WARNING: ASP orthorectification failed for {eid}: {e}")
-
-            asp_camera_path = paths.ba_camera_path(input_for_orient)
-            _merge_scene_metadata(
-                cd, scene,
-                preprocess_matcher=selected_matcher,
-                ortho_strategy=ortho_strategy,
-                gcp_corners={k: list(v) for k, v in gcp_corners.items()},
-                georef_path=os.path.abspath(georef_path),
-                stitched_path=os.path.abspath(input_for_orient),
-                asp_camera_path=os.path.abspath(asp_camera_path) if os.path.exists(asp_camera_path) else None,
-                asp_ortho_path=os.path.abspath(asp_ortho_path) if asp_ortho_path else None,
-                **_primary_input_update(georef_path, asp_ortho_path),
-            )
-
-            # Clean up stitched intermediates to save disk
-            stitched_int = paths.stitched_path(cd, eid)
-            if os.path.exists(stitched_int) and not preserve_stitched:
-                os.remove(stitched_int)
-                print(f"  Removed intermediate: {os.path.basename(stitched_int)}")
+        _run_scene_standard_path(
+            scene, cd, eid, camera, frames, corners, reference,
+            georef_path, preserve_stitched,
+            model_cache=model_cache,
+        )
 
         progress["completed"][eid] = {"stage": "georef"}
         progress["failed"].pop(eid, None)
@@ -930,7 +1333,9 @@ def _reference_bounds_wgs(reference_path: str) -> tuple:
 
 def generate_manifest(scenes: list, output_dir: str, reference: str,
                       cache_dir: str | None = None,
-                      device: str = "auto") -> str:
+                      device: str = "auto",
+                      anchors_override: str | None = None,
+                      secondary_references: list[str] | None = None) -> str:
     """Generate a strip manifest JSON for auto-align.py.
 
     Each frame gets per-frame metadata priors (from USGS corners) and a
@@ -955,7 +1360,9 @@ def generate_manifest(scenes: list, output_dir: str, reference: str,
     try:
         for scene in scenes:
             eid = scene.entity_id
-            input_kind, input_path = _preferred_alignment_input_info(cd, eid)
+            input_kind, input_path = _preferred_alignment_input_info(
+                cd, eid, reference=reference,
+            )
             if not input_path:
                 continue
 
@@ -975,21 +1382,61 @@ def generate_manifest(scenes: list, output_dir: str, reference: str,
                 skipped += 1
                 continue
 
-            # Coarse-align and crop wide strips to reference bbox before alignment.
-            # This finds the actual content overlap (accounting for USGS corner
-            # offset), shifts the image, and crops to the reference footprint +
-            # margin so the alignment pipeline doesn't search 200km of ocean.
+            # Hard-fail when preprocess coarse-align abstained AND the
+            # camera profile flags USGS corners as unreliable. Aligning
+            # against an ortho positioned only by USGS corners (10–30 km
+            # off on KH-4 / KH-7) is worse than not aligning: ROMA finds
+            # an internally-consistent fit on the wrong shoreline. Two
+            # ways to bypass:
+            #   * DECLASS_ALLOW_UNCOARSE_ALIGN=1 — diagnostic escape hatch.
+            #   * --anchors-override <PATH> — hand-curated anchors give us
+            #     the geographic prior coarse-align couldn't, so the
+            #     anchor stage can pin position from the lat/lon side.
+            coarse_status = (metadata or {}).get("coarse_align_status")
+            allow_uncoarse = os.environ.get(
+                "DECLASS_ALLOW_UNCOARSE_ALIGN", "").lower() in {"1", "true", "yes"}
+            override_provides_prior = bool(
+                anchors_override and os.path.exists(anchors_override))
+            if (coarse_status == "abstained" and not allow_uncoarse
+                    and not override_provides_prior):
+                profile = load_profile(_profile_name_for_scene(scene))
+                if not profile.camera.usgs_corners_reliable:
+                    print(f"  [skip] {eid} — coarse-align abstained and "
+                          f"profile '{profile.meta.name}' flags USGS corners "
+                          f"as unreliable; set DECLASS_ALLOW_UNCOARSE_ALIGN=1 "
+                          f"or pass --anchors-override to override")
+                    skipped += 1
+                    continue
+            if (coarse_status == "abstained"
+                    and override_provides_prior):
+                print(f"  [info] {eid} — coarse-align abstained but "
+                      f"--anchors-override supplies hand-curated GCPs; "
+                      f"proceeding with alignment")
+
+            # Pre-alignment coarse crop is disabled by default: the USGS-
+            # corner bbox can be 20+ km off, which causes the crop to
+            # discard valid data. auto-align runs its own coarse→fine
+            # offset detection on the full ortho. Set
+            # DECLASS_PRE_ALIGN_CROP=1 to opt back into the crop for
+            # tight-budget workflows where discarding edge data is
+            # acceptable.
             input_for_align = input_path
-            cropped_path = _alignment_crop_path(cd, eid, input_kind or "georef")
-            if _path_is_stale(cropped_path, input_path):
-                crop_result = coarse_align_and_crop(
-                    input_path, reference, cropped_path,
-                    target_bbox_wgs=frame_bbox,
-                )
-                if crop_result:
-                    input_for_align = crop_result
-            else:
-                input_for_align = cropped_path
+            if os.environ.get("DECLASS_PRE_ALIGN_CROP", "").lower() in {"1", "true", "yes"}:
+                cropped_path = _alignment_crop_path(cd, eid, input_kind or "georef")
+                if _path_is_stale(cropped_path, input_path):
+                    try:
+                        _crop_profile = load_profile(_profile_name_for_scene(scene))
+                    except Exception:
+                        _crop_profile = None
+                    crop_result = coarse_align_and_crop(
+                        input_path, reference, cropped_path,
+                        target_bbox_wgs=frame_bbox,
+                        params=_crop_profile,
+                    )
+                    if crop_result:
+                        input_for_align = crop_result
+                else:
+                    input_for_align = cropped_path
 
             _merge_scene_metadata(
                 cd,
@@ -1002,7 +1449,10 @@ def generate_manifest(scenes: list, output_dir: str, reference: str,
             diag_dir = paths.scene_diagnostics_dir(output_dir, eid)
             qa_json = os.path.join(diag_dir, "qa.json")
 
-            # Write per-frame metadata prior from USGS corners
+            # Write per-frame metadata prior from USGS corners.
+            # ``acquisition_date`` is embedded so step_setup's era-gap
+            # inference can compute the year-gap to the reference for
+            # the QA scorer's cross-temporal corrections.
             prior_data = {
                 "source": f"usgs_corners_{eid}",
                 "confidence": 0.35,
@@ -1014,6 +1464,8 @@ def generate_manifest(scenes: list, output_dir: str, reference: str,
                 "center_lon": (frame_bbox[0] + frame_bbox[2]) / 2,
                 "center_lat": (frame_bbox[1] + frame_bbox[3]) / 2,
                 "corners": corners,
+                "primary_input_kind": input_kind,
+                "acquisition_date": getattr(scene, "acquisition_date", None),
             }
             prior_path = paths.scene_prior_path(output_dir, eid)
             with open(prior_path, "w") as f:
@@ -1027,8 +1479,21 @@ def generate_manifest(scenes: list, output_dir: str, reference: str,
             win_top = min(ref_bbox[3], max(frame_bbox[3], ref_bbox[1]) + margin_deg)
             window_str = f"{win_left},{win_bottom},{win_right},{win_top}"
 
-            # Generate automatic anchor GCPs from coarse RoMa matching
+            # Generate automatic anchor GCPs from coarse RoMa matching.
+            # When --anchors-override is set, drop the hand-curated file at
+            # the canonical scene path; the existing skip-if-exists guard
+            # then preserves it instead of regenerating. This lets
+            # run_test.py pin the iteration loop on its known-good anchor
+            # set without forking the production code path.
             anchors_path = paths.scene_anchors_path(output_dir, eid)
+            if anchors_override and os.path.exists(anchors_override):
+                os.makedirs(os.path.dirname(anchors_path), exist_ok=True)
+                if not os.path.exists(anchors_path) or _path_is_stale(
+                        anchors_path, anchors_override):
+                    import shutil as _sh
+                    _sh.copy2(anchors_override, anchors_path)
+                    print(f"  [auto_anchors] Using --anchors-override "
+                          f"({os.path.basename(anchors_override)}) for {eid}")
             if not os.path.exists(anchors_path):
                 try:
                     anchors_path = generate_auto_anchors(
@@ -1050,6 +1515,7 @@ def generate_manifest(scenes: list, output_dir: str, reference: str,
                 "reference_window": window_str,
                 "diagnostics_dir": os.path.abspath(diag_dir),
                 "qa_json": os.path.abspath(qa_json),
+                "profile": _profile_name_for_scene(scene),
             }
             if anchors_path:
                 job_dict["anchors"] = os.path.abspath(anchors_path)
@@ -1070,13 +1536,19 @@ def generate_manifest(scenes: list, output_dir: str, reference: str,
     jobs.sort(key=lambda item: item[0], reverse=True)
     sorted_jobs = [job for _, job in jobs]
 
+    shared: dict = {
+        "reference": os.path.abspath(reference),
+        "device": device,
+        "global_search": True,
+        "allow_abstain": True,
+    }
+    if secondary_references:
+        # Absolute paths so auto-align in a different cwd resolves them.
+        shared["secondary_references"] = [
+            os.path.abspath(p) for p in secondary_references if p
+        ]
     manifest = {
-        "shared": {
-            "reference": os.path.abspath(reference),
-            "device": device,
-            "global_search": True,
-            "allow_abstain": True,
-        },
+        "shared": shared,
         "jobs": sorted_jobs,
     }
 
@@ -1438,7 +1910,6 @@ class PipelineContext:
     output_dir: str
     cache_dir: str
     progress: dict
-    preprocess_matcher: str = "roma"
     reference: Optional[str] = None            # composite when built, primary otherwise
     primary_reference: Optional[str] = None    # always the original reference (used for alignment)
     target_bbox: Optional[tuple] = None
@@ -1452,6 +1923,14 @@ class PipelineContext:
     mosaics: list = field(default_factory=list)
     mosaic_qa: dict = field(default_factory=dict)
     crop_bbox: Optional[tuple] = None
+    # Shared ELoFTR ModelCache for the preprocess coarse-align step. Lazy-
+    # created in stage_preprocess_scenes the first time a scene is processed
+    # under a reference, then disposed at the end of the stage. Threaded
+    # through extract_stitch_georef_scene → _run_scene_* → _maybe_generate_
+    # asp_ortho → _coarse_align_ortho_to_sidecar → coarse_align_and_crop so
+    # batches of scenes amortise the ~5 s ELoFTR weights load instead of
+    # paying it per scene.
+    eloftr_cache: Optional[object] = None
 
 
 def _print_stage_banner(title: str) -> None:
@@ -1468,6 +1947,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help="Path(s) to USGS EarthExplorer CSV catalog files")
     parser.add_argument("--reference", "-r", default=None,
                         help="Path to a correctly-aligned reference GeoTIFF")
+    parser.add_argument("--secondary-reference", action="append", default=[],
+                        metavar="PATH",
+                        help="Additional reference(s) tried when the primary "
+                             "alignment doesn't accept (e.g. a wider modern "
+                             "basemap when the era-matched primary leaves "
+                             "edge frames unmatched). Repeatable.")
     parser.add_argument("--auto-reference", action="store_true",
                         help="Auto-fetch a Sentinel-2 reference image")
     parser.add_argument("--output-dir", "-o", default="output",
@@ -1498,19 +1983,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                              "selection by coverage")
     parser.add_argument("--prefer-camera", default=None,
                         help="Preferred camera designation (A=Aft, F=Forward) for scene selection")
-    parser.add_argument("--bundle-adjust", action="store_true",
-                        help="Enable strip bundle adjustment with preprocessing tie points "
-                             "(experimental, requires ASP + --experimental)")
-    parser.add_argument("--preprocess-matcher", default="roma",
-                        choices=["roma", "nift"],
-                        help="Feature matcher used by panoramic preprocessing and "
-                             "experimental BA match generation (default: roma)")
-    parser.add_argument("--experimental", action="store_true",
-                        help="Opt in to experimental features (currently: --bundle-adjust). "
-                             "In-progress research threads are gated behind this flag so "
-                             "production runs can't stumble into unvalidated code paths.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"],
                         help="Torch device override for auto-anchor generation and alignment")
+    parser.add_argument("--anchors-override", default=None,
+                        help="Path to a hand-curated anchor JSON (same format as the "
+                             "auto-anchors output). When set, the file is copied to each "
+                             "scene's scene_anchors_path BEFORE generate_manifest's "
+                             "auto-anchor branch runs, so the auto-anchor stage skips "
+                             "regeneration. Used by scripts/test/run_test.py to pin the "
+                             "iteration loop on a known-good anchor set.")
     parser.add_argument("--cleanup", action="store_true",
                         help="Delete intermediate files (extracted/, georef/) after mosaic")
     return parser
@@ -1551,7 +2032,6 @@ def _init_context(args: argparse.Namespace) -> PipelineContext:
         output_dir=output_dir,
         cache_dir=cache_dir,
         progress=progress,
-        preprocess_matcher=normalize_preprocess_matcher(args.preprocess_matcher),
         crop_bbox=_parse_crop_bbox(args.crop_bbox),
     )
 
@@ -1623,22 +2103,42 @@ def stage_download_imagery(ctx: PipelineContext) -> None:
 def stage_preprocess_scenes(ctx: PipelineContext) -> None:
     """Run extract → stitch → georef on every downloadable scene."""
     _print_stage_banner("Stage 3-5: Extract, Stitch, Georef")
-    preserve_stitched = bool(ctx.args.bundle_adjust)
 
-    for scene in ctx.downloadable:
-        print(f"\n{'─' * 50}")
-        print(f"Processing: {scene.entity_id} ({scene.camera_system.name}, {scene.acquisition_date})")
-        print(f"{'─' * 50}")
-        ok = extract_stitch_georef_scene(
-            scene, ctx.output_dir, ctx.file_map, ctx.reference, ctx.progress,
-            cache_dir=ctx.cache_dir, preserve_stitched=preserve_stitched,
-            preprocess_matcher=ctx.preprocess_matcher,
-        )
-        if ok:
-            ctx.success_count += 1
-        else:
-            ctx.fail_count += 1
-        save_progress(ctx.cache_dir, ctx.progress)
+    # Lazy-create the ELoFTR ModelCache shared across all scenes' coarse-
+    # align calls. Skipped entirely when no reference is set (the coarse
+    # stage is a no-op without one). Disposed in finally so MPS / CUDA
+    # memory is released at end-of-stage even on exceptions.
+    if ctx.eloftr_cache is None and ctx.reference and os.path.exists(ctx.reference):
+        try:
+            from align.models import ModelCache, get_torch_device
+            ctx.eloftr_cache = ModelCache(get_torch_device(ctx.args.device))
+        except Exception as exc:
+            print(f"  [coarse_crop] ELoFTR ModelCache unavailable ({exc}); "
+                  f"each scene will lazy-load")
+            ctx.eloftr_cache = None
+
+    try:
+        for scene in ctx.downloadable:
+            print(f"\n{'─' * 50}")
+            print(f"Processing: {scene.entity_id} ({scene.camera_system.name}, {scene.acquisition_date})")
+            print(f"{'─' * 50}")
+            ok = extract_stitch_georef_scene(
+                scene, ctx.output_dir, ctx.file_map, ctx.reference, ctx.progress,
+                cache_dir=ctx.cache_dir,
+                model_cache=ctx.eloftr_cache,
+            )
+            if ok:
+                ctx.success_count += 1
+            else:
+                ctx.fail_count += 1
+            save_progress(ctx.cache_dir, ctx.progress)
+    finally:
+        if ctx.eloftr_cache is not None:
+            try:
+                ctx.eloftr_cache.close()
+            except Exception:
+                pass
+            ctx.eloftr_cache = None
 
     print(f"\n  Georef complete: {ctx.success_count} succeeded, {ctx.fail_count} failed")
 
@@ -1677,92 +2177,14 @@ def _collect_strip_frames(strip, cache_dir: str):
     return strip_scenes, strip_frames, strip_corners
 
 
-def _record_ba_ortho_metadata(scene, cache_dir: str, frame_path: str, remapped: str,
-                              matcher_name: str = "roma") -> None:
-    metadata = _load_scene_metadata(cache_dir, scene.entity_id) or {}
-    metadata["asp_ortho_path"] = os.path.abspath(remapped)
-    metadata.setdefault("georef_path", paths.georef_path(cache_dir, scene.entity_id))
-    metadata.setdefault("stitched_path", os.path.abspath(frame_path))
-    metadata.setdefault("entity_id", scene.entity_id)
-    metadata.setdefault("camera_designation", _camera_designation(scene))
-    metadata.setdefault("profile", _profile_name_for_scene(scene))
-    metadata.setdefault("gcp_corners", {k: list(v) for k, v in scene.corners.items()})
-    metadata["preprocess_matcher"] = normalize_preprocess_matcher(matcher_name)
-    metadata.update(_primary_input_update(metadata.get("georef_path"), remapped))
-    _save_scene_metadata(cache_dir, scene.entity_id, metadata)
-
-
-def _bundle_adjust_strip(strip, ctx: PipelineContext) -> None:
-    """Run selected matcher → ASP bundle_adjust → mapproject on one strip."""
-    strip_scenes, strip_frames, strip_corners = _collect_strip_frames(strip, ctx.cache_dir)
-    if len(strip_frames) < 2:
-        return
-
-    matcher = normalize_preprocess_matcher(ctx.preprocess_matcher)
-    match_prefix = generate_strip_matches(
-        strip_frames, strip_corners, paths.match_files_dir(ctx.output_dir),
-        match_prefix=f"{matcher}_{strip.mission}_{strip.date}".replace("/", "_"),
-        matcher_name=matcher,
-    )
-    if not match_prefix:
-        return
-
-    strip._match_prefix = match_prefix
-    print(f"  Strip {strip.mission} {strip.date}: match prefix → {match_prefix}")
-
-    camera_params = _camera_params_for_scene(strip_scenes[0], matcher)
-    if camera_params is None:
-        return
-    profile = load_profile(_profile_name_for_scene(strip_scenes[0]))
-    solve_intrinsics = bool(getattr(profile.camera, "bundle_adjust_solve_intrinsics", False))
-    bbox = strip.bbox
-    dem_path = fetch_and_prepare_dem(
-        west=bbox[0] - 0.1, south=bbox[1] - 0.1,
-        east=bbox[2] + 0.1, north=bbox[3] + 0.1,
-    )
-    strip_key = f"{strip.mission}_{strip.date}_{strip.camera_designation}".replace("/", "_")
-    adjusted = run_strip_bundle_adjustment(
-        strip_frames, camera_params, strip_corners,
-        dem_path=dem_path,
-        output_dir=paths.bundle_adjust_dir(ctx.cache_dir, strip_key),
-        match_prefix=match_prefix,
-        solve_intrinsics=solve_intrinsics,
-    )
-    if not adjusted:
-        return
-
-    for scene, frame_path, camera_path in zip(strip_scenes, strip_frames, adjusted):
-        remapped = mapproject_image(
-            frame_path, camera_path,
-            dem_path=dem_path,
-            output_path=paths.ortho_path(ctx.cache_dir, scene.entity_id, bundle_adjusted=True),
-            resolution=_reference_resolution(ctx.primary_reference),
-            t_srs="EPSG:3857",
-        )
-        if remapped:
-            _record_ba_ortho_metadata(scene, ctx.cache_dir, frame_path, remapped, matcher_name=matcher)
-
-
-def stage_bundle_adjust_strips(ctx: PipelineContext) -> None:
-    """Experimental: inter-frame matcher tie points + ASP bundle_adjust (2OC P2)."""
-    _print_stage_banner(
-        f"Stage 5b: Inter-frame match generation ({ctx.preprocess_matcher.upper()} → ASP)"
-    )
-    for strip in ctx.strips:
-        if len(strip.scenes) < 2:
-            continue
-        try:
-            _bundle_adjust_strip(strip, ctx)
-        except Exception as e:
-            print(f"  WARNING: bundle adjustment failed for strip "
-                  f"{strip.mission} {strip.date}: {e}")
-
-
 def stage_align_scenes(ctx: PipelineContext) -> None:
     _print_stage_banner("Stage 6: Alignment")
+    secondary_refs = list(getattr(ctx.args, "secondary_reference", None) or [])
     manifest_path = generate_manifest(
         ctx.downloadable, ctx.output_dir, ctx.primary_reference,
         cache_dir=ctx.cache_dir, device=ctx.args.device,
+        anchors_override=getattr(ctx.args, "anchors_override", None),
+        secondary_references=secondary_refs,
     )
     run_alignment(manifest_path)
 
@@ -1904,12 +2326,6 @@ def _run_frames_dir_mode(args: argparse.Namespace) -> None:
 
 
 def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.bundle_adjust and not args.experimental:
-        parser.error(
-            "--bundle-adjust is an experimental feature (in-progress research, "
-            "downstream camera-model improvement not yet quantified). "
-            "Pass --experimental alongside --bundle-adjust to acknowledge."
-        )
     if args.frames_dir:
         return  # frames-dir mode has its own arg shape
     if not args.csv and not args.resume:
@@ -1923,6 +2339,16 @@ def main() -> None:
     args = parser.parse_args()
     _validate_args(parser, args)
 
+    # OOM guard — warn / abort on under-provisioned machines and optionally
+    # install a soft RLIMIT_AS cap. The KH-9 PC per-segment path crashed a
+    # MacBookPro18,4 overnight with jetsam→kernel panic (2026-04-21) after
+    # hitting 144 GB uncompressed demand. See align/memory_guard.py for
+    # tunables (DECLASS_MIN_FREE_GB, DECLASS_ABORT_FLOOR_GB,
+    # DECLASS_MEMORY_CAP_GB).
+    from align.memory_guard import apply_process_memory_cap, check_memory_or_warn
+    apply_process_memory_cap()
+    check_memory_or_warn("startup")
+
     if args.frames_dir:
         return _run_frames_dir_mode(args)
 
@@ -1935,8 +2361,6 @@ def main() -> None:
     stage_download_imagery(ctx)
     stage_preprocess_scenes(ctx)
     stage_build_composite_reference(ctx)
-    if args.bundle_adjust and not args.skip_align:
-        stage_bundle_adjust_strips(ctx)
     if not args.skip_align and ctx.primary_reference:
         stage_align_scenes(ctx)
     if not args.skip_mosaic and not args.skip_align and ctx.reference:

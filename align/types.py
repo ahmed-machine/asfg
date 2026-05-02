@@ -13,12 +13,6 @@ import numpy as np
 # String enums for scattered literals
 # ---------------------------------------------------------------------------
 
-class MatcherType(str, Enum):
-    """Dense feature matcher backend."""
-    ROMA = "roma"
-    NIFT = "nift"
-
-
 class MaskProvider(str, Enum):
     """Mask provider backend for pipeline-level mask_provider field."""
     HEURISTIC = "heuristic"

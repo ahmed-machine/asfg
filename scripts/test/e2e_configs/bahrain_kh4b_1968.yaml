@@ -12,7 +12,14 @@
 name: bahrain_kh4b_1968
 entity_id: DS1104-1057DA023
 boundary: data/bahrain_boundary.geojson
-reference_name: bahrain_esri_worldimagery
+# Switched 2026-04-25 from bahrain_esri_worldimagery to the 1976 KH-9
+# reference. ESRI World Imagery is modern (post-reclamation Bahrain
+# coastline + Saudi mainland in frame), which gave the matchers two
+# similar-shape coastlines to confuse — agreement=0.00 on every coarse
+# stage. The 1976 KH-9 reference is era-matched (pre-reclamation coast,
+# tighter geographic bounds), so feature matching has only one plausible
+# coast to lock onto.
+reference_name: kh9_dzb1212
 catalogs:
   - data/available/corona2_69b17d89ee62ff28.csv
 prefer_camera: A              # Aft camera (vs F Fore)

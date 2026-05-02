@@ -22,7 +22,6 @@ from rasterio.warp import reproject, Resampling
 
 from . import constants as _C
 from .image import chunked_remap, to_u8_percentile
-from .models import use_ssd_weights
 
 # ---------------------------------------------------------------------------
 # SEA-RAFT (uncertainty supplement) → DIS (primary flow engine)
@@ -170,15 +169,7 @@ def _get_raft_model():
         print(f"  [SEA-RAFT] Loading SEA-RAFT-M on {device}...", flush=True)
         model = SEARAFT()  # uses built-in Medium defaults
         ckpt_path = _download_sea_raft_weights()
-        # Experimental SSD-finetuned override (see scripts/experimental/ssd/).
-        # Opt-in via DECLASS_EXPERIMENTAL_SSD=1. Default off — downstream
-        # alignment improvement has not been validated.
-        ssd_weights_path = 'align/weights/searaft_ssd.pth'
-        if use_ssd_weights() and os.path.exists(ssd_weights_path):
-            print(f"  [SEA-RAFT] OVERRIDE: Loading SSD-finetuned SEA-RAFT weights from {ssd_weights_path}", flush=True)
-            state_dict = torch.load(ssd_weights_path, map_location="cpu", weights_only=True)
-        else:
-            state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         
         # Strip "module." prefix if checkpoint was saved with DataParallel
         if any(k.startswith("module.") for k in state_dict):
@@ -592,6 +583,7 @@ def _forward_backward_mask(
     warped_gray: np.ndarray,
     flow_fwd: np.ndarray,
     threshold_px: float = 3.0,
+    use_uncertainty: bool = True,
 ) -> np.ndarray:
     """Compute forward-backward consistency mask, supplemented by SEA-RAFT uncertainty.
 
@@ -603,27 +595,12 @@ def _forward_backward_mask(
     _, _, err = _forward_backward_error(ref_gray, warped_gray, flow_fwd)
     fb_mask = err < threshold_px
 
-    # Supplement with SEA-RAFT uncertainty when available
-    uncertainty = _estimate_uncertainty_raft(ref_gray, warped_gray)
-    
-    # --- SSD EXTRACTION HOOK ---
-    # Dump raw SEA-RAFT uncertainty and flow to disk
-    ssd_dir = os.environ.get("SSD_EXTRACT_DIR", None)
-    if ssd_dir and uncertainty is not None:
-        import torch
-        os.makedirs(ssd_dir, exist_ok=True)
-        # Use provided ID if available, else generate uuid
-        ext_id = os.environ.get("SSD_EXTRACT_ID", None)
-        if not ext_id:
-            import uuid
-            ext_id = str(uuid.uuid4())[:8]
-        pt_path = os.path.join(ssd_dir, f"searaft_raw_{ext_id}.pt")
-        torch.save({
-            'flow_fwd': flow_fwd,
-            'uncertainty': uncertainty,
-            'err_fwd_bwd': err
-        }, pt_path)
-    # ---------------------------
+    # Supplement with SEA-RAFT uncertainty when available. Callers can
+    # disable this for a cheap DIS/FB precheck before loading the heavy model.
+    uncertainty = (
+        _estimate_uncertainty_raft(ref_gray, warped_gray)
+        if use_uncertainty else None
+    )
 
     if uncertainty is not None:
         # Adaptive threshold: median + 2*MAD (robust outlier detection)
@@ -825,7 +802,24 @@ def apply_flow_refinement_to_file(
 
     # Compute flow
     flow_fwd = _estimate_flow(ref_u8_fr, warped_u8_fr)
-    fb_mask = _forward_backward_mask(ref_u8_fr, warped_u8_fr, flow_fwd, fb_threshold_px)
+    fb_mask = _forward_backward_mask(
+        ref_u8_fr, warped_u8_fr, flow_fwd, fb_threshold_px,
+        use_uncertainty=False,
+    )
+    precheck_pct = float(fb_mask.sum()) / max(1, fb_mask.size) * 100
+    if precheck_pct < 10.0:
+        print(
+            f"  [FlowRefine-TPS] DIS precheck only {precheck_pct:.0f}% reliable "
+            f"— skipping before SEA-RAFT uncertainty",
+            flush=True,
+        )
+        del ref_arr_fr, warped_arr_fr, ref_u8_fr, warped_u8_fr, fb_mask, flow_fwd
+        gc.collect()
+        return False
+    fb_mask = _forward_backward_mask(
+        ref_u8_fr, warped_u8_fr, flow_fwd, fb_threshold_px,
+        use_uncertainty=True,
+    )
 
     # Median filter
     if median_kernel > 1:

@@ -1,0 +1,87 @@
+inherits: _base
+
+# KH-8 GAMBIT-3 (1966-1984) — Eastman Kodak strip camera with a 4460 mm
+# folded Cassegrain optical train, 1.21 m stationary concave primary, and
+# a steerable flat mirror that tilts during exposure. ~0.10 m (4 in)
+# ground resolution, ~6 km swath, 66-305 km altitude range. Block 4
+# "Dual Mode" (1971-84) supported up to 2000 stereo pairs per mission
+# via along-track roll-joint pointing.
+#
+# **STUB PROFILE — KH-8 INGESTION NOT SUPPORTED TODAY.**
+#
+# No public rigorous photogrammetric sensor model exists for KH-8:
+#   - ASP OpticalBar doesn't handle steerable-flat-mirror strip geometry.
+#   - CoSP (Ghuffar 2022) and 2OC (Hou 2023) are KH-4/KH-9 panoramic-only.
+#   - UW `declass_stereo` excludes KH-8 explicitly.
+#   - Civilian archaeology community hasn't adopted KH-8 (small footprint =
+#     poor survey tool), so there's no published pipeline.
+#
+# The geometry is closer to HiRISE / CE-2 pushbroom linescan than to
+# CORONA OpticalBar. Building a real KH-8 sensor model is a multi-week
+# greenfield project, not a port of the KH-4/KH-9 codepath.
+#
+# Local primary sources (57 volumes at `data/camera-manuals/kh8_gambit_
+# dual_mode_data_book/`): mostly orbital planning + satellite control
+# schematics. Volume 16 is the KH-8B Camera System data book (NPIC Oct
+# 1970, TCS-20292/70) — optics summary + slit codes + stereo mirror
+# pitch range (±8.65°) + film format. A cam-optics-focused volume may
+# exist within 01-57 but hasn't been catalogued volume-by-volume.
+#
+# Authoritative sources:
+#   Wikipedia KH-8 Gambit 3 — 4460 mm focal length, 1.21 m primary, block
+#     taxonomy (1/2/3/4 = Dual Mode).
+#   Gunter's Space Page kh-8_bl1..bl4 — per-block altitudes.
+#   The Space Review archive — history + mirror polishing improvements.
+#   USGS EROS Archive DISP 3 collection — holds the declassified imagery
+#     but provides no processing guidance.
+
+meta:
+  name: kh8
+  description: KH-8 GAMBIT-3 (1966-1984) — strip + steerable flat mirror [STUB]
+  cameras: [KH-8]
+
+camera:
+  type: linescan               # strip geometry; same class as KH-7 in our taxonomy
+  focal_length: 4.460          # metres (175.6 in)
+  pixel_pitch: 7.0e-6          # metres (USGS standard scan)
+  primary_mirror_diameter_m: 1.21
+  film_width_mm: 223.8         # 8.811 in
+  swath_km: 6.3
+  nominal_altitude_km: 160     # Block 3 baseline; Block 4 can dip to 130
+  speed: 7800
+  forward_tilt: 0.0            # steerable mirror overrides this — per-image pose varies
+  scan_arc_deg: 0.0            # strip, not panoramic
+  scan_time: 0.0
+  scan_dir: right
+  motion_compensation_factor: 1.0
+  # Conservative default: no published KH-8 photogrammetry, so assume
+  # 4-corner-only metadata of the same magnitude as KH-7.
+  usgs_corners_reliable: false
+  # Stacked NCC → ELoFTR → phase-correlate fallback (preprocess/coarse_align_ncc_stack.py)
+  # engages when single-shot ELoFTR abstains. ±50 km radius — KH-8 corner
+  # accuracy unverified; same envelope as KH-7.
+  coarse_ncc_search_radius_m: 50000
+  # Stereo via along-track roll-joint only; NO fore+aft simultaneous pair.
+  # Intentional sentinel. If code ever loads this profile and tries to run
+  # the KH-4/KH-9 pipeline, downstream `is_panoramic` checks will be false
+  # and most logic will bail; this profile is here to document intent.
+  _unsupported_reason: >
+    KH-8 GAMBIT-3 imagery has NEVER BEEN DECLASSIFIED. The USGS EROS
+    declassified-imagery catalog jumps directly from Declass 2 (KH-7 +
+    KH-9 Mapping Camera) to Declass 3 (KH-9 Panoramic) with no KH-8
+    collection. Clinton EO 12951 (1995) promised KH-8/KH-9 review; only
+    KH-9 was completed. NGA explicitly stated (FAS 2011) it could not
+    advise when KH-8 would be released, and no declassification has
+    occurred since. Original film is at NARA II + USGS EROS vault but
+    stays classified.
+
+    Even if imagery were available, the sensor class (Eastman Kodak
+    strip + steerable flat mirror, time-varying look direction) is
+    unsupported by any public photogrammetric pipeline (ASP, CoSP,
+    2OC, declass_stereo). Building a sensor model would be a multi-
+    week greenfield project closer to HiRISE pushbroom than to
+    CORONA OpticalBar.
+
+    For strip-camera experimentation before any KH-8 release, use
+    KH-7 (Declass 2, DZB4xxx prefix) which exercises the same
+    type: linescan code path.

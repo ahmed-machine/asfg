@@ -1,18 +1,20 @@
 """Coarse offset detection and global localization.
 
-Offset detection fallback chain (tried in order until one succeeds):
-1. Semantic-weighted NCC on binary land masks (fast, works for coastal areas).
-2. CLAHE-normalized grayscale NCC (works on texture-rich areas like deserts).
-3. NMI (Normalized Mutual Information) — handles non-linear radiometric
-   differences between historical film and modern satellite imagery.
+Coarse offset uses tiled ELoFTR matching on a shared canvas (see
+:func:`align.scale.eloftr_translation_estimate`). The historic NCC chain
+(land-mask NCC, CLAHE-grayscale NCC, NMI) was removed in 2026-04 because
+it was repeatedly fooled by similar-shape coastlines (Bahrain north
+coast vs Saudi mainland) — high correlation, wrong geography, no
+internal way to detect the ambiguity. ELoFTR's per-match MAD-derived
+agreement score abstains in those cases instead.
 
-Global localization searches the full reference for the target footprint.
+Global localization continues to search the full reference for the
+target footprint via weighted-NCC; that's a different problem (no prior
+on position at all) and the current matcher is acceptable there.
 """
 
-import math
 import os
 import tempfile
-from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -22,493 +24,73 @@ from affine import Affine
 from rasterio.warp import Resampling, reproject, transform_bounds
 
 from .geo import dataset_bounds_in_crs, read_overlap_region, transform_point, work_shift_to_dataset_shift
-from .image import clahe_normalize, to_u8
-from .semantic_masking import build_semantic_masks, class_weight_map, stable_feature_mask
+from .image import clahe_normalize
 from .types import GlobalHypothesis, MetadataPrior
-
-
-@dataclass
-class CoarseResult:
-    """Result from a single coarse offset detection method."""
-    dx_m: float
-    dy_m: float
-    confidence: float
-    method: str
-
-def _save_coarse_diagnostic(template, search, result_map, max_loc, max_val,
-                            base_r, base_c, tr0, tc0, res, dx_m, dy_m,
-                            diagnostics_dir, label):
-    """Save coarse offset diagnostic: template, search region, correlation heatmap."""
-    # Normalize images to uint8 for display
-    def _to_vis(arr):
-        if arr.max() == 0:
-            return np.zeros_like(arr, dtype=np.uint8)
-        return (arr / max(arr.max(), 1e-6) * 255).clip(0, 255).astype(np.uint8)
-
-    tmpl_vis = _to_vis(template.astype(np.float32))
-    search_vis = _to_vis(search.astype(np.float32))
-
-    # Resize template to match search height for side-by-side
-    th, tw = tmpl_vis.shape
-    sh, sw = search_vis.shape
-    scale = sh / th if th > 0 else 1.0
-    tmpl_resized = cv2.resize(tmpl_vis, (max(1, int(tw * scale)), sh))
-    trw = tmpl_resized.shape[1]
-
-    # Correlation heatmap
-    corr_norm = ((result_map - result_map.min()) /
-                 max(result_map.max() - result_map.min(), 1e-6) * 255).astype(np.uint8)
-    corr_color = cv2.applyColorMap(corr_norm, cv2.COLORMAP_JET)
-    corr_resized = cv2.resize(corr_color, (sw, sh))
-
-    # Canvas: template | search | correlation heatmap
-    canvas_w = trw + sw + sw
-    canvas = np.zeros((sh, canvas_w, 3), dtype=np.uint8)
-    canvas[:, :trw] = cv2.cvtColor(tmpl_resized, cv2.COLOR_GRAY2BGR)
-    canvas[:, trw:trw + sw] = cv2.cvtColor(search_vis, cv2.COLOR_GRAY2BGR)
-    canvas[:, trw + sw:] = corr_resized
-
-    # Draw crosshair at best match on search region
-    match_x = max_loc[0]
-    match_y = max_loc[1]
-    cx = trw + match_x + tw // 2
-    cy = match_y + th // 2
-    cv2.drawMarker(canvas, (cx, cy), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
-
-    # Draw match rectangle on search
-    cv2.rectangle(canvas,
-                  (trw + match_x, match_y),
-                  (trw + match_x + tw, match_y + th),
-                  (0, 255, 0), 1)
-
-    # Labels
-    cv2.putText(canvas, "template", (4, 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(canvas, "search", (trw + 4, 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(canvas, "correlation", (trw + sw + 4, 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
-
-    # Offset text
-    text = f"dx={dx_m:.1f}m dy={dy_m:.1f}m corr={max_val:.3f} res={res:.0f}m"
-    cv2.putText(canvas, text, (4, sh - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
-
-    os.makedirs(diagnostics_dir, exist_ok=True)
-    out_path = os.path.join(diagnostics_dir, f"coarse_{label}.jpg")
-    cv2.imwrite(out_path, canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    print(f"  Saved diagnostic: {os.path.basename(out_path)}")
-
-
-def _bundle_weights(bundle):
-    """Compute class weight map from a MaskBundle."""
-    w = np.zeros_like(bundle.land, dtype=np.float32)
-    w += 1.25 * bundle.stable
-    w += 0.75 * bundle.shoreline
-    w += 0.35 * bundle.dark_farmland
-    w -= 0.80 * bundle.shallow_water
-    return np.clip(w, 0.0, 1.5)
-
-
-def _build_search_region(off_img, template_shape, tc0, tr0, res,
-                         coarse_offset=None, search_margin_m=None):
-    """Extract the search region from an offset image, optionally restricted by a coarse offset.
-
-    Returns (search_array, base_col, base_row).
-    """
-    if coarse_offset and search_margin_m:
-        coarse_dx_px = int(round(coarse_offset[0] / res))
-        coarse_dy_px = int(round(coarse_offset[1] / res))
-        margin_px = int(search_margin_m / res)
-        s_c0 = max(0, tc0 + coarse_dx_px - margin_px)
-        s_c1 = min(off_img.shape[1], tc0 + template_shape[1] + coarse_dx_px + margin_px)
-        s_r0 = max(0, tr0 + coarse_dy_px - margin_px)
-        s_r1 = min(off_img.shape[0], tr0 + template_shape[0] + coarse_dy_px + margin_px)
-        search = off_img[s_r0:s_r1, s_c0:s_c1]
-        return search, s_c0, s_r0
-    else:
-        return off_img, 0, 0
-
-
-def _subpixel_refine(result, max_loc):
-    """Sub-pixel refinement via parabolic interpolation on a correlation map.
-
-    Returns (sub_x, sub_y) as float coordinates.
-    """
-    pr, pc = max_loc[1], max_loc[0]
-    sub_x, sub_y = float(pc), float(pr)
-    if 0 < pr < result.shape[0] - 1 and 0 < pc < result.shape[1] - 1:
-        vc = result[pr, pc]
-        vl = result[pr, pc - 1]
-        vr = result[pr, pc + 1]
-        denom_x = vl - 2 * vc + vr
-        if abs(denom_x) > 1e-10:
-            sub_x = pc + 0.5 * (vl - vr) / denom_x
-
-        vt = result[pr - 1, pc]
-        vb = result[pr + 1, pc]
-        denom_y = vt - 2 * vc + vb
-        if abs(denom_y) > 1e-10:
-            sub_y = pr + 0.5 * (vt - vb) / denom_y
-    return sub_x, sub_y
-
-
-def _match_to_offset(base_c, base_r, sub_x, sub_y, tc0, tr0, res):
-    """Convert a match position to geographic offset in metres."""
-    actual_c = base_c + sub_x
-    actual_r = base_r + sub_y
-    dx_m = (actual_c - tc0) * res
-    dy_m = (actual_r - tr0) * res
-    return dx_m, dy_m
 
 
 def detect_offset_at_resolution(src_offset, src_ref, overlap, work_crs, res,
                                 template_radius_m=6000, coarse_offset=None,
                                 search_margin_m=None, mask_mode="coastal_obia",
-                                diagnostics_dir=None, min_ncc=0.3):
-    """Detect the offset between two images at a given resolution using
-    template matching on binary land masks.
+                                diagnostics_dir=None, min_ncc=0.3,
+                                model_cache=None):
+    """Detect the offset between two images at a given resolution via
+    tiled ELoFTR matching.
 
-    Returns (dx_m, dy_m, correlation) where dx/dy are the offset of the
-    misaligned image in metres (east, south).
+    The previous NCC-based implementation (semantic-weighted land-mask
+    NCC, CLAHE grayscale NCC, NMI) was repeatedly fooled by similar-shape
+    coastlines: high correlation, wrong geography, no internal way to
+    detect the ambiguity. ELoFTR's per-match MAD-derived agreement score
+    abstains in those cases instead.
+
+    The signature is preserved for caller compatibility:
+      * ``template_radius_m``, ``coarse_offset``, ``search_margin_m`` and
+        ``mask_mode`` are accepted but ignored — ELoFTR matches on the
+        full overlap canvas and doesn't need a search-window prior.
+      * ``min_ncc`` is reused as the agreement floor (typically 0.3).
+      * ``diagnostics_dir`` is accepted; ELoFTR currently writes no
+        per-call jpg, but pipeline-level diagnostics still land there.
+
+    Returns ``(dx_m, dy_m, agreement)`` where ``dx_m`` / ``dy_m`` are the
+    metric offset to apply (positive = shift target east / south,
+    matching the historic NCC sign convention) and ``agreement`` is in
+    [0, 1] with 1 = matches in perfect agreement. Returns
+    ``(None, None, 0)`` when ELoFTR abstains.
+
+    ``model_cache`` may be passed in for batch processing; otherwise a
+    fresh ``ModelCache`` is created and disposed inside the call.
     """
+    from .scale import (eloftr_translation_estimate,
+                        _ELOFTR_MIN_AGREEMENT)
+
     arr_offset, _ = read_overlap_region(src_offset, overlap, work_crs, res)
     arr_ref, _ = read_overlap_region(src_ref, overlap, work_crs, res)
 
-    bundle_offset = build_semantic_masks(arr_offset, mode=mask_mode)
-    bundle_ref = build_semantic_masks(arr_ref, mode=mask_mode)
-
-    land_offset = bundle_offset.land
-    land_ref = bundle_ref.land
-    stable_ref = bundle_ref.stable
-    weight_offset = _bundle_weights(bundle_offset)
-    weight_ref = _bundle_weights(bundle_ref)
-
-    search_img = weight_offset if np.mean(weight_offset > 0) > 0.02 else land_offset
-    template_img = weight_ref if np.mean(weight_ref > 0) > 0.02 else land_ref
-    ref_seed = stable_ref if np.mean(stable_ref > 0) > 0.01 else land_ref
-
-    # Find a robust semantic centroid for template extraction.
-    ref_rows = np.any(ref_seed > 0, axis=1)
-    ref_cols = np.any(ref_seed > 0, axis=0)
-    if not ref_rows.any() or not ref_cols.any():
-        return None, None, 0
-    rr, cc = np.where(ref_seed > 0)
-    ww = weight_ref[rr, cc] if len(rr) else np.array([])
-    if len(rr) and np.sum(ww) > 0:
-        r_center = int(np.average(rr, weights=ww))
-        c_center = int(np.average(cc, weights=ww))
-    else:
-        r_center = int(np.mean(np.where(ref_rows)[0]))
-        c_center = int(np.mean(np.where(ref_cols)[0]))
-
-    # Extract template from the semantic center.
-    th = int(template_radius_m / res)
-    tr0 = max(0, r_center - th)
-    tr1 = min(land_ref.shape[0], r_center + th)
-    tc0 = max(0, c_center - th)
-    tc1 = min(land_ref.shape[1], c_center + th)
-    template = template_img[tr0:tr1, tc0:tc1]
-
-    if template.shape[0] < 10 or template.shape[1] < 10:
-        return None, None, 0
-
-    # Shared context passed to each fallback method
-    ctx = dict(
-        arr_offset=arr_offset, arr_ref=arr_ref,
-        search_img=search_img, template=template,
-        tr0=tr0, tr1=tr1, tc0=tc0, tc1=tc1, res=res,
-        coarse_offset=coarse_offset, search_margin_m=search_margin_m,
+    result = eloftr_translation_estimate(
+        arr_ref, arr_offset, res, model_cache=model_cache,
     )
+    if result is None:
+        return None, None, 0
 
-    # Try each method in order until one succeeds
-    methods = [
-        ("land_mask_ncc", _land_mask_ncc_offset),
-        ("clahe_ncc",     _clahe_ncc_offset),
-        ("nmi",           _nmi_offset),
-    ]
+    dx_eloftr, dy_eloftr, n_matches, agreement = result
+    floor = max(_ELOFTR_MIN_AGREEMENT, float(min_ncc))
+    if agreement < floor:
+        print(f"  [coarse:eloftr] agreement {agreement:.2f} < {floor:.2f} "
+              f"(matches={n_matches}); abstaining", flush=True)
+        return None, None, 0
 
-    for name, method in methods:
-        try:
-            result = method(ctx, min_confidence=min_ncc)
-        except Exception as e:
-            print(f"  [coarse/{name}] failed: {e}", flush=True)
-            continue
-
-        if result is not None and result.confidence >= min_ncc:
-            if diagnostics_dir is not None:
-                suffix = "_refined" if coarse_offset else "_coarse"
-                label = f"{res:.0f}m_{name}{suffix}"
-                # Build a minimal diagnostic from the land-mask search for context
-                search_diag, base_c_d, base_r_d = _build_search_region(
-                    search_img, template.shape, tc0, tr0, res,
-                    coarse_offset, search_margin_m)
-                if search_diag.shape[0] > template.shape[0] and search_diag.shape[1] > template.shape[1]:
-                    result_map = cv2.matchTemplate(search_diag, template, cv2.TM_CCOEFF_NORMED)
-                    _, dv, _, dl = cv2.minMaxLoc(result_map)
-                    _save_coarse_diagnostic(
-                        template, search_diag, result_map, dl, dv,
-                        base_r_d, base_c_d, tr0, tc0, res,
-                        result.dx_m, result.dy_m, diagnostics_dir, label)
-            return result.dx_m, result.dy_m, result.confidence
-
-        if result is not None:
-            print(f"  [coarse/{name}] confidence too low: {result.confidence:.4f} "
-                  f"(threshold={min_ncc})", flush=True)
-        else:
-            print(f"  [coarse/{name}] returned no result", flush=True)
-
-    print(f"  [coarse] All methods failed at {res:.0f}m/px", flush=True)
-    return None, None, 0
-
-
-def _land_mask_ncc_offset(ctx, min_confidence=0.3):
-    """Primary method: NCC on semantic-weighted land masks.
-
-    Uses the pre-built search_img (weight map or land mask) and template
-    from the orchestrator. Handles restricted search regions for long
-    strip imagery (e.g. KH-4).
-
-    Returns CoarseResult or None.
-    """
-    search_img = ctx['search_img']
-    template = ctx['template']
-    tc0, tr0, res = ctx['tc0'], ctx['tr0'], ctx['res']
-    coarse_offset = ctx['coarse_offset']
-    search_margin_m = ctx['search_margin_m']
-
-    search, base_c, base_r = _build_search_region(
-        search_img, template.shape, tc0, tr0, res,
-        coarse_offset, search_margin_m)
-
-    # When no coarse offset is given, restrict search to valid-data region
-    # to prevent spurious matches on long strips (e.g. 270km KH-4)
-    restricted = False
-    if not (coarse_offset and search_margin_m):
-        valid_rows = np.any(search > 0, axis=1)
-        valid_cols = np.any(search > 0, axis=0)
-        if valid_rows.any() and valid_cols.any():
-            r_idxs = np.where(valid_rows)[0]
-            c_idxs = np.where(valid_cols)[0]
-            pad = max(template.shape[0], template.shape[1])
-            r0 = max(0, r_idxs[0] - pad)
-            r1 = min(search.shape[0], r_idxs[-1] + pad + 1)
-            c0 = max(0, c_idxs[0] - pad)
-            c1 = min(search.shape[1], c_idxs[-1] + pad + 1)
-            if (r1 - r0) < search.shape[0] * 0.95 or (c1 - c0) < search.shape[1] * 0.95:
-                search = search[r0:r1, c0:c1]
-                base_c, base_r = c0, r0
-                restricted = True
-
-    if search.shape[0] <= template.shape[0] or search.shape[1] <= template.shape[1]:
-        return None
-
-    result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-    # If restricted search gave a poor result, retry with full search area
-    if max_val < min_confidence and restricted:
-        search = search_img
-        base_c, base_r = 0, 0
-        if search.shape[0] > template.shape[0] and search.shape[1] > template.shape[1]:
-            result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-    if max_val < min_confidence:
-        return CoarseResult(dx_m=0, dy_m=0, confidence=max_val, method="land_mask_ncc")
-
-    sub_x, sub_y = _subpixel_refine(result, max_loc)
-    dx_m, dy_m = _match_to_offset(base_c, base_r, sub_x, sub_y, tc0, tr0, res)
-    return CoarseResult(dx_m=dx_m, dy_m=dy_m, confidence=max_val, method="land_mask_ncc")
-
-
-def _clahe_ncc_offset(ctx, min_confidence=0.3):
-    """Fallback: CLAHE-normalized grayscale NCC.
-
-    When land-mask NCC fails (featureless desert, ice, etc.), direct
-    grayscale correlation on CLAHE-normalized imagery can succeed because
-    it captures texture differences invisible in binary masks.
-
-    Returns CoarseResult or None.
-    """
-    from .image import clahe_normalize
-
-    arr_offset, arr_ref = ctx['arr_offset'], ctx['arr_ref']
-    tr0, tr1 = ctx['tr0'], ctx['tr1']
-    tc0, tc1 = ctx['tc0'], ctx['tc1']
-    res = ctx['res']
-
-    ref_u8 = clahe_normalize(arr_ref).astype(np.float32)
-    off_u8 = clahe_normalize(arr_offset).astype(np.float32)
-
-    template = ref_u8[tr0:tr1, tc0:tc1]
-    if template.shape[0] < 10 or template.shape[1] < 10:
-        return None
-
-    search, b_c, b_r = _build_search_region(
-        off_u8, template.shape, tc0, tr0, res,
-        ctx['coarse_offset'], ctx['search_margin_m'])
-
-    if search.shape[0] <= template.shape[0] or search.shape[1] <= template.shape[1]:
-        return None
-
-    result = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(result)
-
-    if max_val < min_confidence:
-        return CoarseResult(dx_m=0, dy_m=0, confidence=max_val, method="clahe_ncc")
-
-    sub_x, sub_y = _subpixel_refine(result, max_loc)
-    dx_m, dy_m = _match_to_offset(b_c, b_r, sub_x, sub_y, tc0, tr0, res)
-    return CoarseResult(dx_m=dx_m, dy_m=dy_m, confidence=max_val, method="clahe_ncc")
-
-
-def _compute_nmi(template, patch, n_bins=32):
-    """Compute Normalized Mutual Information between two grayscale patches.
-
-    Returns NMI in [0, 2] where higher = more similar.  Handles zero-data
-    regions (nodata = 0) by masking them out before histogram computation.
-    """
-    t_valid = template > 0
-    p_valid = patch > 0
-    valid = t_valid & p_valid
-    if np.sum(valid) < 100:
-        return 0.0
-
-    t_vals = template[valid]
-    p_vals = patch[valid]
-
-    # Joint histogram with Parzen (Gaussian) smoothing
-    hist_joint, _, _ = np.histogram2d(
-        t_vals, p_vals, bins=n_bins, range=[[0, 255], [0, 255]])
-    hist_joint = cv2.GaussianBlur(hist_joint.astype(np.float32), (3, 3), 0.5)
-    hist_joint = hist_joint / (hist_joint.sum() + 1e-10)
-
-    hist_t = hist_joint.sum(axis=1)
-    hist_p = hist_joint.sum(axis=0)
-
-    eps = 1e-10
-    h_t = -np.sum(hist_t * np.log(hist_t + eps))
-    h_p = -np.sum(hist_p * np.log(hist_p + eps))
-    h_tp = -np.sum(hist_joint * np.log(hist_joint + eps))
-    mi = h_t + h_p - h_tp
-    nmi = 2.0 * mi / (h_t + h_p + eps) if (h_t + h_p) > eps else 0.0
-    return float(nmi)
-
-
-def _nmi_offset(ctx, min_confidence=0.3, min_nmi=0.7):
-    """Fallback: Normalized Mutual Information template matching.
-
-    NMI captures non-linear intensity relationships between cross-temporal
-    satellite imagery, unlike NCC which assumes linear correlation.  This
-    makes it suitable as a fallback when land-mask NCC fails due to
-    radiometric differences between eras (e.g. 1968 film vs modern satellite).
-
-    Strategy: coarse-to-fine approach.
-    1. Downsample to ~32m/px and exhaustively search (fast).
-    2. Refine at full resolution around the coarse peak (accurate).
-
-    Returns CoarseResult or None.
-    """
-    arr_offset, arr_ref = ctx['arr_offset'], ctx['arr_ref']
-    tr0, tr1 = ctx['tr0'], ctx['tr1']
-    tc0, tc1 = ctx['tc0'], ctx['tc1']
-    res = ctx['res']
-
-    ref_u8 = to_u8(arr_ref).astype(np.float32)
-    off_u8 = to_u8(arr_offset).astype(np.float32)
-
-    template = ref_u8[tr0:tr1, tc0:tc1]
-    if template.shape[0] < 10 or template.shape[1] < 10:
-        return None
-
-    search, b_c, b_r = _build_search_region(
-        off_u8, template.shape, tc0, tr0, res,
-        ctx['coarse_offset'], ctx['search_margin_m'])
-
-    if search.shape[0] <= template.shape[0] or search.shape[1] <= template.shape[1]:
-        return None
-
-    print(f"  [coarse/nmi] Starting NMI search at res {res}. "
-          f"Search shape: {search.shape}, template shape: {template.shape}", flush=True)
-
-    th, tw = template.shape
-
-    # --- Coarse pass: downsample for speed ---
-    # Target ~32m/px for the coarse NMI scan
-    ds_factor = max(1, int(round(32.0 / res))) if res < 32 else 1
-    if ds_factor > 1:
-        tmpl_ds = cv2.resize(template, (tw // ds_factor, th // ds_factor),
-                             interpolation=cv2.INTER_AREA)
-        search_ds = cv2.resize(search,
-                               (search.shape[1] // ds_factor, search.shape[0] // ds_factor),
-                               interpolation=cv2.INTER_AREA)
-    else:
-        tmpl_ds = template
-        search_ds = search
-
-    th_ds, tw_ds = tmpl_ds.shape
-    sh_ds, sw_ds = search_ds.shape
-
-    if sh_ds <= th_ds or sw_ds <= tw_ds:
-        return None
-
-    # Exhaustive NMI search on downsampled images (stride 2 for speed)
-    stride = 2
-    best_mi = -1.0
-    best_pos_ds = (0, 0)
-
-    for sy in range(0, sh_ds - th_ds + 1, stride):
-        for sx in range(0, sw_ds - tw_ds + 1, stride):
-            patch = search_ds[sy:sy + th_ds, sx:sx + tw_ds]
-            nmi = _compute_nmi(tmpl_ds, patch)
-            if nmi > best_mi:
-                best_mi = nmi
-                best_pos_ds = (sx, sy)
-
-    # --- Fine pass: hierarchical local search around coarse peak ---
-    cx = best_pos_ds[0] * ds_factor
-    cy = best_pos_ds[1] * ds_factor
-    best_mi_fine = -1.0
-    best_pos = (cx, cy)
-
-    if 0 <= cy and cy + th <= search.shape[0] and 0 <= cx and cx + tw <= search.shape[1]:
-        patch = search[cy:cy + th, cx:cx + tw]
-        best_mi_fine = _compute_nmi(template, patch)
-
-    step = max(1, ds_factor)
-    while step >= 1:
-        improved = True
-        while improved:
-            improved = False
-            for dy in [-step, 0, step]:
-                for dx in [-step, 0, step]:
-                    if dx == 0 and dy == 0:
-                        continue
-                    sy = best_pos[1] + dy
-                    sx = best_pos[0] + dx
-                    if sy < 0 or sy + th > search.shape[0] or sx < 0 or sx + tw > search.shape[1]:
-                        continue
-                    patch = search[sy:sy + th, sx:sx + tw]
-                    nmi = _compute_nmi(template, patch)
-                    if nmi > best_mi_fine:
-                        best_mi_fine = nmi
-                        best_pos = (sx, sy)
-                        improved = True
-        if step == 1:
-            break
-        step = max(1, step // 2)
-
-    if best_mi_fine < min_nmi:
-        return CoarseResult(dx_m=0, dy_m=0, confidence=best_mi_fine, method="nmi")
-
-    # Convert to geographic offset
-    actual_c = b_c + best_pos[0]
-    actual_r = b_r + best_pos[1]
-    dx_m = (actual_c - tc0) * res
-    dy_m = (actual_r - tr0) * res
-
-    return CoarseResult(dx_m=dx_m, dy_m=dy_m, confidence=best_mi_fine, method="nmi")
+    # Sign convention reconciliation. The shared helper returns dx/dy in
+    # the *shift-to-apply* convention (positive dx_m = shift target east
+    # to align with reference). The historic NCC contract here is the
+    # *amount-of-misalignment* convention (positive dx_m = target is
+    # currently east of reference). pipeline.py's downstream translator
+    # then converts via ``work_shift_to_dataset_shift`` to a westward
+    # bounds shift (see step_coarse_offset's coarse_dx comment). Negate
+    # so callers see the historic convention.
+    dx_m = -dx_eloftr
+    dy_m = -dy_eloftr
+    print(f"  [coarse:eloftr] dx={dx_m:+.0f}m, dy={dy_m:+.0f}m "
+          f"(matches={n_matches}, agreement={agreement:.2f})", flush=True)
+    return dx_m, dy_m, agreement
 
 
 # ---------------------------------------------------------------------------
@@ -593,30 +175,182 @@ def _prepare_search_bounds(ref_bounds, priors, work_crs, explicit_bounds=None):
     return candidate or ref_bounds
 
 
-def _transform_template(arr, scale, angle_deg):
-    src = to_u8(arr)
-    if abs(scale - 1.0) > 1e-3:
-        new_w = max(32, int(round(src.shape[1] * scale)))
-        new_h = max(32, int(round(src.shape[0] * scale)))
-        src = cv2.resize(src, (new_w, new_h), interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC)
-    if abs(angle_deg) > 1e-3:
-        h, w = src.shape[:2]
-        center = (w / 2.0, h / 2.0)
-        M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
-        cos_v = abs(M[0, 0])
-        sin_v = abs(M[0, 1])
-        new_w = int((h * sin_v) + (w * cos_v))
-        new_h = int((h * cos_v) + (w * sin_v))
-        M[0, 2] += (new_w / 2.0) - center[0]
-        M[1, 2] += (new_h / 2.0) - center[1]
-        src = cv2.warpAffine(src, M, (new_w, new_h), flags=cv2.INTER_LINEAR,
-                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    return src
+def _resize_to_eloftr_tile(arr_u8, max_dim=800):
+    """Resize a CLAHE-normalized uint8 array to fit ELoFTR's input
+    expectations (max ``max_dim`` on either axis, dimensions divisible
+    by 14). Returns ``(resized_arr, scale_factor_used)``."""
+    h, w = arr_u8.shape[:2]
+    longest = max(h, w)
+    scale = max_dim / longest if longest > max_dim else 1.0
+    new_h = max(56, int(round(h * scale)))
+    new_w = max(56, int(round(w * scale)))
+    new_h = (new_h // 14) * 14 or 56
+    new_w = (new_w // 14) * 14 or 56
+    # Recompute the actual scale we got after rounding
+    actual_scale_x = new_w / w
+    actual_scale_y = new_h / h
+    if (new_h, new_w) == (h, w):
+        return arr_u8, 1.0, 1.0
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    resized = cv2.resize(arr_u8, (new_w, new_h), interpolation=interp)
+    return resized, actual_scale_x, actual_scale_y
+
+
+def _eloftr_global_search(target_arr, ref_arr, ref_res, target_res,
+                          search_bounds, top_k=3,
+                          tile_max_px=800,
+                          conf_min=0.20, min_matches=30,
+                          min_agreement=0.30,
+                          model_cache=None):
+    """Tile the reference and run ELoFTR(target, each tile) to find
+    where the target's content lives in the reference frame.
+
+    Replaces the multi-scale NCC grid search that the historic
+    ``localize_to_reference`` used. Returns a list of
+    ``(score, ref_pixel_origin, target_pixel_size, agreement, n_matches)``
+    tuples sorted by ``score = agreement * sqrt(n_matches)`` descending.
+    ``ref_pixel_origin`` is the (col, row) in ``ref_arr`` where the
+    target's top-left would land if the median match holds; combined
+    with ``ref_res`` and ``search_bounds`` the caller can convert that
+    back to world coords.
+    """
+    from .scale import _run_eloftr_batch
+
+    if min(target_arr.shape[:2]) < 32 or min(ref_arr.shape[:2]) < 32:
+        return []
+
+    target_u8 = clahe_normalize(target_arr)
+    ref_u8 = clahe_normalize(ref_arr)
+
+    # Resize target to fit within an ELoFTR tile (max tile_max_px).
+    target_resized, tx_scale, ty_scale = _resize_to_eloftr_tile(target_u8, tile_max_px)
+    th_r, tw_r = target_resized.shape
+
+    # Tile the reference at the same shape as the resized target. ELoFTR
+    # batches need same-shape pairs, so each tile is exactly (th_r, tw_r);
+    # tiles that fall off the right/bottom edge get clamped.
+    rh, rw = ref_u8.shape
+    if rh < th_r or rw < tw_r:
+        return []
+    stride_r = max(8, th_r // 2)
+    stride_c = max(8, tw_r // 2)
+    row_starts = list(range(0, max(1, rh - th_r) + 1, stride_r))
+    col_starts = list(range(0, max(1, rw - tw_r) + 1, stride_c))
+    if row_starts and row_starts[-1] + th_r < rh:
+        row_starts.append(rh - th_r)
+    if col_starts and col_starts[-1] + tw_r < rw:
+        col_starts.append(rw - tw_r)
+
+    tiles = []
+    for r0 in row_starts:
+        for c0 in col_starts:
+            ref_tile = ref_u8[r0:r0 + th_r, c0:c0 + tw_r]
+            if ref_tile.shape != target_resized.shape:
+                continue
+            if np.mean(ref_tile > 0) < 0.05:
+                continue
+            tiles.append({"ref": ref_tile, "off": target_resized,
+                          "r0": int(r0), "c0": int(c0)})
+    if not tiles:
+        return []
+
+    cache = model_cache
+    created_cache = False
+    if cache is None:
+        try:
+            from .models import ModelCache
+            from .models import get_torch_device as _get_dev
+            cache = ModelCache(_get_dev())
+            created_cache = True
+        except Exception as exc:
+            print(f"  [global:eloftr] ModelCache unavailable ({exc})")
+            return []
+
+    try:
+        try:
+            batch_results = _run_eloftr_batch(
+                tiles, cache.eloftr, cache.device, batch_size=4)
+        except Exception as exc:
+            print(f"  [global:eloftr] inference failed ({exc})")
+            return []
+    finally:
+        if created_cache:
+            cache.close()
+
+    candidates = []
+    for tile, result in zip(tiles, batch_results):
+        kp_ref, kp_tgt, conf = result
+        if kp_ref is None or len(kp_ref) == 0:
+            continue
+        mask = conf > conf_min
+        if mask.sum() < min_matches:
+            continue
+        kp_ref_f = kp_ref[mask].astype(np.float32)
+        kp_tgt_f = kp_tgt[mask].astype(np.float32)
+        # Per-match pixel deltas inside the (resized target, ref tile)
+        # frame. We'll convert to ref-canvas coords below.
+        dx_px = kp_ref_f[:, 0] - kp_tgt_f[:, 0]
+        dy_px = kp_tgt_f[:, 1] - kp_ref_f[:, 1]
+        med_dx = float(np.median(dx_px))
+        med_dy = float(np.median(dy_px))
+        mad_x = float(np.median(np.abs(dx_px - med_dx)))
+        mad_y = float(np.median(np.abs(dy_px - med_dy)))
+        agreement = 1.0 / (1.0 + mad_x + mad_y)
+        if agreement < min_agreement:
+            continue
+
+        # Where does the target's top-left land in ref pixel coords?
+        # Match: target pixel (x_t, y_t) → ref-tile pixel (x_r, y_r).
+        # x_r - x_t = med_dx, y_t - y_r = med_dy → y_r = y_t - med_dy.
+        # Target top-left (0, 0) → ref-tile pixel (med_dx, -med_dy).
+        # Then add tile origin in the full ref array.
+        target_origin_col_in_ref = tile["c0"] + med_dx
+        target_origin_row_in_ref = tile["r0"] + (-med_dy)
+        # Convert resized-target coords back to original target res.
+        # The target was resized by (tx_scale, ty_scale); the resulting
+        # bbox covers the original target's footprint at ``ref_res`` pixel
+        # spacing. In the ref array (also at ref_res), the bbox width is
+        # the original target width scaled by the *ratio of resolutions*
+        # — i.e. the world-bbox of the target spans target_w_orig *
+        # target_res metres, which at ref_res is target_w_orig *
+        # target_res / ref_res pixels.
+        # We compute that explicitly below from target_arr.shape.
+        candidates.append({
+            "score": float(agreement * np.sqrt(int(mask.sum()))),
+            "ref_col": float(target_origin_col_in_ref),
+            "ref_row": float(target_origin_row_in_ref),
+            "agreement": float(agreement),
+            "n_matches": int(mask.sum()),
+            "target_resized_shape": (th_r, tw_r),
+            "tx_scale": float(tx_scale),
+            "ty_scale": float(ty_scale),
+        })
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[:top_k]
 
 
 def localize_to_reference(src_offset, src_ref, work_crs, priors=None, coarse_res=40.0,
-                          top_k=3, mask_mode="coastal_obia", search_bounds=None):
-    """Search the full reference image for the target footprint."""
+                          top_k=3, mask_mode="coastal_obia", search_bounds=None,
+                          model_cache=None):
+    """Search the reference image for the target footprint via tiled
+    ELoFTR matching.
+
+    The historic implementation slid a rotated/rescaled target template
+    across the reference's land-mask + stable + gradient channels via
+    cv2.matchTemplate and combined the three score maps. That fell over
+    when the reference contained multiple plausible coastlines (Bahrain
+    vs Saudi mainland): the highest peak was often on the wrong one.
+    The ELoFTR scan here detects that inconsistency through per-match
+    MAD (the agreement floor); tiles with scattered matches are dropped
+    entirely instead of contributing a high-score wrong hypothesis.
+    Scale / rotation grid was retired alongside the NCC chain because
+    ``detect_scale_rotation`` (also ELoFTR-based) is the dedicated stage
+    for that correction.
+
+    ``mask_mode`` is accepted for caller compatibility but no longer
+    used; ELoFTR works on CLAHE-normalised grayscale.
+    """
     priors = priors or []
     ref_bounds = dataset_bounds_in_crs(src_ref, work_crs)
     search_bounds = _prepare_search_bounds(ref_bounds, priors, work_crs, explicit_bounds=search_bounds)
@@ -637,55 +371,52 @@ def localize_to_reference(src_offset, src_ref, work_crs, priors=None, coarse_res
     else:
         target_arr = _read_raw_resized(src_offset, target_bounds, target_res)
 
-    if min(target_arr.shape[:2]) < 32 or min(ref_arr.shape[:2]) < 32:
-        return []
+    candidates = _eloftr_global_search(
+        target_arr, ref_arr, ref_res=ref_res, target_res=target_res,
+        search_bounds=search_bounds, top_k=top_k,
+        model_cache=model_cache,
+    )
 
-    target_weight = _transform_template(class_weight_map(target_arr, mode=mask_mode), 1.0, 0.0)
-    target_stable = _transform_template(stable_feature_mask(target_arr, mode=mask_mode), 1.0, 0.0)
-    ref_weight = class_weight_map(ref_arr, mode=mask_mode).astype(np.float32)
-    ref_stable = stable_feature_mask(ref_arr, mode=mask_mode).astype(np.float32)
-    ref_grad = clahe_normalize(ref_arr).astype(np.float32)
-    target_grad_base = clahe_normalize(target_arr).astype(np.float32)
-
-    angles = [-8.0, -4.0, 0.0, 4.0, 8.0]
-    scales = [0.9, 1.0, 1.1]
-    candidates = []
-
-    for scale in scales:
-        for angle in angles:
-            templ_weight = _transform_template(target_weight, scale, angle).astype(np.float32)
-            templ_stable = _transform_template(target_stable, scale, angle).astype(np.float32)
-            templ_grad = _transform_template(target_grad_base, scale, angle).astype(np.float32)
-            if templ_weight.shape[0] >= ref_weight.shape[0] or templ_weight.shape[1] >= ref_weight.shape[1]:
-                continue
-            if np.mean(templ_weight > 0) < 0.05 and np.mean(templ_stable > 0) < 0.03:
-                continue
-
-            result_weight = cv2.matchTemplate(ref_weight, templ_weight, cv2.TM_CCOEFF_NORMED)
-            result_stable = cv2.matchTemplate(ref_stable, templ_stable, cv2.TM_CCOEFF_NORMED)
-            result_grad = cv2.matchTemplate(ref_grad, templ_grad, cv2.TM_CCOEFF_NORMED)
-            combined = (0.45 * result_weight) + (0.35 * result_stable) + (0.20 * result_grad)
-            _, max_val, _, max_loc = cv2.minMaxLoc(combined)
-            candidates.append((float(max_val), max_loc, scale, angle, templ_weight.shape[1], templ_weight.shape[0]))
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    hypotheses = []
+    # Convert each candidate to a GlobalHypothesis. Target's top-left in
+    # ref pixel coords (``ref_col``, ``ref_row``) is at ELoFTR's
+    # resized-target scale; the bounding box width in ref pixels is the
+    # original target's bbox width scaled to ref's resolution.
+    target_w_world = target_bounds[2] - target_bounds[0]
+    target_h_world = target_bounds[3] - target_bounds[1]
+    target_w_ref_px = target_w_world / ref_res
+    target_h_ref_px = target_h_world / ref_res
     target_center_x = (target_bounds[0] + target_bounds[2]) / 2.0
     target_center_y = (target_bounds[1] + target_bounds[3]) / 2.0
     ref_full_bounds = dataset_bounds_in_crs(src_ref, work_crs)
-    for idx, (score, (c_px, r_px), scale, angle, templ_w, templ_h) in enumerate(candidates[:top_k]):
-        left = search_bounds[0] + (c_px * ref_res)
-        top = search_bounds[3] - (r_px * ref_res)
-        right = left + (templ_w * ref_res)
-        bottom = top - (templ_h * ref_res)
+
+    hypotheses = []
+    for idx, cand in enumerate(candidates):
+        # Target top-left in ref pixel coords, but at the resized scale.
+        # Convert to ref-canvas coords at ref_res by accounting for the
+        # resized-target → original-target ratio. Within a tile the
+        # match was computed in pixels of the resized target (which is
+        # itself in ref-res pixels of the tile); the top-left we
+        # reported is already in ref-canvas pixel coords AT THE
+        # RESIZED-TARGET SCALE. Multiply the *footprint* by the
+        # ``original_target_size / resized_target_size`` ratio so the
+        # hypothesis bbox covers the full target footprint at ref_res.
+        tx_scale = cand["tx_scale"] or 1.0
+        ty_scale = cand["ty_scale"] or 1.0
+        ref_col = cand["ref_col"] / tx_scale
+        ref_row = cand["ref_row"] / ty_scale
+        left = search_bounds[0] + (ref_col * ref_res)
+        top = search_bounds[3] - (ref_row * ref_res)
+        right = left + (target_w_ref_px * ref_res)
+        bottom = top - (target_h_ref_px * ref_res)
         margin = max((right - left) * 0.20, (top - bottom) * 0.20, 2000.0)
-        left, bottom, right, top = _expand_bounds((left, bottom, right, top), margin, clamp_bounds=ref_full_bounds)
+        left, bottom, right, top = _expand_bounds(
+            (left, bottom, right, top), margin, clamp_bounds=ref_full_bounds)
         center_x = (left + right) / 2.0
         center_y = (bottom + top) / 2.0
         hypotheses.append(
             GlobalHypothesis(
                 hypothesis_id=f"global_{idx}",
-                score=score,
+                score=cand["score"],
                 source="global_template_search",
                 left=left,
                 bottom=bottom,
@@ -693,13 +424,14 @@ def localize_to_reference(src_offset, src_ref, work_crs, priors=None, coarse_res
                 top=top,
                 dx_m=target_center_x - center_x,
                 dy_m=center_y - target_center_y,
-                scale_hint=float(scale),
-                rotation_hint_deg=float(angle),
+                scale_hint=1.0,
+                rotation_hint_deg=0.0,
                 work_crs=str(work_crs),
                 diagnostics={
                     "search_res": ref_res,
                     "target_res": target_res,
-                    "raw_score": score,
+                    "agreement": cand["agreement"],
+                    "n_matches": cand["n_matches"],
                 },
             )
         )

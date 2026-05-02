@@ -1,5 +1,6 @@
 """GeoTIFF I/O, overlap computation, CRS helpers, and affine fitting."""
 
+import os
 from contextlib import contextmanager
 
 import cv2
@@ -156,13 +157,67 @@ def clear_overlap_cache():
     _overlap_cache.clear()
 
 
+def _resolve_scratch_cleaned_source(src):
+    """Return a path to a scratch-cleaned sidecar if it exists and its
+    provenance matches the current source, otherwise ``None``. Used by
+    ``read_overlap_region`` to transparently substitute the cleaned
+    reference when one was prebuilt for this file."""
+    src_name = getattr(src, "name", None)
+    if not src_name or not os.path.exists(src_name):
+        return None
+    try:
+        import paths as _paths
+        from .film_scratches import provenance_matches, _DEFAULT_PARAMS
+    except Exception:
+        return None
+    cleaned = _paths.reference_scratch_cleaned_path(src_name)
+    provenance = _paths.reference_scratch_cleaned_provenance_path(src_name)
+    if not os.path.exists(cleaned):
+        return None
+    if not provenance_matches(provenance, src_name, _DEFAULT_PARAMS):
+        return None
+    return cleaned
+
+
+def _maybe_mask_match_time_scratches(arr: np.ndarray) -> np.ndarray:
+    """Apply on-the-fly scratch detection + zeroing when
+    ``DECLASS_MATCH_TIME_SCRATCH_MASK=1`` is set in the environment.
+    Faster than the cached cleaned sidecar (per-call detection only),
+    but lossier — masked pixels become no-data instead of inpainted, so
+    matchers' tile validity gates may reject scratch-heavy tiles
+    instead of seeing reconstructed content there. Useful for one-off
+    debug or when no cleaned sidecar exists yet."""
+    if os.environ.get("DECLASS_MATCH_TIME_SCRATCH_MASK", "").lower() not in {"1", "true", "yes"}:
+        return arr
+    try:
+        from .film_scratches import detect_scratches
+        mask = detect_scratches(arr)
+    except Exception:
+        return arr
+    if int(mask.sum()) == 0:
+        return arr
+    out = arr.copy()
+    out[mask > 0] = 0
+    return out
+
+
 def read_overlap_region(src, overlap_bounds, target_crs, target_res):
     """Read and reproject a region of *src* into *target_crs* at *target_res*.
 
     Returns (array, transform) where transform maps pixel coords to CRS coords.
     Results are cached by (source path, overlap bounds, resolution).
+
+    Two scratch-handling paths run transparently:
+    1. If ``paths.reference_scratch_cleaned_path(src.name)`` exists AND
+       its provenance matches the current reference, we read from the
+       cleaned sidecar instead. The matchers see inpainted content in
+       place of bright diagonal scratches.
+    2. Otherwise, when ``DECLASS_MATCH_TIME_SCRATCH_MASK=1`` is set we
+       detect scratches on the returned array and zero those pixels —
+       a per-call fallback for runs without a precomputed sidecar.
     """
-    cache_key = (src.name, overlap_bounds, target_res)
+    cleaned_source = _resolve_scratch_cleaned_source(src)
+    cache_key = (cleaned_source or src.name, overlap_bounds, target_res)
     if cache_key in _overlap_cache:
         return _overlap_cache[cache_key]
 
@@ -171,15 +226,29 @@ def read_overlap_region(src, overlap_bounds, target_crs, target_res):
     height = int(round((top - bottom) / target_res))
     dst_transform = rasterio.transform.from_bounds(left, bottom, right, top, width, height)
     dst_array = np.zeros((height, width), dtype=np.float32)
-    reproject(
-        source=rasterio.band(src, 1),
-        destination=dst_array,
-        src_transform=src.transform,
-        src_crs=src.crs,
-        dst_transform=dst_transform,
-        dst_crs=target_crs,
-        resampling=Resampling.bilinear,
-    )
+
+    if cleaned_source is not None:
+        with rasterio.open(cleaned_source) as src_clean:
+            reproject(
+                source=rasterio.band(src_clean, 1),
+                destination=dst_array,
+                src_transform=src_clean.transform,
+                src_crs=src_clean.crs,
+                dst_transform=dst_transform,
+                dst_crs=target_crs,
+                resampling=Resampling.bilinear,
+            )
+    else:
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst_array,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=target_crs,
+            resampling=Resampling.bilinear,
+        )
+        dst_array = _maybe_mask_match_time_scratches(dst_array)
 
     # LRU eviction: remove oldest entry if cache is full
     if len(_overlap_cache) >= _OVERLAP_CACHE_MAX:

@@ -392,7 +392,46 @@ def refine_matches_phase_correlation(matched_pairs: list[MatchPair], arr_ref, ar
     return refined
 
 
-def correct_reference_offset(matched_pairs: list[MatchPair]) -> tuple[list[MatchPair], bool, list[str]]:
+def _limited_anchor_translation_is_corroborated(
+    anchors: list[MatchPair],
+    median_e: float,
+    median_n: float,
+    std_e: float,
+    std_n: float,
+    total: float,
+    anchor_presearch_offset_m: tuple[float, float] | None,
+) -> tuple[bool, str]:
+    """Gate limited-anchor translation corrections with an independent cue."""
+    if total < 20.0 or total > 1500.0:
+        return False, f"shift {total:.1f}m outside 20-1500m range"
+    if max(std_e, std_n) > 150.0:
+        return False, (f"inconsistent anchor translation "
+                       f"(std_E={std_e:.1f}m, std_N={std_n:.1f}m)")
+
+    anchor_conf = float(np.median([a.confidence for a in anchors])) if anchors else 0.0
+    if anchor_conf < 0.35:
+        return False, f"median anchor confidence too low ({anchor_conf:.2f} < 0.35)"
+
+    if anchor_presearch_offset_m is None:
+        return False, "no corroborating anchor presearch consensus"
+
+    pre_e = float(anchor_presearch_offset_m[0])
+    pre_n = float(anchor_presearch_offset_m[1])
+    delta_e = median_e - pre_e
+    delta_n = median_n - pre_n
+    delta_total = float(np.hypot(delta_e, delta_n))
+    if abs(delta_e) > 75.0 or abs(delta_n) > 75.0 or delta_total > 100.0:
+        return False, (f"presearch disagrees "
+                       f"(delta_E={delta_e:+.1f}m, delta_N={delta_n:+.1f}m, "
+                       f"delta={delta_total:.1f}m)")
+    return True, ""
+
+
+def correct_reference_offset(
+    matched_pairs: list[MatchPair],
+    *,
+    anchor_presearch_offset_m: tuple[float, float] | None = None,
+) -> tuple[list[MatchPair], bool, list[str]]:
     """Correct systematic reference image offset using anchor ground truth.
 
     Fits a spatially varying (affine) correction from anchor displacements,
@@ -405,6 +444,9 @@ def correct_reference_offset(matched_pairs: list[MatchPair]) -> tuple[list[Match
     Returns (corrected_pairs, was_corrected, outlier_names).
     ``outlier_names`` is a list of anchor name strings excluded from the
     correction fit (useful for downstream filtering).
+    ``anchor_presearch_offset_m`` is an optional corroborating translation
+    estimate from anchor presearch; when fewer than 3 anchors survive, we
+    require it to agree before applying a translation-only correction.
     """
     anchors = [p for p in matched_pairs if p.is_anchor]
     auto = [p for p in matched_pairs if not p.is_anchor]
@@ -449,10 +491,18 @@ def correct_reference_offset(matched_pairs: list[MatchPair]) -> tuple[list[Match
     if len(anchors) < 3:
         std_e = float(np.std(shifts_e)) if len(shifts_e) > 1 else 0.0
         std_n = float(np.std(shifts_n)) if len(shifts_n) > 1 else 0.0
-        if total <= 1500.0 and max(std_e, std_n) <= 150.0:
+        corroborated, reason = _limited_anchor_translation_is_corroborated(
+            anchors, median_e, median_n, std_e, std_n, total,
+            anchor_presearch_offset_m,
+        )
+        if corroborated:
             print("  Reference offset detected (translation-only from limited anchors):")
             print(f"    Median: dE={median_e:+.1f}m, dN={median_n:+.1f}m "
                   f"(total: {total:.1f}m), std: E={std_e:.1f}m, N={std_n:.1f}m")
+            if anchor_presearch_offset_m is not None:
+                print(f"    Corroborated by anchor presearch: "
+                      f"dE={anchor_presearch_offset_m[0]:+.1f}m, "
+                      f"dN={anchor_presearch_offset_m[1]:+.1f}m")
             corrected = []
             for p in matched_pairs:
                 if p.is_anchor:
@@ -467,8 +517,8 @@ def correct_reference_offset(matched_pairs: list[MatchPair]) -> tuple[list[Match
                         hypothesis_id=p.hypothesis_id,
                     ))
             return corrected, True, []
-        print(f"  Reference offset check: only {len(anchors)} anchor(s) with "
-              f"inconsistent translation (std_E={std_e:.1f}m, std_N={std_n:.1f}m), skipping")
+        print(f"  Reference offset check: only {len(anchors)} anchor(s), "
+              f"translation-only correction not corroborated ({reason}), skipping")
         return matched_pairs, False, []
 
     # Reject anchor outliers using affine-residual rejection instead of MAD.

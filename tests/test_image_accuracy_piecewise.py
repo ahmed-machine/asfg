@@ -13,99 +13,46 @@ from align.types import MatchPair
 from .helpers import make_synthetic_feature_image, warp_synthetic_image, write_array_raster
 
 
-class _SequentialProcessPool:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def map(self, fn, iterable, chunksize=1):
-        for item in iterable:
-            yield fn(item)
-
-
 @pytest.mark.fast
 @pytest.mark.selection
-def test_detect_multiscale_ncc_recovers_scale_and_rotation(monkeypatch, piecewise_case):
-    monkeypatch.setattr(scale, "ProcessPoolExecutor", _SequentialProcessPool)
-
-    ref_image = make_synthetic_feature_image(size=320)
-    offset_image = warp_synthetic_image(ref_image, scale=1.12, rotation_deg=3.0)
-
-    result = scale.detect_multiscale_ncc(ref_image, offset_image, expected_scale=1.12)
-
-    assert result is not None
-    detected_scale, detected_rotation, correlation = result
-    assert detected_scale == pytest.approx(1.12, abs=0.03)
-    assert detected_rotation == pytest.approx(3.0, abs=1.5)
-    assert correlation >= 0.75
-    piecewise_case.record_case_summary(
-        {
-            "detected_scale": detected_scale,
-            "detected_rotation_deg": detected_rotation,
-            "correlation": correlation,
-        }
-    )
-
-
-@pytest.mark.fast
-@pytest.mark.selection
-def test_detect_scale_rotation_recovers_transform_from_synthetic_rasters(
-    tmp_path,
-    monkeypatch,
-    piecewise_case,
+def test_detect_scale_rotation_returns_identity_without_model_cache(
+    tmp_path, piecewise_case,
 ):
-    monkeypatch.setattr(scale, "ProcessPoolExecutor", _SequentialProcessPool)
-    monkeypatch.setattr(
-        scale,
-        "make_land_mask",
-        lambda arr, mode="coastal_obia": ((arr > 0).astype(np.uint8) * 255),
-    )
-
+    """detect_scale_rotation now relies on ELoFTR. With no ``model_cache``
+    the matcher can't run; the function must return an identity transform
+    (scale 1.0, rotation 0) instead of crashing — downstream alignment
+    proceeds without scale correction."""
     ref_image = make_synthetic_feature_image(size=320)
     offset_image = warp_synthetic_image(ref_image, scale=1.12, rotation_deg=3.0)
 
     ref_path = write_array_raster(
-        tmp_path / "reference.tif",
-        ref_image,
-        bounds=(0.0, 0.0, 1600.0, 1600.0),
-        crs="EPSG:3857",
+        tmp_path / "reference.tif", ref_image,
+        bounds=(0.0, 0.0, 1600.0, 1600.0), crs="EPSG:3857",
     )
     offset_path = write_array_raster(
-        tmp_path / "offset.tif",
-        offset_image,
-        bounds=(0.0, 0.0, 1600.0, 1600.0),
-        crs="EPSG:3857",
+        tmp_path / "offset.tif", offset_image,
+        bounds=(0.0, 0.0, 1600.0, 1600.0), crs="EPSG:3857",
     )
 
     with rasterio.open(offset_path) as src_offset, rasterio.open(ref_path) as src_ref:
         result = scale.detect_scale_rotation(
-            src_offset,
-            src_ref,
+            src_offset, src_ref,
             (0.0, 0.0, 1600.0, 1600.0),
             CRS.from_epsg(3857),
-            0.0,
-            0.0,
-            1.12,
+            0.0, 0.0, 1.12,
             model_cache=None,
         )
 
-    assert result.method == "multiscale-ncc"
-    assert result.scale_x == pytest.approx(1.12, abs=0.03)
-    assert result.scale_y == pytest.approx(1.12, abs=0.03)
-    assert result.rotation == pytest.approx(3.0, abs=2.0)
-    piecewise_case.record_case_summary(
-        {
-            "method": result.method,
-            "scale_x": result.scale_x,
-            "scale_y": result.scale_y,
-            "rotation_deg": result.rotation,
-        }
-    )
+    assert result.method is None
+    assert result.scale_x == pytest.approx(1.0)
+    assert result.scale_y == pytest.approx(1.0)
+    assert result.rotation == pytest.approx(0.0)
+    piecewise_case.record_case_summary({
+        "method": result.method,
+        "scale_x": result.scale_x,
+        "scale_y": result.scale_y,
+        "rotation_deg": result.rotation,
+    })
 
 
 @pytest.mark.fast

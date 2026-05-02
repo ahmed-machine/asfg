@@ -444,81 +444,87 @@ def _validate_tiff(file_path: str) -> bool:
         return False
 
 
-def extract_archive(file_path: str, output_dir: str, entity_id: str) -> str:
-    """Extract a .tgz archive or handle a single .tif file.
+def _extract_tgz(file_path: str, entity_dir: str) -> None:
+    """Extract a multi-frame .tgz (KH-9 strips ship this way)."""
+    print(f"  Extracting {os.path.basename(file_path)} ...")
+    with tarfile.open(file_path, "r:gz") as tar:
+        tar.extractall(path=entity_dir, **_TAR_FILTER)
+    tifs = sorted(f for f in os.listdir(entity_dir) if f.lower().endswith(".tif"))
+    print(f"  Extracted {len(tifs)} frames")
 
-    Handles gzip-compressed TIFs (common for KH-4/KH-7 USGS downloads).
+
+def _handle_tif_or_gzipped_tif(file_path: str, entity_dir: str) -> bool:
+    """Handle single-file downloads: plain .tif (symlinked in) or
+    gzip-compressed / tar-gz-in-.tif USGS packaging.
+
+    Returns True if the caller should return ``entity_dir`` immediately
+    (tar-gz-in-.tif case) instead of running further extraction.
+    """
+    if _is_gzip(file_path):
+        out_name = os.path.basename(file_path)
+        out_path = os.path.join(entity_dir, out_name)
+        if os.path.exists(out_path):
+            return False
+        print(f"  Decompressing gzip-compressed TIF: {os.path.basename(file_path)}")
+        # Possibly a tar.gz containing TIFs despite the .tif extension.
+        try:
+            with tarfile.open(file_path, "r:gz") as tar:
+                if any(m.lower().endswith(".tif") for m in tar.getnames()):
+                    tar.extractall(path=entity_dir, **_TAR_FILTER)
+                    tifs = sorted(f for f in os.listdir(entity_dir)
+                                  if f.lower().endswith(".tif"))
+                    print(f"  Extracted {len(tifs)} frames from compressed archive")
+                    return True
+        except tarfile.TarError:
+            pass  # Plain gzip, not a tar — fall through.
+
+        with gzip.open(file_path, "rb") as f_in, open(out_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        print(f"  Decompressed: {os.path.basename(out_path)}")
+        return False
+
+    link_name = os.path.join(entity_dir, os.path.basename(file_path))
+    if not os.path.exists(link_name):
+        os.symlink(os.path.abspath(file_path), link_name)
+    print(f"  Linked single TIF: {os.path.basename(file_path)}")
+    return False
+
+
+def _validate_extracted_tiffs(entity_dir: str, entity_id: str) -> None:
+    """Remove any TIFFs that fail gdalinfo validation; raise if none remain."""
+    tifs = [os.path.join(entity_dir, f) for f in os.listdir(entity_dir)
+            if f.lower().endswith(".tif")]
+    invalid = [t for t in tifs if not _validate_tiff(t)]
+    for t in invalid:
+        print(f"  WARNING: Removing invalid TIFF: {os.path.basename(t)}")
+        os.remove(t)
+    if invalid and not [t for t in tifs if t not in invalid]:
+        raise RuntimeError(f"All extracted TIFFs are invalid for {entity_id}")
+
+
+def extract_archive(file_path: str, output_dir: str, entity_id: str) -> str:
+    """Extract a .tgz archive or single .tif (handling gzip-compressed
+    TIFs as shipped for some KH-4/KH-7 downloads).
 
     Returns the directory containing the extracted/linked frames.
     """
     entity_dir = os.path.join(output_dir, "extracted", entity_id)
-
-    # Check if already extracted
     if os.path.exists(entity_dir):
         tifs = [f for f in os.listdir(entity_dir) if f.lower().endswith(".tif")]
         if tifs:
             print(f"  [skip] Already extracted {len(tifs)} frames in {entity_dir}")
             return entity_dir
-
     os.makedirs(entity_dir, exist_ok=True)
 
     if file_path.endswith(".tgz") or file_path.endswith(".tar.gz"):
-        # Extract .tgz archive (KH-9 multi-frame strips)
-        print(f"  Extracting {os.path.basename(file_path)} ...")
-        with tarfile.open(file_path, "r:gz") as tar:
-            tar.extractall(path=entity_dir, **_TAR_FILTER)
-        tifs = sorted(f for f in os.listdir(entity_dir) if f.lower().endswith(".tif"))
-        print(f"  Extracted {len(tifs)} frames")
-
+        _extract_tgz(file_path, entity_dir)
     elif file_path.endswith(".tif"):
-        # Check if the .tif is actually gzip-compressed (USGS ships some this way)
-        if _is_gzip(file_path):
-            out_name = os.path.basename(file_path)
-            out_path = os.path.join(entity_dir, out_name)
-            if not os.path.exists(out_path):
-                print(f"  Decompressing gzip-compressed TIF: {os.path.basename(file_path)}")
-                # Check if it's a tar.gz containing TIFs
-                try:
-                    with tarfile.open(file_path, "r:gz") as tar:
-                        members = tar.getnames()
-                        tif_members = [m for m in members if m.lower().endswith(".tif")]
-                        if tif_members:
-                            tar.extractall(path=entity_dir, **_TAR_FILTER)
-                            tifs = sorted(f for f in os.listdir(entity_dir)
-                                          if f.lower().endswith(".tif"))
-                            print(f"  Extracted {len(tifs)} frames from compressed archive")
-                            return entity_dir
-                except tarfile.TarError:
-                    pass  # Not a tar archive, just a gzip-compressed single file
-
-                # Plain gzip-compressed TIF
-                with gzip.open(file_path, "rb") as f_in:
-                    with open(out_path, "wb") as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-                print(f"  Decompressed: {os.path.basename(out_path)}")
-        else:
-            # Genuine uncompressed TIF — symlink into entity dir
-            link_name = os.path.join(entity_dir, os.path.basename(file_path))
-            if not os.path.exists(link_name):
-                abs_src = os.path.abspath(file_path)
-                os.symlink(abs_src, link_name)
-            print(f"  Linked single TIF: {os.path.basename(file_path)}")
-
+        if _handle_tif_or_gzipped_tif(file_path, entity_dir):
+            return entity_dir
     else:
         raise ValueError(f"Unknown archive format: {file_path}")
 
-    # Validate extracted TIFFs
-    tifs = [os.path.join(entity_dir, f) for f in os.listdir(entity_dir)
-            if f.lower().endswith(".tif")]
-    invalid = [t for t in tifs if not _validate_tiff(t)]
-    if invalid:
-        for t in invalid:
-            print(f"  WARNING: Removing invalid TIFF: {os.path.basename(t)}")
-            os.remove(t)
-        remaining = [t for t in tifs if t not in invalid]
-        if not remaining:
-            raise RuntimeError(f"All extracted TIFFs are invalid for {entity_id}")
-
+    _validate_extracted_tiffs(entity_dir, entity_id)
     return entity_dir
 
 
