@@ -18,6 +18,8 @@ Camera-specific parameters are managed through YAML profiles in `data/profiles/`
 
 ## Usage
 
+Raw imagery is available via [USGS's M2M API](https://m2m.cr.usgs.gov/). Here's a [sample](https://github.com/ahmed-machine/asfg/blob/master/data/available/corona2_69b17d89ee62ff28.csv) catalog csv. The raw imagery comes in subframes that need to be stitched and orthorectified. Each camera system has a separate profile and requires different parameters. We make extensive use of [NASA Ames Stereo Pipeline](https://stereopipeline.readthedocs.io/) for sub-frame stitching (and fall back to VRT-based stitcher).
+
 **End-to-end pipeline** (`process.py`): catalog parsing, download, extraction, stitching, georeferencing, alignment, and mosaic assembly. All stages are idempotent.
 
 ```bash
