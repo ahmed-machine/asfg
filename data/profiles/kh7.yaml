@@ -80,3 +80,7 @@ camera:
 
 matching:
   anchor_min_land_ncc: 0.08
+  # LoRA-merged RoMa weights from cross-temporal fine-tune (G6 synthetic
+  # eval: median 28% lower, p90 40% lower vs base). Loaded with
+  # apply_setting("satast"). Override with DECLASS_ROMA_WEIGHTS env var.
+  roma_weights_override: align/weights/roma_ssd.pth

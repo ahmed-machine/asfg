@@ -23,6 +23,7 @@ einops = "^0.8.0"
 pyyaml = "^6.0"
 safetensors = "^0.7.0"
 skyfield = "^1.49"
+requests = "^2.33.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.5"

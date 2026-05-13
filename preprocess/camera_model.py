@@ -633,52 +633,9 @@ def mapproject_image(image_path, camera_path, dem_path=None, output_path=None,
 
     Removes panoramic distortion and (with DEM) terrain parallax.
 
-    Parameters
-    ----------
-    image_path : str
-        Input image.
-    camera_path : str
-        .tsai camera file from generate_camera().
-    dem_path : str, optional
-        DEM for terrain correction. If None, uses WGS84 datum (flat earth,
-        still corrects panoramic distortion).
-    output_path : str, optional
-        Output path. Defaults to image_path with '_mapprojected' suffix.
-    resolution : float, optional
-        Output resolution in metres/pixel. If None, auto-detected.
-    t_srs : str
-        Output spatial reference system.
-
-    Returns
-    -------
-    str or None
-        Path to mapprojected image, or None on failure.
-
-    Notes
-    -----
-    ASP ships ``bin/mapproject`` as a Python wrapper that calls
-    ``libexec/mapproject_single --parse-options`` to discover available
-    flags before running the binary. In the 3.6.0 build at
-    StereoPipeline-3.6.0-2025-12-26-arm64-OSX, ``mapproject_single
-    --parse-options`` always exits with code 1 even though it prints the
-    expected help text, which causes the wrapper's
-    ``run_and_parse_output`` to raise. To sidestep this we call
-    ``mapproject_single`` directly. The binary expects positional args
-    in the order: ``[options...] <dem_or_datum> <image> <camera> <output>``.
+    Calls ASP's ``bin/mapproject`` shell wrapper (which exports ISISROOT
+    + unsets conflicting GDAL/PROJ env vars).
     """
-    mapproj = find_asp_tool("mapproject")
-    if mapproj is None:
-        print("  [camera_model] ASP mapproject not found, skipping")
-        return None
-
-    # Locate the mapproject_single binary; bin/mapproject is the shell
-    # wrapper, libexec/mapproject_single is the actual executable.
-    asp_root = os.path.dirname(os.path.dirname(mapproj))
-    mapproj_single = os.path.join(asp_root, "libexec", "mapproject_single")
-    if not os.path.isfile(mapproj_single):
-        # Older / unusual layouts: fall back to whatever find_asp_tool gave us.
-        mapproj_single = mapproj
-
     if output_path is None:
         base, ext = os.path.splitext(image_path)
         output_path = f"{base}_mapprojected{ext}"
@@ -687,46 +644,35 @@ def mapproject_image(image_path, camera_path, dem_path=None, output_path=None,
         print(f"  [camera_model] Mapprojected file already exists: {os.path.basename(output_path)}")
         return output_path
 
-    cmd = [mapproj_single]
+    mapproj = find_asp_tool("mapproject")
+    if mapproj is None:
+        print("  [camera_model] ASP mapproject not found, skipping")
+        return None
+
+    cmd = [mapproj]
     if resolution is not None:
         cmd.extend(["--tr", str(resolution)])
     cmd.extend(["--t_srs", t_srs])
 
-    # mapproject_single takes the DEM (or a datum keyword) as the first
-    # positional argument, followed by image, camera, output.
+    n_threads = max(1, (os.cpu_count() or 4) - 1)
+    cmd.extend(["--threads", str(n_threads), "--cache-size-mb", "4096"])
+
     if dem_path and os.path.isfile(dem_path):
         cmd.append(dem_path)
     else:
         cmd.append("WGS84")
-
     cmd.extend([image_path, camera_path, output_path])
-
-    # ASP mapproject_single instantiates ISIS preferences even for Earth
-    # imagery; without ISISROOT pointing at the install dir (where the
-    # bundled `IsisPreferences` file lives), libc++abi terminates with
-    # "USER ERROR The preference file $ISISROOT/IsisPreferences was not
-    # found". The bin/mapproject shell wrapper exports ISISROOT, but we
-    # call mapproject_single directly so we have to set it ourselves.
-    env = os.environ.copy()
-    if "ISISROOT" not in env and os.path.isfile(os.path.join(asp_root, "IsisPreferences")):
-        env["ISISROOT"] = asp_root
 
     print(f"  [camera_model] Running mapproject -> {os.path.basename(output_path)}")
     print(f"  [camera_model] cmd: {' '.join(cmd)}")
+    if resolution and resolution < 1.0:
+        _timeout = 18000  # 5 h (KH-7 / KH-9 PC native — should be remote anyway)
+    elif resolution and resolution < 2.5:
+        _timeout = 14400  # 4 h (KH-4 native / KH-9 PC reference)
+    else:
+        _timeout = 7200  # 2 h (KH-4 reference res)
     try:
-        # Timeout scales with pixel count. Native GSD on a KH-4B strip
-        # (~2.2 m/px × 120k×10k stitched) hit > 1 h on the 2.6 GB ortho
-        # in e2e_v11; native KH-7 (~0.6 m/px) and KH-9 PC per-segment
-        # (~0.8 m/px) can run > 2 h. Use a liberal 4 h ceiling by
-        # default; the subprocess will exit naturally much sooner on
-        # reference-resolution renders.
-        if resolution and resolution < 1.0:
-            _timeout = 18000  # 5 h (KH-7 / KH-9 PC native)
-        elif resolution and resolution < 2.5:
-            _timeout = 14400  # 4 h (KH-4 native / KH-9 PC reference)
-        else:
-            _timeout = 7200  # 2 h (KH-4 reference res)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_timeout, env=env)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_timeout)
         if result.returncode != 0:
             stderr_tail = (result.stderr or "").strip()[-1500:]
             stdout_tail = (result.stdout or "").strip()[-1500:]

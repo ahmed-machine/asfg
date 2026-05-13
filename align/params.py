@@ -57,6 +57,11 @@ class MatchingParams:
     ransac_reproj_threshold: float = 5.0
     estimation_method: str = "ransac"  # "ransac", "lmeds", "magsac"
     anchor_min_land_ncc: float = 0.10
+    # Path to a LoRA-merged RoMa state dict; loaded by ModelCache.roma when
+    # set, with apply_setting("satast") matched to the training resolution.
+    # Equivalent to the DECLASS_ROMA_WEIGHTS env var; the env var takes
+    # precedence when both are set.
+    roma_weights_override: str | None = None
 
 
 @dataclass
@@ -544,6 +549,11 @@ def _sync_constants(params: AlignParams) -> None:
     g["MATCH_QUOTA_GRID_M"] = params.matching.match_quota_grid_m
     g["MATCH_QUOTA_PER_CELL"] = params.matching.match_quota_per_cell
     g["RANSAC_REPROJ_THRESHOLD"] = params.matching.ransac_reproj_threshold
+
+    # Profile-driven RoMa weights override → env var so ModelCache.roma picks
+    # it up. The env var wins when both are set, matching CLI semantics.
+    if params.matching.roma_weights_override and "DECLASS_ROMA_WEIGHTS" not in os.environ:
+        os.environ["DECLASS_ROMA_WEIGHTS"] = params.matching.roma_weights_override
 
     # Validation
     g["ANCHOR_INLIER_THRESHOLD"] = params.validation.anchor_inlier_threshold

@@ -19,6 +19,10 @@ matching:
   roma_tile_overlap: 512
   roma_size: 640
   roma_num_corresp: 600
+  # Path to a LoRA-merged RoMa state dict (relative to repo root or absolute).
+  # When set, ModelCache.roma loads it with apply_setting("satast"). Override
+  # via DECLASS_ROMA_WEIGHTS env var. Default null (base RoMa).
+  roma_weights_override: null
   land_mask_frac_min: 0.30
   tile_joint_land_min: 0.03
   match_quota_grid_m: 2000

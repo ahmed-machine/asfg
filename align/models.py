@@ -147,6 +147,21 @@ class ModelCache:
             print(f"  [ModelCache] Loading RoMa v2 on {self.device}")
             cfg = RoMaV2.Cfg(setting="fast", compile=False)
             self._roma = RoMaV2(cfg)
+            weights_override = os.environ.get("DECLASS_ROMA_WEIGHTS")
+            if weights_override:
+                state = torch.load(weights_override, map_location=self.device)
+                self._roma.load_state_dict(state, strict=True)
+                # LoRA-merged weights are optimised against the satast feature
+                # distribution (800px lr / 1024px hr / bidirectional). Running them
+                # at fast (512px / unidirectional) produces zero matches in
+                # production. Default the setting to satast when override weights
+                # are loaded; override via ``DECLASS_ROMA_SETTING`` if needed.
+                setting_env = os.environ.get("DECLASS_ROMA_SETTING", "satast")
+                self._roma.apply_setting(setting_env)
+                print(
+                    f"  [ModelCache] Loaded RoMa override from {weights_override} "
+                    f"with setting={setting_env}"
+                )
             print(f"  [ModelCache] RoMa v2 ready")
         return self._roma
 

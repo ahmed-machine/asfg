@@ -11,10 +11,9 @@ boundary: data/bahrain_boundary.geojson
 # Modern ESRI World Imagery basemap (populated by scripts/fetch_esri_basemap.py).
 # Decouples alignment quality from cross-temporal KH-film coastline drift; gives
 # the §4.4 model-guided re-matching loop a stable, broadly-covering reference.
-reference_name: bahrain_esri_worldimagery
-# Legacy fallback — kh9_dzb1212 is the 1976 KH-9 Mapping Camera scene, useful for
-# A/B comparison of same-era Corona-to-Corona matching.
-#   reference_name: kh9_dzb1212
+reference_name: kh9_dzb1212
+# Modern ESRI fallback (decouples from cross-temporal KH-film coastline drift):
+#   reference_name: bahrain_esri_worldimagery
 catalogs:
   - data/available/declassiii_69b17de7ab15497e.csv
 prefer_camera: A              # Aft panoramic camera pair (vs F Fore)

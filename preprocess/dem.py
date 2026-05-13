@@ -71,8 +71,14 @@ def fetch_dem(west: float, south: float, east: float, north: float,
                 urllib.request.urlretrieve(url, local_path)
                 tile_paths.append(local_path)
             except Exception as e:
-                print(f"  [DEM] Failed to download {name}: {e}")
-                # Tile may not exist (ocean areas)
+                # Copernicus GLO-30 only publishes land tiles, so 404s on
+                # ocean cells are expected and silent. Anything else is a
+                # real failure (network, auth, S3 outage) — log loudly.
+                from urllib.error import HTTPError
+                if isinstance(e, HTTPError) and e.code == 404:
+                    pass  # ocean tile; silently skip
+                else:
+                    print(f"  [DEM] Failed to download {name}: {e}")
                 continue
 
     if not tile_paths:

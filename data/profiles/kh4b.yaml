@@ -96,6 +96,10 @@ matching:
   # surviving GCPs pin the warp more precisely. At matching-res 4.77 m/px
   # that's ~19 m vs 38 m previously.
   ransac_reproj_threshold: 4.0
+  # LoRA-merged RoMa weights from cross-temporal fine-tune (G6 synthetic
+  # eval: median 28% lower, p90 40% lower vs base). Loaded with
+  # apply_setting("satast"). Override with DECLASS_ROMA_WEIGHTS env var.
+  roma_weights_override: align/weights/roma_ssd.pth
 
 grid_optim:
   w_data: 1.2
