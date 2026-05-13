@@ -1,4 +1,4 @@
-# declass-process
+# ASFG (VERY WIP, STILL SHIFTING)
 
 Automated georectification pipeline for declassified Cold War-era reconnaissance satellite imagery (1959-1984). Given a scanned film frame and a modern georeferenced basemap, the pipeline registers the historical image to the reference through coarse localization, neural feature matching, grid optimization, and optical flow refinement. The output is a geometrically corrected GeoTIFF.
 
