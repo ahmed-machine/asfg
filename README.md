@@ -2,9 +2,16 @@
 
 Automated georectification pipeline for declassified Cold War-era reconnaissance satellite imagery (1959-1984). Given a scanned film frame and a modern georeferenced basemap, the pipeline registers the historical image to the reference through coarse localization, neural feature matching, grid optimization, and optical flow refinement. The output is a geometrically corrected GeoTIFF.
 
-The imagery comes from three declassification releases under [Executive Order 12951](https://www.govinfo.gov/content/pkg/FR-1995-02-28/pdf/95-5050.pdf): [Declass-1](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-1) (1995, CORONA/ARGON/LANYARD 1960-1972), [Declass-2](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-2) (2002, KH-7/KH-9 1963-1980), and [Declass-3](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-3) (2011, remaining KH-7/KH-9 missions).
+The imagery comes from three declassification releases under [Executive Order 12951](https://www.govinfo.gov/content/pkg/FR-1995-02-28/pdf/95-5050.pdf): [Declass-1](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-1) (1995, CORONA/ARGON/LANYARD 1960-1972), [Declass-2](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-2) (2002, KH-7/KH-9 1963-1980), and [Declass-3](https://www.usgs.gov/centers/eros/science/usgs-eros-archive-declassified-data-declassified-satellite-imagery-3) (2011, remaining KH-7/KH-9 missions). Over 1.5 million of these images exist but the vast majority hasn't been georeferenced or orthorectified due to the manual labor required.
 
 ![Feature matching between reference (left) and target KH-9 frame (right)](assets/feature-matching-example.jpg)
+
+## Hypothesis
+Historical satellite film georectification as a process is still dependent on manual identification of geographic features (GCPs). Significant research has been done on vision transformers identifying features in modern satellite imagery. Rapid development of urban land cover and shoreline between modern satellite imagery and imagery from 50-60 years makes it very unstable and difficult to reliably match features across this temporal distance, even for humans.
+
+To resolve this, we attempt to reduce the temporal distance by referencing historic satellite imagery. For a given region, we manually georeference one of the earliest film images captured with full coverage (i.e. 1965). The manually aligned image is used as a feature matching reference for automatically identified features in successive film captures (<1-2 years). We progress chronologically through the dataset (1960 to 1980), reference matching each successive image against each prior aligned image in the same coarse area.
+
+Additionally, SoTA vision transformer models require fine-tuning for use with historic imagery (e.g LoRA with matched pairs across camera systems). To ensure high fidelity, we build safe guards around sample distribution (i.e. to avoid overfitting on urban areas), confidence thresholds, and outlier filtering prior to warping.
 
 ## Supported camera systems
 
